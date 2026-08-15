@@ -5,7 +5,7 @@ use kode_agent::Agent;
 use kode_context::{CompiledContext, ContextCompiler, ContextRequest, ContextSource};
 use kode_core::CancellationToken;
 use kode_core::config::KodeConfig;
-use kode_core::event::{EventBus, KodeEvent};
+use kode_core::event::{EventBus, KodeEvent, TaskStep};
 use kode_intel::{CodeIntelligence, ZindeksAdapter};
 use kode_memory::{EngineeringMemory, IngatAdapter, RememberTool};
 use kode_model::{OpenAiModel, OpenAiOptions};
@@ -204,11 +204,20 @@ pub async fn run_task(
     events.emit(KodeEvent::Note {
         text: compiled.summary_line(),
     });
+    events.emit(KodeEvent::TaskProgress {
+        step: TaskStep::Understand,
+        done: true,
+    });
 
     let mut outcome = agent
         .run_with_context(task, compiled.render().as_deref(), &ctx)
         .await
         .map_err(|err| anyhow::anyhow!(err))?;
+
+    events.emit(KodeEvent::TaskProgress {
+        step: TaskStep::Change,
+        done: outcome.mutated,
+    });
 
     let mut final_mutated = outcome.mutated;
 
@@ -216,8 +225,12 @@ pub async fn run_task(
         let profile = kode_verify::detect(cwd);
         events.emit(KodeEvent::VerificationStarted);
         let mut report = kode_verify::run_verification(cwd, &profile, &ctx.cancel).await;
-        emit_step_lines(&events, &report);
+        emit_verify_steps(&events, &report);
         events.emit(KodeEvent::VerificationFinished { ok: report.ok });
+        events.emit(KodeEvent::TaskProgress {
+            step: TaskStep::Verify,
+            done: report.ok,
+        });
 
         if !report.ok {
             events.emit(KodeEvent::Note {
@@ -241,8 +254,12 @@ pub async fn run_task(
                 let profile = kode_verify::detect(cwd);
                 events.emit(KodeEvent::VerificationStarted);
                 report = kode_verify::run_verification(cwd, &profile, &ctx.cancel).await;
-                emit_step_lines(&events, &report);
+                emit_verify_steps(&events, &report);
                 events.emit(KodeEvent::VerificationFinished { ok: report.ok });
+                events.emit(KodeEvent::TaskProgress {
+                    step: TaskStep::Verify,
+                    done: report.ok,
+                });
             }
             events.emit(KodeEvent::Note {
                 text: report.summary_line(),
@@ -417,15 +434,21 @@ fn git_lines(compiled: &CompiledContext) -> Vec<String> {
     }
 }
 
-fn emit_step_lines(events: &EventBus, report: &kode_verify::VerificationReport) {
+/// Emits one `VerifyStep` event per `StepResult` — the per-step provenance
+/// the TUI's `V` gutter and Ledger view render. Replaces the old
+/// `Note`-per-step reporting so a step is only reported once.
+fn emit_verify_steps(events: &EventBus, report: &kode_verify::VerificationReport) {
     for step in &report.steps {
-        let tag = match &step.status {
-            kode_verify::StepStatus::Passed => "PASS",
-            kode_verify::StepStatus::Failed => "FAIL",
-            kode_verify::StepStatus::Skipped(_) => "SKIP",
+        let (passed, skipped) = match &step.status {
+            kode_verify::StepStatus::Passed => (true, false),
+            kode_verify::StepStatus::Failed => (false, false),
+            kode_verify::StepStatus::Skipped(_) => (false, true),
         };
-        events.emit(KodeEvent::Note {
-            text: format!("{}: {tag}", step.name),
+        events.emit(KodeEvent::VerifyStep {
+            name: step.name.clone(),
+            passed,
+            skipped,
+            duration_ms: step.duration.as_millis() as u64,
         });
     }
 }

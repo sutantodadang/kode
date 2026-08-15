@@ -55,6 +55,21 @@ pub async fn run(
                 Ok(KodeEvent::Note { text }) => {
                     eprintln!("◆ {text}");
                 }
+                Ok(KodeEvent::VerifyStep {
+                    name,
+                    passed,
+                    skipped,
+                    ..
+                }) => {
+                    let tag = if skipped {
+                        "SKIP"
+                    } else if passed {
+                        "PASS"
+                    } else {
+                        "FAIL"
+                    };
+                    eprintln!("◆ {name}: {tag}");
+                }
                 Ok(KodeEvent::Knowledge {
                     zindeks,
                     ingat,

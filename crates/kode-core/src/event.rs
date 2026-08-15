@@ -1,5 +1,14 @@
 use tokio::sync::broadcast;
 
+/// One step of the Ledger view's fixed 4-step task lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskStep {
+    Understand,
+    Decide,
+    Change,
+    Verify,
+}
+
 /// Events emitted during an agent run.
 #[derive(Debug, Clone)]
 pub enum KodeEvent {
@@ -56,6 +65,23 @@ pub enum KodeEvent {
         git: Vec<String>,
         context_tokens: usize,
         budget_tokens: usize,
+    },
+    /// One verification step's result, emitted per `StepResult` right
+    /// before the summary `Note`. Frontends render this distinctly (TUI:
+    /// `V` gutter; headless: `◆ {name}: {PASS|FAIL|SKIP}`).
+    VerifyStep {
+        name: String,
+        passed: bool,
+        skipped: bool,
+        duration_ms: u64,
+    },
+    /// Progress on one of the Ledger view's 4 fixed task steps
+    /// (Understand/Decide/Change/Verify). `Decide` is never emitted by the
+    /// pipeline — frontends derive it locally from the first `ToolStarted`
+    /// event of a run, which is itself observable fact.
+    TaskProgress {
+        step: TaskStep,
+        done: bool,
     },
 }
 
