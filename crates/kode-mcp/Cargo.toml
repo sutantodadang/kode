@@ -1,5 +1,5 @@
 [package]
-name = "kode-intel"
+name = "kode-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,8 +9,7 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-async-trait = { workspace = true }
 tracing = { workspace = true }
-futures = { workspace = true }
+async-trait = { workspace = true }
 kode-core = { workspace = true }
-kode-mcp = { path = "../kode-mcp" }
+kode-tools = { path = "../kode-tools" }

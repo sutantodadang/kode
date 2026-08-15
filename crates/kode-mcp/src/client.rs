@@ -1,7 +1,7 @@
 //! Minimal hand-rolled MCP JSON-RPC client over an arbitrary async byte
 //! stream (newline-delimited JSON, one message per line — standard MCP
-//! stdio framing). No MCP SDK dependency; we only need `initialize` and
-//! `tools/call`.
+//! stdio framing). No MCP SDK dependency; we only need `initialize`,
+//! `tools/list`, and `tools/call`.
 
 use std::pin::Pin;
 use std::time::Duration;
@@ -9,16 +9,25 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
-use crate::error::{IntelError, Result};
+use crate::error::{McpError, Result};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A tool advertised by a remote MCP server via `tools/list`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteToolInfo {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+    pub read_only: bool,
+}
 
 /// A connected-but-not-yet-initialized (or initialized) MCP client.
 ///
 /// Requests are always awaited to completion before the next is issued, so
 /// holding this behind a `tokio::sync::Mutex` and keeping the guard across
-/// an `.await` (as `ZindeksAdapter` does) is safe: calls are inherently
-/// serialized by the protocol, there is no independent progress to block.
+/// an `.await` (as adapters do) is safe: calls are inherently serialized by
+/// the protocol, there is no independent progress to block.
 pub struct McpClient {
     reader: BufReader<Pin<Box<dyn AsyncRead + Send>>>,
     writer: Pin<Box<dyn AsyncWrite + Send>>,
@@ -44,8 +53,8 @@ impl McpClient {
 
     async fn write_line(&mut self, value: &Value) -> Result<()> {
         let mut line =
-            serde_json::to_string(value).map_err(|e| IntelError::Protocol(e.to_string()))?;
-        tracing::debug!(target: "kode_intel::mcp", %line, "-> zindeks");
+            serde_json::to_string(value).map_err(|e| McpError::Protocol(e.to_string()))?;
+        tracing::debug!(target: "kode_mcp::client", %line, "-> server");
         line.push('\n');
         self.writer.write_all(line.as_bytes()).await?;
         self.writer.flush().await?;
@@ -59,15 +68,15 @@ impl McpClient {
             let mut line = String::new();
             let n = self.reader.read_line(&mut line).await?;
             if n == 0 {
-                return Err(IntelError::Protocol("connection closed".to_string()));
+                return Err(McpError::Protocol("connection closed".to_string()));
             }
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
             let value: Value = serde_json::from_str(line)
-                .map_err(|e| IntelError::Protocol(format!("invalid json: {e}")))?;
-            tracing::debug!(target: "kode_intel::mcp", %line, "<- zindeks");
+                .map_err(|e| McpError::Protocol(format!("invalid json: {e}")))?;
+            tracing::debug!(target: "kode_mcp::client", %line, "<- server");
 
             let is_notification_or_request = value.get("method").is_some();
             let resp_id = value.get("id").and_then(|v| v.as_i64());
@@ -84,18 +93,18 @@ impl McpClient {
         self.write_line(&msg).await?;
         let resp = tokio::time::timeout(REQUEST_TIMEOUT, self.read_response(id))
             .await
-            .map_err(|_| IntelError::Timeout)??;
+            .map_err(|_| McpError::Timeout)??;
 
         if let Some(err) = resp.get("error") {
             let message = err
                 .get("message")
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown error");
-            return Err(IntelError::Tool(message.to_string()));
+            return Err(McpError::Tool(message.to_string()));
         }
         resp.get("result")
             .cloned()
-            .ok_or_else(|| IntelError::Protocol("response missing result".to_string()))
+            .ok_or_else(|| McpError::Protocol("response missing result".to_string()))
     }
 
     async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
@@ -122,10 +131,51 @@ impl McpClient {
 
         if result.get("isError").and_then(|v| v.as_bool()) == Some(true) {
             let text = extract_text(&result).unwrap_or_else(|| "tool call failed".to_string());
-            return Err(IntelError::Tool(text));
+            return Err(McpError::Tool(text));
         }
         extract_text(&result)
-            .ok_or_else(|| IntelError::Protocol("missing content[0].text".to_string()))
+            .ok_or_else(|| McpError::Protocol("missing content[0].text".to_string()))
+    }
+
+    /// Lists tools advertised by the connected server (`tools/list`).
+    pub async fn list_tools(&mut self) -> Result<Vec<RemoteToolInfo>> {
+        let result = self.request("tools/list", json!({})).await?;
+        let tools = result
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        Ok(tools
+            .into_iter()
+            .map(|t| {
+                let name = t
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let description = t
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let input_schema = t
+                    .get("inputSchema")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"type": "object"}));
+                let read_only = t
+                    .get("annotations")
+                    .and_then(|a| a.get("readOnlyHint"))
+                    .and_then(|v| v.as_bool())
+                    == Some(true);
+                RemoteToolInfo {
+                    name,
+                    description,
+                    input_schema,
+                    read_only,
+                }
+            })
+            .collect())
     }
 }
 
@@ -247,7 +297,7 @@ mod tests {
         });
 
         let err = client.call_tool("search", json!({})).await.unwrap_err();
-        assert!(matches!(err, IntelError::Tool(msg) if msg == "No project loaded"));
+        assert!(matches!(err, McpError::Tool(msg) if msg == "No project loaded"));
         server.await.unwrap();
     }
 
@@ -270,7 +320,7 @@ mod tests {
         });
 
         let err = client.call_tool("search", json!({})).await.unwrap_err();
-        assert!(matches!(err, IntelError::Tool(msg) if msg.contains("NO_PROJECT")));
+        assert!(matches!(err, McpError::Tool(msg) if msg.contains("NO_PROJECT")));
         server.await.unwrap();
     }
 
@@ -300,6 +350,81 @@ mod tests {
 
         let text = client.call_tool("search", json!({})).await.unwrap();
         assert_eq!(text, "ok");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_tools_parses_two_tools_one_read_only() {
+        let (mut client, mut server_r, mut server_w) = client_pair();
+
+        let server = tokio::spawn(async move {
+            let req = read_server_line(&mut server_r).await;
+            assert_eq!(req["method"], "tools/list");
+            let id = req["id"].clone();
+            write_server_line(
+                &mut server_w,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "tools": [
+                            {
+                                "name": "search",
+                                "description": "search things",
+                                "inputSchema": {"type": "object", "properties": {}},
+                                "annotations": {"readOnlyHint": true}
+                            },
+                            {
+                                "name": "write_thing",
+                                "description": "writes a thing",
+                                "inputSchema": {"type": "object"},
+                                "annotations": {"readOnlyHint": false}
+                            }
+                        ]
+                    }
+                }),
+            )
+            .await;
+        });
+
+        let tools = client.list_tools().await.unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].name, "search");
+        assert_eq!(tools[0].description, "search things");
+        assert!(tools[0].read_only);
+        assert_eq!(tools[1].name, "write_thing");
+        assert!(!tools[1].read_only);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_tools_defaults_missing_description_and_schema() {
+        let (mut client, mut server_r, mut server_w) = client_pair();
+
+        let server = tokio::spawn(async move {
+            let req = read_server_line(&mut server_r).await;
+            let id = req["id"].clone();
+            write_server_line(
+                &mut server_w,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "tools": [
+                            {"name": "bare_tool"}
+                        ]
+                    }
+                }),
+            )
+            .await;
+        });
+
+        let tools = client.list_tools().await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "bare_tool");
+        assert_eq!(tools[0].description, "");
+        assert_eq!(tools[0].input_schema, json!({"type": "object"}));
+        assert!(!tools[0].read_only);
         server.await.unwrap();
     }
 }

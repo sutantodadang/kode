@@ -1,5 +1,4 @@
 pub mod error;
-pub mod mcp;
 pub mod mock;
 pub mod types;
 pub mod zindeks;

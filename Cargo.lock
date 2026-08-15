@@ -822,6 +822,7 @@ dependencies = [
  "kode-context",
  "kode-core",
  "kode-intel",
+ "kode-mcp",
  "kode-memory",
  "kode-model",
  "kode-tools",
@@ -882,6 +883,21 @@ dependencies = [
  "async-trait",
  "futures",
  "kode-core",
+ "kode-mcp",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "kode-mcp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "kode-core",
+ "kode-tools",
  "serde",
  "serde_json",
  "thiserror",

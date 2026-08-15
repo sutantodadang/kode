@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use kode_core::config::{KodeConfig, ModelConfig, ZindeksConfig};
+use kode_core::config::{KodeConfig, McpServerConfig, ModelConfig, ZindeksConfig};
 use kode_intel::{CodeIntelligence, ZindeksAdapter};
 use kode_memory::{EngineeringMemory, IngatAdapter};
 
@@ -109,6 +109,8 @@ pub async fn run(cwd: &Path) -> anyhow::Result<()> {
     } else {
         checks.push(Check::warn("Ingat", "ingat", "disabled in config", ""));
     }
+
+    collect_mcp_checks(&mut checks, &config).await;
 
     checks.push(git_binary_check().await);
     checks.push(git_repository_check(cwd));
@@ -341,6 +343,64 @@ async fn collect_ingat_checks(checks: &mut Vec<Check>, config: &KodeConfig) {
         Ok(Err(err)) => checks.push(Check::fail("Ingat", "memory", err.to_string(), INGAT_FIX)),
         Err(_) => checks.push(Check::fail("Ingat", "memory", "timed out", INGAT_FIX)),
     }
+}
+
+const MCP_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn collect_mcp_checks(checks: &mut Vec<Check>, config: &KodeConfig) {
+    if config.mcp.servers.is_empty() {
+        checks.push(Check::pass("MCP", "servers", "none configured"));
+        return;
+    }
+
+    for (name, server) in &config.mcp.servers {
+        if !server.enabled {
+            checks.push(Check::warn("MCP", name.clone(), "disabled", ""));
+            continue;
+        }
+        checks.push(mcp_server_check(name, server).await);
+    }
+}
+
+async fn mcp_server_check(name: &str, cfg: &McpServerConfig) -> Check {
+    match tokio::time::timeout(MCP_TIMEOUT, probe_mcp_server(cfg)).await {
+        Ok(Ok(n)) => Check::pass("MCP", name.to_string(), format!("{n} tools")),
+        Ok(Err(err)) => Check::fail(
+            "MCP",
+            name.to_string(),
+            err.to_string(),
+            "check command/args",
+        ),
+        Err(_) => Check::fail("MCP", name.to_string(), "timed out", "check command/args"),
+    }
+}
+
+/// Spawns `cfg.command`, performs the MCP handshake, and lists its tools,
+/// returning the tool count. The child is killed on drop.
+async fn probe_mcp_server(cfg: &McpServerConfig) -> kode_mcp::Result<usize> {
+    let mut cmd = tokio::process::Command::new(&cfg.command);
+    cmd.args(&cfg.args);
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::null());
+    cmd.kill_on_drop(true);
+
+    let mut child = cmd.spawn().map_err(|e| {
+        kode_mcp::McpError::Unavailable(format!("cannot start {}: {e}", cfg.command))
+    })?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| kode_mcp::McpError::Unavailable("mcp child missing stdin".to_string()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| kode_mcp::McpError::Unavailable("mcp child missing stdout".to_string()))?;
+
+    let mut client = kode_mcp::McpClient::new(stdout, stdin);
+    client.initialize().await?;
+    let tools = client.list_tools().await?;
+    Ok(tools.len())
 }
 
 async fn git_binary_check() -> Check {

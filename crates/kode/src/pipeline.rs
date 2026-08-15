@@ -113,6 +113,26 @@ pub async fn run_task(
             .map(|name| name.to_string_lossy().to_string());
         registry.register(Arc::new(RememberTool::new(mem.clone(), repository)));
     }
+
+    // Generic external MCP servers (kept architecturally separate from the
+    // first-class Zindeks/Ingat integrations above). `_mcp_manager` owns the
+    // spawned child processes and must outlive the agent run.
+    let _mcp_manager = if !config.mcp.servers.is_empty() {
+        let mut notes = Vec::new();
+        let manager = kode_mcp::McpManager::connect_all(&config.mcp.servers, &mut notes).await;
+        for text in notes {
+            events.emit(KodeEvent::Note { text });
+        }
+        for handle in &manager.handles {
+            for tool in &handle.tools {
+                registry.register(tool.clone());
+            }
+        }
+        Some(manager)
+    } else {
+        None
+    };
+
     let tools = ToolRuntime::new(registry, config.permissions.default_mode, handler);
     let agent = Agent::new(model, tools, events.clone(), &config.agent);
 

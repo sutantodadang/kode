@@ -17,3 +17,15 @@ pub enum IntelError {
 }
 
 pub type Result<T> = std::result::Result<T, IntelError>;
+
+impl From<kode_mcp::McpError> for IntelError {
+    fn from(err: kode_mcp::McpError) -> Self {
+        match err {
+            kode_mcp::McpError::Unavailable(msg) => IntelError::Unavailable(msg),
+            kode_mcp::McpError::Protocol(msg) => IntelError::Protocol(msg),
+            kode_mcp::McpError::Tool(msg) => IntelError::Tool(msg),
+            kode_mcp::McpError::Timeout => IntelError::Timeout,
+            kode_mcp::McpError::Io(e) => IntelError::Io(e),
+        }
+    }
+}

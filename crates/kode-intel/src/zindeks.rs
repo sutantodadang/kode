@@ -8,12 +8,12 @@ use tokio::process::Child;
 use tokio::sync::Mutex;
 
 use crate::error::{IntelError, Result};
-use crate::mcp::McpClient;
 use crate::types::{
     CodeContext, CodeContextRequest, CodeSearchResult, FileOutline, IntelHealth, OutlineSymbol,
 };
 use crate::{CodeIntelligence, error};
 use kode_core::config::ZindeksConfig;
+use kode_mcp::McpClient;
 
 /// Speaks MCP JSON-RPC to a local `zindeks` process (stdio child) or a
 /// running `zindeks serve --port N` (TCP), and exposes the narrow
@@ -95,7 +95,7 @@ impl ZindeksAdapter {
     /// already done by [`Self::connect`].
     pub async fn initialize(&self) -> Result<()> {
         let mut client = self.client.lock().await;
-        client.initialize().await
+        client.initialize().await.map_err(IntelError::from)
     }
 
     /// Whether `root` is already indexed by the connected zindeks instance
@@ -144,10 +144,10 @@ impl ZindeksAdapter {
         let mut client = self.client.lock().await;
         match client.call_tool(name, arguments).await {
             Ok(text) => Ok(text),
-            Err(IntelError::Tool(msg)) if is_not_indexed_error(&msg) => {
+            Err(kode_mcp::McpError::Tool(msg)) if is_not_indexed_error(&msg) => {
                 Err(IntelError::NotIndexed(self.root.display().to_string()))
             }
-            Err(e) => Err(e),
+            Err(e) => Err(IntelError::from(e)),
         }
     }
 }

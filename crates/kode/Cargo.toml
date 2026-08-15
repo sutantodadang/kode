@@ -10,6 +10,7 @@ kode-agent = { path = "../kode-agent" }
 kode-model = { path = "../kode-model" }
 kode-tools = { path = "../kode-tools" }
 kode-intel = { path = "../kode-intel" }
+kode-mcp = { path = "../kode-mcp" }
 kode-context = { path = "../kode-context" }
 kode-memory = { path = "../kode-memory" }
 kode-verify = { path = "../kode-verify" }

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -61,6 +62,7 @@ pub struct KodeConfig {
     pub ingat: IngatConfig,
     pub agent: AgentConfig,
     pub permissions: PermissionsConfig,
+    pub mcp: McpConfig,
 }
 
 impl KodeConfig {
@@ -206,6 +208,37 @@ pub enum PermissionMode {
     Deny,
 }
 
+/// Configuration for user-defined external MCP (Model Context Protocol)
+/// servers, distinct from the first-class `[zindeks]`/`[ingat]` integrations.
+/// Each entry's tools register into the tool runtime as `{server}__{tool}`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpConfig {
+    #[serde(default)]
+    pub servers: BTreeMap<String, McpServerConfig>,
+}
+
+/// A single external MCP server, spawned as a stdio child process.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    /// Binary to spawn. No sensible default — required per server entry.
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            args: Vec::new(),
+            enabled: default_true(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +281,50 @@ mod tests {
         assert_eq!(cfg.agent.max_context_tokens, 100_000);
         assert_eq!(cfg.agent.context_budget_tokens, 16_000);
         assert_eq!(cfg.permissions.default_mode, PermissionMode::Ask);
+        assert!(cfg.mcp.servers.is_empty());
+    }
+
+    #[test]
+    fn load_parses_mcp_servers_table() {
+        let dir = temp_project_dir();
+        let kode_dir = dir.join(".kode");
+        std::fs::create_dir_all(&kode_dir).unwrap();
+        std::fs::write(
+            kode_dir.join("config.toml"),
+            concat!(
+                "[mcp.servers.everything]\n",
+                "command = \"npx\"\n",
+                "args = [\"-y\", \"@modelcontextprotocol/server-everything\"]\n",
+                "enabled = true\n",
+            ),
+        )
+        .unwrap();
+
+        let cfg = KodeConfig::load(&dir).unwrap();
+        let server = cfg.mcp.servers.get("everything").unwrap();
+        assert_eq!(server.command, "npx");
+        assert_eq!(
+            server.args,
+            vec!["-y", "@modelcontextprotocol/server-everything"]
+        );
+        assert!(server.enabled);
+    }
+
+    #[test]
+    fn mcp_server_enabled_defaults_to_true() {
+        let dir = temp_project_dir();
+        let kode_dir = dir.join(".kode");
+        std::fs::create_dir_all(&kode_dir).unwrap();
+        std::fs::write(
+            kode_dir.join("config.toml"),
+            "[mcp.servers.everything]\ncommand = \"npx\"\n",
+        )
+        .unwrap();
+
+        let cfg = KodeConfig::load(&dir).unwrap();
+        let server = cfg.mcp.servers.get("everything").unwrap();
+        assert!(server.enabled);
+        assert!(server.args.is_empty());
     }
 
     #[test]
