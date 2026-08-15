@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use kode_agent::Agent;
-use kode_context::{ContextCompiler, ContextRequest};
+use kode_context::{CompiledContext, ContextCompiler, ContextRequest, ContextSource};
 use kode_core::CancellationToken;
 use kode_core::config::KodeConfig;
 use kode_core::event::{EventBus, KodeEvent};
@@ -197,6 +197,10 @@ pub async fn run_task(
         token_estimate: compiled.token_estimate(),
         sections: compiled.sections.len(),
     });
+    events.emit(knowledge_from(
+        &compiled,
+        config.agent.context_budget_tokens as usize,
+    ));
     events.emit(KodeEvent::Note {
         text: compiled.summary_line(),
     });
@@ -269,6 +273,150 @@ pub async fn run_task(
     Ok(())
 }
 
+/// Builds a `KodeEvent::Knowledge` digest from a compiled context. Pure —
+/// no I/O, safe to unit test with a hand-built `CompiledContext`.
+fn knowledge_from(compiled: &CompiledContext, budget: usize) -> KodeEvent {
+    KodeEvent::Knowledge {
+        zindeks: zindeks_lines(compiled),
+        ingat: ingat_lines(compiled),
+        git: git_lines(compiled),
+        context_tokens: compiled.stats.compiled_tokens,
+        budget_tokens: budget,
+    }
+}
+
+/// Up to 3 distinct `**path**`-style file headers pulled from the
+/// CodeIntelligence section body(ies), rendered as `path (score)` when a
+/// trailing `(...)` is present, else just `path`. Falls back to a section
+/// count/token summary when no such headers parse.
+fn zindeks_lines(compiled: &CompiledContext) -> Vec<String> {
+    let intel_sections: Vec<&kode_context::ContextSection> = compiled
+        .sections
+        .iter()
+        .filter(|s| s.source == ContextSource::CodeIntelligence)
+        .collect();
+    if intel_sections.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    for section in &intel_sections {
+        for raw in section.body.lines() {
+            if let Some(parsed) = parse_zindeks_header(raw)
+                && !lines.contains(&parsed)
+            {
+                lines.push(parsed);
+                if lines.len() == 3 {
+                    return lines;
+                }
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        let tokens: usize = intel_sections.iter().map(|s| s.tokens).sum();
+        vec![format!(
+            "{} context sections · {tokens} tokens",
+            intel_sections.len()
+        )]
+    } else {
+        lines
+    }
+}
+
+/// Parses a markdown file-header line like `**src/foo.rs** (0.83)` into
+/// `"src/foo.rs (0.83)"`, or `**src/foo.rs**` into `"src/foo.rs"`. Returns
+/// `None` when `line` isn't a `**...**`-style header.
+fn parse_zindeks_header(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix("**")?;
+    let (path, after) = rest.split_once("**")?;
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let after = after.trim();
+    if after.starts_with('(') && after.ends_with(')') {
+        Some(format!("{path} {after}"))
+    } else {
+        Some(path.to_string())
+    }
+}
+
+/// First bullet's summary text (leading `- **[kind]** ` stripped) per
+/// Memory-source section, max 2, each truncated to 60 chars (char-safe).
+fn ingat_lines(compiled: &CompiledContext) -> Vec<String> {
+    let mut lines = Vec::new();
+    for section in compiled
+        .sections
+        .iter()
+        .filter(|s| s.source == ContextSource::Memory)
+    {
+        if let Some(first_bullet) = section.body.lines().next() {
+            lines.push(truncate_chars(strip_bullet_prefix(first_bullet), 60));
+            if lines.len() == 2 {
+                break;
+            }
+        }
+    }
+    lines
+}
+
+/// Strips the `- **[kind]** ` prefix `format_memory_bullet` in
+/// `kode-context` adds ahead of a memory's summary text.
+fn strip_bullet_prefix(bullet: &str) -> &str {
+    let trimmed = bullet.trim_start();
+    let Some(after_dash) = trimmed.strip_prefix("- ") else {
+        return trimmed;
+    };
+    let Some(after_open) = after_dash.strip_prefix("**[") else {
+        return after_dash;
+    };
+    match after_open.split_once("]** ") {
+        Some((_, rest)) => rest,
+        None => after_open,
+    }
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut truncated: String = s.chars().take(max).collect();
+        truncated.push('…');
+        truncated
+    }
+}
+
+/// `"{n} files changed"` from the Git section's `status:` block, or an
+/// empty vec when there is no Git section (clean tree / not a repo).
+fn git_lines(compiled: &CompiledContext) -> Vec<String> {
+    let Some(section) = compiled
+        .sections
+        .iter()
+        .find(|s| s.source == ContextSource::Git)
+    else {
+        return Vec::new();
+    };
+    let after_status = section
+        .body
+        .strip_prefix("status:\n")
+        .unwrap_or(&section.body);
+    let status_block = after_status
+        .split("\n\ndiff:\n")
+        .next()
+        .unwrap_or(after_status);
+    let n = status_block
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count();
+    if n == 0 {
+        Vec::new()
+    } else {
+        vec![format!("{n} files changed")]
+    }
+}
+
 fn emit_step_lines(events: &EventBus, report: &kode_verify::VerificationReport) {
     for step in &report.steps {
         let tag = match &step.status {
@@ -279,5 +427,142 @@ fn emit_step_lines(events: &EventBus, report: &kode_verify::VerificationReport) 
         events.emit(KodeEvent::Note {
             text: format!("{}: {tag}", step.name),
         });
+    }
+}
+
+#[cfg(test)]
+mod knowledge_tests {
+    use super::*;
+    use kode_context::{ContextSection, ContextStats};
+
+    fn section(source: ContextSource, title: &str, body: &str) -> ContextSection {
+        ContextSection {
+            source,
+            title: title.to_string(),
+            body: body.to_string(),
+            tokens: body.len().div_ceil(4),
+        }
+    }
+
+    fn compiled(sections: Vec<ContextSection>, compiled_tokens: usize) -> CompiledContext {
+        CompiledContext {
+            sections,
+            stats: ContextStats {
+                compiled_tokens,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn knowledge_from_empty_compiled_yields_all_empty_vecs() {
+        let c = compiled(vec![], 0);
+        let ev = knowledge_from(&c, 16_000);
+        match ev {
+            KodeEvent::Knowledge {
+                zindeks,
+                ingat,
+                git,
+                context_tokens,
+                budget_tokens,
+            } => {
+                assert!(zindeks.is_empty());
+                assert!(ingat.is_empty());
+                assert!(git.is_empty());
+                assert_eq!(context_tokens, 0);
+                assert_eq!(budget_tokens, 16_000);
+            }
+            other => panic!("expected Knowledge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn knowledge_from_full_sections_extracts_all_three_sources() {
+        let intel_body = "**src/foo.rs** (0.91)\nsome context\n**src/bar.rs** (0.80)\n**src/baz.rs**\n**src/qux.rs**\n";
+        let memory_body = "- **[project-rule]** always prefix shell commands with rtk immediately every single time no exceptions — full body text here";
+        let git_body = "status:\nM foo.rs\nA bar.rs\n\ndiff:\n+ line\n- line";
+
+        let c = compiled(
+            vec![
+                section(
+                    ContextSource::CodeIntelligence,
+                    "Repository context",
+                    intel_body,
+                ),
+                section(
+                    ContextSource::Memory,
+                    "Project rules & conventions",
+                    memory_body,
+                ),
+                section(ContextSource::Git, "Uncommitted changes", git_body),
+            ],
+            4200,
+        );
+
+        let ev = knowledge_from(&c, 16_000);
+        match ev {
+            KodeEvent::Knowledge {
+                zindeks,
+                ingat,
+                git,
+                context_tokens,
+                budget_tokens,
+            } => {
+                assert_eq!(
+                    zindeks,
+                    vec![
+                        "src/foo.rs (0.91)".to_string(),
+                        "src/bar.rs (0.80)".to_string(),
+                        "src/baz.rs".to_string(),
+                    ]
+                );
+                assert_eq!(
+                    ingat,
+                    vec![
+                        "always prefix shell commands with rtk immediately every sing…".to_string()
+                    ]
+                );
+                assert_eq!(git, vec!["2 files changed".to_string()]);
+                assert_eq!(context_tokens, 4200);
+                assert_eq!(budget_tokens, 16_000);
+            }
+            other => panic!("expected Knowledge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn knowledge_from_unparseable_zindeks_markdown_falls_back_to_summary() {
+        let intel_body = "no bold headers here\njust plain repository context text";
+        let c = compiled(
+            vec![section(
+                ContextSource::CodeIntelligence,
+                "Repository context",
+                intel_body,
+            )],
+            10,
+        );
+
+        let ev = knowledge_from(&c, 16_000);
+        match ev {
+            KodeEvent::Knowledge { zindeks, .. } => {
+                assert_eq!(zindeks.len(), 1);
+                assert!(zindeks[0].contains("context sections"));
+                assert!(zindeks[0].contains("tokens"));
+            }
+            other => panic!("expected Knowledge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn git_lines_empty_when_no_git_section() {
+        let c = compiled(
+            vec![section(
+                ContextSource::CodeIntelligence,
+                "Repository context",
+                "**src/foo.rs**",
+            )],
+            10,
+        );
+        assert!(git_lines(&c).is_empty());
     }
 }

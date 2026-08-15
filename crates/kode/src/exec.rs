@@ -55,6 +55,19 @@ pub async fn run(
                 Ok(KodeEvent::Note { text }) => {
                     eprintln!("◆ {text}");
                 }
+                Ok(KodeEvent::Knowledge {
+                    zindeks,
+                    ingat,
+                    git,
+                    ..
+                }) => {
+                    eprintln!(
+                        "◆ knows: Z:{} I:{} G:{}",
+                        zindeks.len(),
+                        ingat.len(),
+                        git.len()
+                    );
+                }
                 Ok(KodeEvent::TaskFinished {
                     iterations,
                     tool_calls,

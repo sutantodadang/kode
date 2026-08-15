@@ -44,6 +44,19 @@ pub enum KodeEvent {
         input_tokens: u64,
         output_tokens: u64,
     },
+    /// Emitted once per context compilation, alongside `ContextCompiled`.
+    /// Carries a UI-ready digest of what the agent knows for this task:
+    /// up to 3 zindeks fact lines, up to 2 ingat memory summaries, up to 1
+    /// git impact line, and the compiled/budget token counts. Frontends
+    /// render this as they see fit (TUI: Knowledge Band; headless: a
+    /// compact summary line).
+    Knowledge {
+        zindeks: Vec<String>,
+        ingat: Vec<String>,
+        git: Vec<String>,
+        context_tokens: usize,
+        budget_tokens: usize,
+    },
 }
 
 /// Broadcast bus for `KodeEvent`s.

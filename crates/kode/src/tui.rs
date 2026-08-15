@@ -1,7 +1,10 @@
+mod theme;
+
 use std::collections::VecDeque;
 use std::io::Stdout;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -16,14 +19,14 @@ use kode_tools::permission::PermissionHandler;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::pipeline;
 
-/// The agent run's current phase, shown in the status bar.
+/// The agent run's current phase, shown in the breadcrumb/spinner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
     Idle,
@@ -66,6 +69,62 @@ impl StatusInfo {
     }
 }
 
+/// Provenance tag for one transcript line, rendered as a 2-col gutter
+/// prefix (see `gutter_prefix`). Per `DESIGN.md`: color = provenance,
+/// never decoration — never fake provenance on prose the sources didn't
+/// produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gutter {
+    /// Blank spacer line — no glyph.
+    None,
+    /// Agent prose (flushed model token stream).
+    Prose,
+    /// A tool ran (started, or finished ok — no animation on success).
+    Tool,
+    /// A tool finished with an error.
+    ToolFail,
+    /// A verification result line. Not yet emitted by `apply_event` (the
+    /// pipeline currently reports verification steps as generic `Note`
+    /// events) — reserved so a future per-step Verify event can render
+    /// distinctly without another gutter/glyph addition.
+    #[allow(dead_code)]
+    Verify,
+    /// A progress/degradation note.
+    Note,
+    /// An agent-level error.
+    Error,
+    /// Echoed user input.
+    User,
+}
+
+/// One line of transcript: its provenance gutter plus the rendered text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptLine {
+    pub gutter: Gutter,
+    pub text: String,
+}
+
+impl TranscriptLine {
+    pub fn new(gutter: Gutter, text: impl Into<String>) -> Self {
+        Self {
+            gutter,
+            text: text.into(),
+        }
+    }
+}
+
+/// The Knowledge Band's data — the last `KodeEvent::Knowledge` digest
+/// received. Absent (`AppState::knowledge == None`) before the first
+/// context compilation of the session.
+#[derive(Debug, Clone, Default)]
+pub struct KnowledgeState {
+    pub zindeks: Vec<String>,
+    pub ingat: Vec<String>,
+    pub git: Vec<String>,
+    pub context_tokens: usize,
+    pub budget_tokens: usize,
+}
+
 /// A pending permission request awaiting a y/n answer from the user.
 pub struct PermReq {
     pub summary: String,
@@ -95,7 +154,7 @@ pub struct PickerLoaded {
 /// Pure UI state, driven by `apply_event`. Kept free of any terminal I/O so
 /// it can be unit tested directly.
 pub struct AppState {
-    pub transcript: Vec<String>,
+    pub transcript: Vec<TranscriptLine>,
     pub current_stream: String,
     pub status: StatusInfo,
     pub running: bool,
@@ -104,6 +163,22 @@ pub struct AppState {
     pub follow: bool,
     pub input: String,
     pub picker: PickerState,
+    /// Last received Knowledge digest; `None` until the first context
+    /// compilation of the session completes.
+    pub knowledge: Option<KnowledgeState>,
+    /// User-toggled visibility of the Knowledge Band (Ctrl+K).
+    pub knowledge_band_open: bool,
+    /// Last path component of the working directory, shown in the
+    /// breadcrumb. Set once at startup.
+    pub repo_dir: String,
+    /// Current git branch (`git branch --show-current`), best-effort, read
+    /// once at startup. `None` when not a git repo / git unavailable.
+    pub branch: Option<String>,
+    /// When the current run started, for the elapsed-time spinner label.
+    pub run_started: Option<Instant>,
+    /// Name of the tool currently running, if any (drives the spinner
+    /// label: tool name vs. generic "thinking").
+    pub current_tool: Option<String>,
 }
 
 impl AppState {
@@ -118,6 +193,12 @@ impl AppState {
             follow: true,
             input: String::new(),
             picker: PickerState::default(),
+            knowledge: None,
+            knowledge_band_open: true,
+            repo_dir: String::new(),
+            branch: None,
+            run_started: None,
+            current_tool: None,
         }
     }
 
@@ -135,15 +216,24 @@ impl AppState {
 /// the transcript always reads as a sequence of complete lines.
 pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
     if !matches!(ev, KodeEvent::ModelToken { .. }) && !state.current_stream.is_empty() {
-        state
-            .transcript
-            .push(std::mem::take(&mut state.current_stream));
+        let text = std::mem::take(&mut state.current_stream);
+        for line in text.split('\n') {
+            if line.is_empty() {
+                state.transcript.push(TranscriptLine::new(Gutter::None, ""));
+            } else {
+                state
+                    .transcript
+                    .push(TranscriptLine::new(Gutter::Prose, line));
+            }
+        }
     }
 
     match ev {
         KodeEvent::AgentStarted => {
             state.running = true;
             state.status.state = RunState::Thinking;
+            state.run_started = Some(Instant::now());
+            state.current_tool = None;
         }
         KodeEvent::ContextCompilationStarted => {}
         KodeEvent::ContextCompiled {
@@ -154,36 +244,53 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
         }
         KodeEvent::ModelStarted => {
             state.status.state = RunState::Thinking;
+            state.current_tool = None;
         }
         KodeEvent::ModelToken { text } => {
             state.current_stream.push_str(&text);
         }
         KodeEvent::ToolRequested { .. } => {}
         KodeEvent::ToolStarted { name } => {
-            state.transcript.push(format!("▸ {name}"));
+            state
+                .transcript
+                .push(TranscriptLine::new(Gutter::Tool, name.clone()));
             state.status.tools_used += 1;
             state.status.state = RunState::Tool;
+            state.current_tool = Some(name);
         }
         KodeEvent::ToolFinished { name, ok } => {
             if !ok {
-                state.transcript.push(format!("▸ {name} failed"));
+                state.transcript.push(TranscriptLine::new(
+                    Gutter::ToolFail,
+                    format!("{name} failed"),
+                ));
             }
+            state.current_tool = None;
         }
         KodeEvent::VerificationStarted => {
             state.status.state = RunState::Verify;
+            state.current_tool = None;
         }
         KodeEvent::VerificationFinished { .. } => {}
         KodeEvent::AgentFinished => {
             state.running = false;
             state.status.state = RunState::Idle;
+            state.run_started = None;
+            state.current_tool = None;
         }
         KodeEvent::AgentError { message } => {
-            state.transcript.push(format!("error: {message}"));
+            state
+                .transcript
+                .push(TranscriptLine::new(Gutter::Error, message));
             state.running = false;
             state.status.state = RunState::Idle;
+            state.run_started = None;
+            state.current_tool = None;
         }
         KodeEvent::Note { text } => {
-            state.transcript.push(format!("◆ {text}"));
+            state
+                .transcript
+                .push(TranscriptLine::new(Gutter::Note, text));
         }
         KodeEvent::TaskFinished {
             iterations,
@@ -191,11 +298,31 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             input_tokens,
             output_tokens,
         } => {
-            state.transcript.push(format!(
-                "— {iterations} iterations, {tool_calls} tool calls, {input_tokens}→{output_tokens} tokens"
+            state.transcript.push(TranscriptLine::new(
+                Gutter::Note,
+                format!(
+                    "{iterations} iterations, {tool_calls} tool calls, {input_tokens}→{output_tokens} tokens"
+                ),
             ));
             state.running = false;
             state.status.state = RunState::Idle;
+            state.run_started = None;
+            state.current_tool = None;
+        }
+        KodeEvent::Knowledge {
+            zindeks,
+            ingat,
+            git,
+            context_tokens,
+            budget_tokens,
+        } => {
+            state.knowledge = Some(KnowledgeState {
+                zindeks,
+                ingat,
+                git,
+                context_tokens,
+                budget_tokens,
+            });
         }
     }
 }
@@ -368,25 +495,36 @@ fn handle_slash_command(
             state.status.model = name.clone();
             config.model.model = name.clone();
             let _ = KodeConfig::update_model_selection(cwd, Some(&name), None);
-            state.transcript.push(format!("◆ model set: {name}"));
+            state.transcript.push(TranscriptLine::new(
+                Gutter::Note,
+                format!("model set: {name}"),
+            ));
         }
         SlashCommand::Effort(value) => match validate_effort(&value) {
             Ok(v) => {
                 state.status.effort = v.clone();
                 config.model.effort = v.clone();
                 let _ = KodeConfig::update_model_selection(cwd, None, Some(&v));
-                state.transcript.push(format!("◆ effort set: {v}"));
+                state.transcript.push(TranscriptLine::new(
+                    Gutter::Note,
+                    format!("effort set: {v}"),
+                ));
             }
-            Err(msg) => state.transcript.push(format!("◆ {msg}")),
+            Err(msg) => state
+                .transcript
+                .push(TranscriptLine::new(Gutter::Note, msg)),
         },
         SlashCommand::Help => {
-            state.transcript.push(
-                "◆ commands: /model [name], /effort <minimal|low|medium|high|xhigh>, /help"
-                    .to_string(),
-            );
+            state.transcript.push(TranscriptLine::new(
+                Gutter::Note,
+                "commands: /model [name], /effort <minimal|low|medium|high|xhigh>, /help",
+            ));
         }
         SlashCommand::Unknown(cmd) => {
-            state.transcript.push(format!("◆ unknown command: {cmd}"));
+            state.transcript.push(TranscriptLine::new(
+                Gutter::Note,
+                format!("unknown command: {cmd}"),
+            ));
         }
     }
 }
@@ -425,6 +563,26 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Best-effort current branch via `git branch --show-current`. `None` when
+/// not a git repo, git is unavailable, or the repo has no commits yet.
+fn detect_branch(cwd: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8(output.stdout).ok()?;
+    let trimmed = branch.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 /// Launches the interactive TUI. Runs until the user quits (Ctrl-C/'q' while
 /// idle) or the process is otherwise terminated.
 pub async fn run(cwd: &Path, cancel: CancellationToken) -> anyhow::Result<()> {
@@ -442,6 +600,11 @@ pub async fn run(cwd: &Path, cancel: CancellationToken) -> anyhow::Result<()> {
         config.model.model.clone(),
         config.model.effort.clone(),
     );
+    state.repo_dir = cwd
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| cwd.display().to_string());
+    state.branch = detect_branch(cwd);
 
     let (perm_tx, mut perm_rx) = mpsc::unbounded_channel::<(String, oneshot::Sender<bool>)>();
     let handler: Arc<dyn PermissionHandler> = Arc::new(TuiPermission::new(perm_tx));
@@ -469,7 +632,10 @@ pub async fn run(cwd: &Path, cancel: CancellationToken) -> anyhow::Result<()> {
                                     state.status.model = model.clone();
                                     config.model.model = model.clone();
                                     let _ = KodeConfig::update_model_selection(cwd, Some(&model), None);
-                                    state.transcript.push(format!("◆ model set: {model}"));
+                                    state.transcript.push(TranscriptLine::new(
+                                        Gutter::Note,
+                                        format!("model set: {model}"),
+                                    ));
                                     state.picker.open = false;
                                 }
                                 PickerOutcome::Cancel => {
@@ -486,10 +652,13 @@ pub async fn run(cwd: &Path, cancel: CancellationToken) -> anyhow::Result<()> {
                                 if let Some(cmd) = parse_slash_command(&input) {
                                     handle_slash_command(&mut state, cwd, &mut config, &picker_tx, cmd);
                                 } else if state.status.model.is_empty() {
-                                    state.transcript.push("◆ pick a model first".to_string());
+                                    state.transcript.push(TranscriptLine::new(Gutter::Note, "pick a model first"));
                                     open_picker(&mut state, config.model.provider.clone(), &picker_tx);
                                 } else {
                                     let task = input;
+                                    state
+                                        .transcript
+                                        .push(TranscriptLine::new(Gutter::User, task.clone()));
                                     let child = cancel.child_token();
                                     current_cancel = Some(child.clone());
                                     state.running = true;
@@ -573,6 +742,11 @@ fn handle_key(
         return false;
     }
 
+    if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('k') {
+        state.knowledge_band_open = !state.knowledge_band_open;
+        return false;
+    }
+
     match code {
         KeyCode::Esc => {
             if state.running
@@ -619,56 +793,245 @@ fn handle_key(
     false
 }
 
-fn draw(f: &mut ratatui::Frame, state: &AppState) {
-    let has_pending = !state.pending.is_empty();
-    let constraints = if has_pending {
-        vec![
-            Constraint::Min(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(3),
-        ]
+/// Renders an 8-cell (by default) meter string: `▓` for filled cells,
+/// `░` for empty ones. `budget == 0` yields an all-empty meter (no
+/// division by zero). Pure — the caller applies Z/DIM coloring per cell.
+pub fn meter(used: usize, budget: usize, cells: usize) -> String {
+    let filled = if budget == 0 {
+        0
     } else {
-        vec![
-            Constraint::Min(1),
-            Constraint::Length(1),
-            Constraint::Length(3),
-        ]
+        let ratio = used as f64 / budget as f64;
+        ((ratio * cells as f64).round() as usize).min(cells)
     };
-    let areas = Layout::vertical(constraints).split(f.area());
+    let mut s = String::with_capacity(cells);
+    for i in 0..cells {
+        s.push(if i < filled { '▓' } else { '░' });
+    }
+    s
+}
 
-    let mut lines: Vec<Line> = state
+/// True when the Knowledge Band should render: the user hasn't collapsed
+/// it (Ctrl+K), a `Knowledge` event has arrived, and at least one source
+/// has data. Per `DESIGN.md`: never fake provenance — the band is hidden
+/// entirely when a source is unavailable/empty, never shown padded/empty.
+pub fn knowledge_band_visible(state: &AppState) -> bool {
+    state.knowledge_band_open
+        && state
+            .knowledge
+            .as_ref()
+            .is_some_and(|k| !k.zindeks.is_empty() || !k.ingat.is_empty() || !k.git.is_empty())
+}
+
+/// Formats a token count compactly: `<1000` verbatim, else `"{n:.1}k"`.
+fn format_k(n: usize) -> String {
+    if n < 1000 {
+        n.to_string()
+    } else {
+        format!("{:.1}k", n as f64 / 1000.0)
+    }
+}
+
+const SPINNER_FRAMES: [char; 4] = ['·', '•', '●', '•'];
+
+/// The single spinner instance's frame for `elapsed_ms`, cycling at 4 Hz
+/// (one of the 4 frames every 250ms). Per `DESIGN.md`: ONE moving region
+/// max, exactly these frames.
+fn spinner_frame(elapsed_ms: u128) -> char {
+    let idx = ((elapsed_ms / 250) % 4) as usize;
+    SPINNER_FRAMES[idx]
+}
+
+/// Maps a `Gutter` to its fixed 2-col glyph prefix and color, per
+/// `DESIGN.md`'s glyph vocabulary. Every color pairs with a fixed glyph —
+/// shape carries meaning without color.
+fn gutter_prefix(gutter: &Gutter) -> (&'static str, Color) {
+    match gutter {
+        Gutter::None => ("  ", Color::Reset),
+        Gutter::Prose => ("│ ", theme::DIM),
+        Gutter::Tool => ("T▸", theme::T),
+        Gutter::ToolFail => ("T▸", theme::ERR),
+        Gutter::Verify => ("V ", theme::OK),
+        Gutter::Note => ("· ", theme::DIM),
+        Gutter::Error => ("× ", theme::ERR),
+        Gutter::User => ("› ", theme::MUTED),
+    }
+}
+
+/// Renders one transcript line as a gutter span + text span. Long lines
+/// wrap via `Paragraph`'s own word-wrap without gutter-aligned
+/// continuation (acceptable ceiling for this phase).
+fn transcript_line_to_ratatui(line: &TranscriptLine) -> Line<'static> {
+    let (prefix, color) = gutter_prefix(&line.gutter);
+    Line::from(vec![
+        Span::styled(prefix, Style::default().fg(color)),
+        Span::raw(line.text.clone()),
+    ])
+}
+
+/// Builds the breadcrumb row: `kode  {repo} · {branch} · {provider}/{model}
+/// · effort:{e} · ctx ▓▓░░ {used}/{budget}`. The context meter is omitted
+/// until the first `Knowledge` event of the session.
+fn breadcrumb_line(state: &AppState) -> Line<'static> {
+    let branch = state.branch.clone().unwrap_or_else(|| "no git".to_string());
+    let effort = if state.status.effort.is_empty() {
+        "-".to_string()
+    } else {
+        state.status.effort.clone()
+    };
+    let model = if state.status.model.is_empty() {
+        "(no model)".to_string()
+    } else {
+        state.status.model.clone()
+    };
+    let prefix = format!(
+        " kode  {} · {branch} · {}/{model} · effort:{effort}",
+        state.repo_dir, state.status.provider
+    );
+    let mut spans = vec![Span::raw(prefix)];
+    if let Some(ks) = &state.knowledge {
+        let bar = meter(ks.context_tokens, ks.budget_tokens, 8);
+        let filled = bar.chars().filter(|c| *c == '▓').count();
+        spans.push(Span::raw(" · ctx "));
+        spans.push(Span::styled(
+            bar.chars().take(filled).collect::<String>(),
+            Style::default().fg(theme::Z),
+        ));
+        spans.push(Span::styled(
+            bar.chars().skip(filled).collect::<String>(),
+            Style::default().fg(theme::DIM),
+        ));
+        spans.push(Span::raw(format!(
+            " {}/{}",
+            format_k(ks.context_tokens),
+            format_k(ks.budget_tokens)
+        )));
+    }
+    Line::from(spans)
+}
+
+/// Builds the Knowledge Band's content lines (not including the trailing
+/// rule line, which needs the render-time area width). Row 1: `Z {first
+/// zindeks fact}`, indented continuation lines for the rest; then one `I`
+/// line per ingat summary (quoted, italic); then one `G` line for the git
+/// impact. Sources with empty vecs render nothing.
+fn knowledge_band_lines(ks: &KnowledgeState) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = Vec::new();
+
+    if let Some((first, rest)) = ks.zindeks.split_first() {
+        lines.push(Line::from(vec![
+            Span::raw(" KNOWS  "),
+            Span::styled(
+                format!("Z {first}"),
+                Style::default().fg(theme::Z).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        for extra in rest {
+            lines.push(Line::from(Span::styled(
+                format!("          {extra}"),
+                Style::default().fg(theme::Z),
+            )));
+        }
+    }
+
+    for entry in &ks.ingat {
+        lines.push(Line::from(vec![
+            Span::raw(" KNOWS  "),
+            Span::styled("I ", Style::default().fg(theme::I)),
+            Span::styled(
+                format!("\u{201c}{entry}\u{201d}"),
+                Style::default().fg(theme::I).add_modifier(Modifier::ITALIC),
+            ),
+        ]));
+    }
+
+    if let Some(git_line) = ks.git.first() {
+        lines.push(Line::from(vec![
+            Span::raw(" KNOWS  "),
+            Span::styled("G ", Style::default().fg(theme::G)),
+            Span::styled(git_line.clone(), Style::default().fg(theme::G)),
+        ]));
+    }
+
+    lines
+}
+
+/// Renders the Knowledge Band into `area`: `lines`' content plus a
+/// trailing DIM `─` rule spanning `area`'s full width — the only
+/// horizontal rule besides the one above the input box.
+fn draw_knowledge_band(
+    f: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    mut lines: Vec<Line<'static>>,
+) {
+    let rule: String = "─".repeat(area.width as usize);
+    lines.push(Line::from(Span::styled(
+        rule,
+        Style::default().fg(theme::DIM),
+    )));
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw(f: &mut ratatui::Frame, state: &AppState) {
+    let band_lines = if knowledge_band_visible(state) {
+        state.knowledge.as_ref().map(knowledge_band_lines)
+    } else {
+        None
+    };
+    let band_height = band_lines.as_ref().map(|l| l.len() as u16 + 1).unwrap_or(0);
+
+    let has_pending = !state.pending.is_empty();
+
+    let mut constraints = vec![Constraint::Length(1)]; // breadcrumb
+    if band_height > 0 {
+        constraints.push(Constraint::Length(band_height));
+    }
+    constraints.push(Constraint::Min(1)); // transcript
+    if has_pending {
+        constraints.push(Constraint::Length(3));
+    }
+    constraints.push(Constraint::Length(3)); // input
+
+    let areas = Layout::vertical(constraints).split(f.area());
+    let mut idx = 0;
+
+    f.render_widget(Paragraph::new(breadcrumb_line(state)), areas[idx]);
+    idx += 1;
+
+    if let Some(lines) = band_lines {
+        draw_knowledge_band(f, areas[idx], lines);
+        idx += 1;
+    }
+
+    let mut text_lines: Vec<Line> = state
         .transcript
         .iter()
-        .map(|l| Line::from(l.as_str()))
+        .map(transcript_line_to_ratatui)
         .collect();
     if !state.current_stream.is_empty() {
-        lines.push(Line::from(state.current_stream.as_str()));
+        text_lines.push(transcript_line_to_ratatui(&TranscriptLine::new(
+            Gutter::Prose,
+            state.current_stream.clone(),
+        )));
     }
-    let transcript = Paragraph::new(lines)
+    if state.running {
+        let elapsed = state.run_started.map(|t| t.elapsed()).unwrap_or_default();
+        let frame = spinner_frame(elapsed.as_millis());
+        let secs = elapsed.as_secs_f64();
+        let label = match &state.current_tool {
+            Some(tool) => format!("▸ {tool} · {secs:.1}s"),
+            None => format!("{frame} {} · {secs:.1}s", state.status.state.label()),
+        };
+        text_lines.push(Line::from(Span::styled(
+            label,
+            Style::default().fg(theme::T),
+        )));
+    }
+    let transcript = Paragraph::new(text_lines)
         .wrap(Wrap { trim: false })
         .scroll((state.scroll, 0))
         .block(Block::default().borders(Borders::NONE));
-    f.render_widget(transcript, areas[0]);
-
-    let status = format!(
-        "{} / {} / effort:{} | {} tokens | {} tools | {}",
-        state.status.provider,
-        if state.status.model.is_empty() {
-            "(no model)"
-        } else {
-            state.status.model.as_str()
-        },
-        if state.status.effort.is_empty() {
-            "-"
-        } else {
-            state.status.effort.as_str()
-        },
-        state.status.context_tokens,
-        state.status.tools_used,
-        state.status.state.label(),
-    );
-    f.render_widget(Paragraph::new(status), areas[1]);
+    f.render_widget(transcript, areas[idx]);
+    idx += 1;
 
     let next_area = if has_pending {
         let req_line = state
@@ -679,13 +1042,14 @@ fn draw(f: &mut ratatui::Frame, state: &AppState) {
         f.render_widget(
             Paragraph::new(Span::styled(
                 req_line,
-                Style::default().bg(Color::Yellow).fg(Color::Black),
+                Style::default().fg(theme::I).add_modifier(Modifier::BOLD),
             )),
-            areas[2],
+            areas[idx],
         );
-        areas[3]
+        idx += 1;
+        areas[idx]
     } else {
-        areas[2]
+        areas[idx]
     };
 
     let input = Paragraph::new(state.input.as_str())
@@ -775,10 +1139,17 @@ mod tests {
                 name: "read_file".into(),
             },
         );
-        assert_eq!(s.transcript, vec!["thinking...", "▸ read_file"]);
+        assert_eq!(
+            s.transcript,
+            vec![
+                TranscriptLine::new(Gutter::Prose, "thinking..."),
+                TranscriptLine::new(Gutter::Tool, "read_file"),
+            ]
+        );
         assert!(s.current_stream.is_empty());
         assert_eq!(s.status.tools_used, 1);
         assert_eq!(s.status.state, RunState::Tool);
+        assert_eq!(s.current_tool, Some("read_file".to_string()));
     }
 
     #[test]
@@ -791,7 +1162,11 @@ mod tests {
                 ok: false,
             },
         );
-        assert_eq!(s.transcript, vec!["▸ run_shell failed"]);
+        assert_eq!(
+            s.transcript,
+            vec![TranscriptLine::new(Gutter::ToolFail, "run_shell failed")]
+        );
+        assert_eq!(s.current_tool, None);
     }
 
     #[test]
@@ -808,7 +1183,7 @@ mod tests {
     }
 
     #[test]
-    fn note_pushes_diamond_prefixed_line() {
+    fn note_pushes_note_gutter_line() {
         let mut s = state();
         apply_event(
             &mut s,
@@ -816,7 +1191,13 @@ mod tests {
                 text: "code intelligence unavailable".into(),
             },
         );
-        assert_eq!(s.transcript, vec!["◆ code intelligence unavailable"]);
+        assert_eq!(
+            s.transcript,
+            vec![TranscriptLine::new(
+                Gutter::Note,
+                "code intelligence unavailable"
+            )]
+        );
     }
 
     #[test]
@@ -850,7 +1231,10 @@ mod tests {
         assert_eq!(s.status.state, RunState::Idle);
         assert_eq!(
             s.transcript,
-            vec!["— 3 iterations, 5 tool calls, 100→50 tokens"]
+            vec![TranscriptLine::new(
+                Gutter::Note,
+                "3 iterations, 5 tool calls, 100→50 tokens"
+            )]
         );
     }
 
@@ -860,6 +1244,7 @@ mod tests {
         apply_event(&mut s, KodeEvent::AgentStarted);
         assert!(s.running);
         assert_eq!(s.status.state, RunState::Thinking);
+        assert!(s.run_started.is_some());
     }
 
     #[test]
@@ -869,6 +1254,7 @@ mod tests {
         apply_event(&mut s, KodeEvent::AgentFinished);
         assert!(!s.running);
         assert_eq!(s.status.state, RunState::Idle);
+        assert!(s.run_started.is_none());
     }
 
     #[test]
@@ -882,7 +1268,32 @@ mod tests {
             },
         );
         assert!(!s.running);
-        assert_eq!(s.transcript, vec!["error: boom"]);
+        assert_eq!(
+            s.transcript,
+            vec![TranscriptLine::new(Gutter::Error, "boom")]
+        );
+    }
+
+    #[test]
+    fn knowledge_event_updates_band_state_without_transcript_push() {
+        let mut s = state();
+        apply_event(
+            &mut s,
+            KodeEvent::Knowledge {
+                zindeks: vec!["src/foo.rs (0.9)".to_string()],
+                ingat: vec!["always prefix with rtk".to_string()],
+                git: vec!["3 files changed".to_string()],
+                context_tokens: 4200,
+                budget_tokens: 16_000,
+            },
+        );
+        assert!(s.transcript.is_empty());
+        let ks = s.knowledge.as_ref().expect("knowledge set");
+        assert_eq!(ks.zindeks, vec!["src/foo.rs (0.9)".to_string()]);
+        assert_eq!(ks.ingat, vec!["always prefix with rtk".to_string()]);
+        assert_eq!(ks.git, vec!["3 files changed".to_string()]);
+        assert_eq!(ks.context_tokens, 4200);
+        assert_eq!(ks.budget_tokens, 16_000);
     }
 
     #[test]
@@ -974,6 +1385,88 @@ mod tests {
         assert!(!s.follow);
         handle_key(&mut s, KeyCode::PageDown, KeyModifiers::NONE, &None);
         assert_eq!(s.scroll, 14);
+    }
+
+    #[test]
+    fn handle_key_ctrl_k_toggles_knowledge_band() {
+        let mut s = state();
+        assert!(s.knowledge_band_open);
+        handle_key(&mut s, KeyCode::Char('k'), KeyModifiers::CONTROL, &None);
+        assert!(!s.knowledge_band_open);
+        handle_key(&mut s, KeyCode::Char('k'), KeyModifiers::CONTROL, &None);
+        assert!(s.knowledge_band_open);
+    }
+
+    // -- knowledge band visibility ----------------------------------------
+
+    #[test]
+    fn knowledge_band_visible_false_when_no_knowledge_yet() {
+        let s = state();
+        assert!(!knowledge_band_visible(&s));
+    }
+
+    #[test]
+    fn knowledge_band_visible_false_when_all_sources_empty() {
+        let mut s = state();
+        s.knowledge = Some(KnowledgeState::default());
+        assert!(!knowledge_band_visible(&s));
+    }
+
+    #[test]
+    fn knowledge_band_visible_true_when_a_source_has_data() {
+        let mut s = state();
+        s.knowledge = Some(KnowledgeState {
+            zindeks: vec!["src/foo.rs".to_string()],
+            ..Default::default()
+        });
+        assert!(knowledge_band_visible(&s));
+    }
+
+    #[test]
+    fn knowledge_band_visible_false_when_toggled_closed() {
+        let mut s = state();
+        s.knowledge = Some(KnowledgeState {
+            zindeks: vec!["src/foo.rs".to_string()],
+            ..Default::default()
+        });
+        s.knowledge_band_open = false;
+        assert!(!knowledge_band_visible(&s));
+    }
+
+    // -- breadcrumb meter ---------------------------------------------------
+
+    #[test]
+    fn meter_zero_percent() {
+        assert_eq!(meter(0, 16_000, 8), "░░░░░░░░");
+    }
+
+    #[test]
+    fn meter_fifty_percent() {
+        assert_eq!(meter(8_000, 16_000, 8), "▓▓▓▓░░░░");
+    }
+
+    #[test]
+    fn meter_hundred_percent() {
+        assert_eq!(meter(16_000, 16_000, 8), "▓▓▓▓▓▓▓▓");
+    }
+
+    #[test]
+    fn meter_zero_budget_is_all_empty() {
+        assert_eq!(meter(500, 0, 8), "░░░░░░░░");
+    }
+
+    // -- gutter mapping -------------------------------------------------
+
+    #[test]
+    fn gutter_prefix_matches_glyph_vocabulary() {
+        assert_eq!(gutter_prefix(&Gutter::None).0, "  ");
+        assert_eq!(gutter_prefix(&Gutter::Prose).0, "│ ");
+        assert_eq!(gutter_prefix(&Gutter::Tool).0, "T▸");
+        assert_eq!(gutter_prefix(&Gutter::ToolFail).0, "T▸");
+        assert_eq!(gutter_prefix(&Gutter::Verify).0, "V ");
+        assert_eq!(gutter_prefix(&Gutter::Note).0, "· ");
+        assert_eq!(gutter_prefix(&Gutter::Error).0, "× ");
+        assert_eq!(gutter_prefix(&Gutter::User).0, "› ");
     }
 
     // -- slash commands -----------------------------------------------
@@ -1161,7 +1654,7 @@ mod tests {
 
         assert_eq!(s.status.model, "gpt-5.6-sol");
         assert_eq!(cfg.model.model, "gpt-5.6-sol");
-        assert!(s.transcript.iter().any(|l| l.contains("gpt-5.6-sol")));
+        assert!(s.transcript.iter().any(|l| l.text.contains("gpt-5.6-sol")));
 
         let reloaded = KodeConfig::load(&dir).unwrap();
         assert_eq!(reloaded.model.model, "gpt-5.6-sol");
@@ -1183,7 +1676,11 @@ mod tests {
         );
 
         assert_eq!(cfg.model.effort, "");
-        assert!(s.transcript.iter().any(|l| l.contains("invalid effort")));
+        assert!(
+            s.transcript
+                .iter()
+                .any(|l| l.text.contains("invalid effort"))
+        );
         assert!(!KodeConfig::config_path(&dir).exists());
     }
 
@@ -1217,6 +1714,6 @@ mod tests {
 
         handle_slash_command(&mut s, &dir, &mut cfg, &tx, SlashCommand::Help);
 
-        assert!(s.transcript.iter().any(|l| l.contains("/model")));
+        assert!(s.transcript.iter().any(|l| l.text.contains("/model")));
     }
 }
