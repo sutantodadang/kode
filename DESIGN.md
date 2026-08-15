@@ -1,0 +1,61 @@
+# Design System — Kode TUI
+
+Preview: `.kode-design-preview.html` (rendered mocks of every surface below).
+
+## Product Context
+- **What this is:** Kode — a code-intelligence-first coding agent TUI (Rust/ratatui). The agent knows the repository before acting: zindeks code graph + ingat engineering memory feed a provenance-tracked context compiler.
+- **Who it's for:** engineers living in the terminal who distrust black-box agents.
+- **Competitors:** Claude Code, Codex CLI, opencode, crush — all chat-transcript-first; none surface what the agent knows.
+- **Memorable thing:** *intelligence made visible* — you SEE what the agent knows and where every claim came from.
+
+## Aesthetic Direction
+- **Direction:** calm instrument. "Senior engineer who read the system", not "AI typing excitedly."
+- **Decoration level:** minimal. Evidence composed clearly beats subsystems shouting.
+- **Feel target (first 3 seconds):** "this thing already read my codebase."
+
+## Layout (ratatui panes)
+1. **Breadcrumb** — 1 row, always: repo · branch+state · provider/model · effort · live context meter (`▓▓▓░░ 3.4k/16k`).
+2. **Knowledge Band** — 3 rows under breadcrumb, collapsible (Ctrl+K): `Z` top graph facts, `I` top recalled memory (italic, quoted verbatim), `G` git impact. Real data from the last context compilation only; hidden entirely when a source is unavailable.
+3. **Transcript** — home surface. Agent/event lines carry a 2-col provenance gutter: `Z I G T V` glyphs for knowledge/tool/verification lines, plain `│` for agent prose. Never fake provenance on prose the sources didn't produce.
+4. **Input line** — bottom, `›` prompt, right edge shows per-source context counts (`Z:4 I:2 G:2`).
+5. **Knowledge Aperture** — signature moment. On task submit the band expands ~6 rows: request tree (`─┬─`) with real graph trace, recalled memory + confidence, git impact; contracts on first tool call. Never decorative, never faked; absent when engines are absent.
+6. **Ledger view** — Ctrl+L alternate screen: OBJECTIVE / numbered steps (`01 UNDERSTAND ✓`) / CURRENT CHANGE diff / WHY (provenance lines). Chat history demoted, not deleted.
+- No permanent sidebar. No file tree. Overlays (model picker, ledger) are summoned and dismissed, zero standing footprint.
+
+## Color
+- **Approach:** restrained-semantic. Color = provenance, never decoration. ≤15% of visible cells colored.
+- **Background:** terminal default (respect user themes). Never paint full-screen backgrounds.
+- **Accents (only two brand colors):**
+  - zindeks / structural knowledge: `#63C5DA` (ANSI-256: 80)
+  - ingat / recalled memory: `#D7A85B` (179)
+- **Semantic:**
+  - git: `#8FAE8B` (108) · tools: `#8C9BAB` (103)
+  - verified/pass: `#74B88A` (108) · failure: `#D16D72` (167)
+  - primary text: terminal default / `#D8DEE5` (253) · muted: `#7C8793` (244) · dim structure: `#525C66` (240)
+- Every color pairs with a fixed glyph — shape carries meaning without color (colorblind-safe).
+
+## Glyphs (the whole vocabulary — nothing else)
+- Sources: `Z I G T V` (bold, colored)
+- Progress: `●` active (`◉` alternate), `○` pending, `✓` done, `×` failed
+- Trees: `├─ └─ │ ─┬─` · Relationships: `→` · Input: `›` · Tool: `▸` · Diff: `+ -`
+- Emphasis: **bold** = headings/active/agent conclusions · dim = history/meta/timestamps · *italic* = verbatim quoted ingat memory (only)
+- No emoji in core UI. No box-drawing borders around every section.
+
+## Motion
+- Word/sentence-chunk streaming. No character typewriter effect.
+- ONE moving region max. Single spinner instance: `· • ● •`. Active-step marker `●/◉` at 4 Hz.
+- Unknown duration → elapsed time (`● cargo test 08.4s`). Determinate → `▓▓▓░░ 60%`. Never fake progress.
+- New Z/I evidence steps dim→normal over 3 frames. Settled rows never move again.
+- Diffs, provenance, verification results, user input: never animate.
+- `[ui] reduced_motion = true` kills spinner + pulse.
+
+## Anti-slop (non-negotiable)
+No gradients · no emoji spam · no chat bubbles · no card grids · no permanent sidebar · no spinner beside streaming prose · no color without semantics · no fake thinking animation · no knowledge display without real zindeks/ingat data behind it.
+
+## Decisions Log
+| Date | Decision | Rationale |
+|------|----------|-----------|
+| 2026-08-15 | Initial TUI design system | /design-consultation: Codex voice (workbench/aperture) + Claude voice (marginalia) + research: all 4 competitors are transcript+spinner; provenance lane empty |
+| 2026-08-15 | Transcript stays home; ledger = alternate view | Stage Codex's boldest idea without betting the home screen |
+| 2026-08-15 | Cyan for zindeks, not violet | crush owns purple; cyan+amber unclaimed in the category |
+| 2026-08-15 | Gutter shows real event provenance only | No fake footnotes on LLM prose — honesty > theater |

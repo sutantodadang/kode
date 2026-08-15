@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kode — Calm Instrument</title>
+<style>
+  :root{
+    --bg:#0B0E11; --surface:#12171C; --raised:#1B232B; --line:#39434D;
+    --text:#D8DEE5; --muted:#7C8793; --dim:#525C66;
+    --z:#63C5DA; --i:#D7A85B; --g:#8FAE8B; --t:#8C9BAB; --ok:#74B88A; --err:#D16D72;
+    --mono:"Cascadia Code","JetBrains Mono","Fira Code",ui-monospace,Consolas,monospace;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:var(--bg);color:var(--text);font-family:var(--mono);line-height:1.55;padding:48px 24px}
+  .wrap{max-width:880px;margin:0 auto}
+  h1{font-size:26px;font-weight:600;letter-spacing:-.5px}
+  h1 .k{color:var(--z)} h1 .o{color:var(--i)}
+  .thesis{color:var(--muted);margin:10px 0 40px;max-width:640px}
+  h2{font-size:13px;text-transform:uppercase;letter-spacing:2px;color:var(--dim);margin:48px 0 14px}
+  .term{background:var(--surface);border:1px solid var(--line);border-radius:8px;overflow:hidden;box-shadow:0 12px 40px rgba(0,0,0,.5)}
+  .tbar{display:flex;gap:6px;padding:9px 12px;border-bottom:1px solid var(--line)}
+  .tbar span{width:10px;height:10px;border-radius:50%;background:var(--line)}
+  pre{padding:18px 20px;font-size:13px;line-height:1.6;overflow-x:auto;white-space:pre}
+  .z{color:var(--z)} .i{color:var(--i)} .g{color:var(--g)} .t{color:var(--t)}
+  .ok{color:var(--ok)} .err{color:var(--err)} .mut{color:var(--muted)} .dim{color:var(--dim)}
+  .b{font-weight:700} .it{font-style:italic}
+  .cap{color:var(--muted);font-size:12px;margin:10px 2px 0}
+  .row{display:flex;flex-wrap:wrap;gap:10px}
+  .sw{flex:1 1 120px;background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:10px}
+  .chip{height:26px;border-radius:4px;margin-bottom:8px}
+  .sw small{color:var(--muted);font-size:11px;display:block}
+  .sw code{font-size:11px;color:var(--dim)}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  td,th{padding:7px 10px;border-bottom:1px solid var(--surface);text-align:left;vertical-align:top}
+  th{color:var(--dim);font-weight:400;text-transform:uppercase;font-size:11px;letter-spacing:1px}
+  .rules{color:var(--muted);font-size:13px}
+  .rules li{margin:6px 0 6px 18px}
+  .foot{margin-top:56px;color:var(--dim);font-size:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1><span class="k">Kode</span> — calm instrument</h1>
+<p class="thesis">A dark, instrument-grade workbench where repository knowledge appears as calm evidence — precise, layered, already present before the agent touches code. The energy is <em>senior engineer who read the system</em>, not <em>AI typing excitedly</em>.</p>
+
+<h2>Main view — transcript home, Knowledge Band, provenance gutter</h2>
+<div class="term">
+  <div class="tbar"><span></span><span></span><span></span></div>
+<pre><span class="dim"> kode</span>  <span class="mut">Kode</span> <span class="dim">·</span> <span class="g">master ✓ clean</span> <span class="dim">·</span> <span class="mut">codex/gpt-5.6-sol · effort:high</span> <span class="dim">·</span> ctx <span class="z">▓▓▓▓</span><span class="dim">░░░░</span> <span class="mut">3.4k/16k</span>
+<span class="dim"> ────────────────────────────────────────────────────────────────────────</span>
+ <span class="b mut">KNOWS</span>   <span class="z b">Z</span>  <span class="z">run_verification → detect() → ProjectProfile</span> <span class="dim">· 4 symbols</span>
+         <span class="i b">I</span>  <span class="it i">"verification pipeline must stay event-driven — no prints"</span>
+         <span class="g b">G</span>  <span class="g">2 files modified · crates/kode-verify touched last commit</span>
+<span class="dim"> ────────────────────────────────────────────────────────────────────────</span>
+
+ <span class="dim">›</span> <span class="mut">why does verify skip clippy on fresh machines?</span>
+
+ <span class="z">Z</span><span class="dim">│</span> <span class="b">Clippy is an optional step.</span> In <span class="z">detect()</span> the Rust profile marks
+  <span class="dim">│</span> clippy <span class="t">required: false</span> — a missing binary maps to
+  <span class="dim">│</span> <span class="mut">Skipped("not available")</span>, never Failed.<span class="z">¹</span>
+ <span class="i">I</span><span class="dim">│</span> Per project rule, skipped checks are <span class="b">never reported as passed</span> —
+  <span class="dim">│</span> honest-reporting decision from M9.<span class="i">²</span>
+ <span class="t">T</span><span class="dim">│</span> <span class="t">▸ read_file</span> <span class="dim">crates/kode-verify/src/detect.rs · 0.1s</span>
+ <span class="ok">V</span><span class="dim">│</span> <span class="ok">✓ verified against current source</span> <span class="dim">detect.rs:61</span>
+
+ <span class="dim">● thinking · 2.1s</span>
+
+<span class="dim"> ────────────────────────────────────────────────────────────────────────</span>
+ <span class="dim">›</span> <span class="mut">_</span>                                          <span class="dim">ctx</span> <span class="z">Z:4</span> <span class="i">I:2</span> <span class="g">G:2</span>   <span class="dim">/help</span>
+</pre>
+</div>
+<p class="cap">Breadcrumb (1 row) → Knowledge Band (3 rows, collapsible) → transcript with provenance gutter → input with per-source context counts. Terminal-default background respected; only foreground carries the palette.</p>
+
+<h2>Signature moment — the Knowledge Aperture</h2>
+<div class="term">
+  <div class="tbar"><span></span><span></span><span></span></div>
+<pre> <span class="dim">›</span> <span class="mut">fix the flaky temp-dir collision in config tests</span>
+
+ <span class="b mut">KNOWLEDGE APERTURE</span>
+ <span class="mut">request</span> <span class="dim">─┬─</span> <span class="z b">Z</span>  <span class="z">load() → config_path() → temp_project_dir()</span> <span class="dim">tests</span>
+          <span class="dim">├─</span> <span class="i b">I</span>  <span class="it i">recalled: "PID reuse resurrects stale .kode dirs"</span> <span class="dim">· conf 0.94</span>
+          <span class="dim">├─</span> <span class="g b">G</span>  <span class="g">last change touched 11 test helpers</span>
+          <span class="dim">└─</span> <span class="mut">?</span>  <span class="mut">likely fix boundary: nanos() uniqueness</span>
+
+ <span class="mut">intended inspection</span>  <span class="dim">3 symbols · 2 files · 1 memory · 0 edits yet</span>
+</pre>
+</div>
+<p class="cap">On task submit, the band expands ~6 lines: real graph trace, real recalled memory, declared inspection plan. Contracts after first tool call. Real data only — never a decorative fake. This is the screenshot people post.</p>
+
+<h2>Ledger view — Ctrl+L alternate screen</h2>
+<div class="term">
+  <div class="tbar"><span></span><span></span><span></span></div>
+<pre> <span class="b mut">OBJECTIVE</span>  <span class="text">De-flake config tests across all crates</span>
+
+   <span class="dim">01</span>  <span class="mut">UNDERSTAND</span>   <span class="ok">✓</span>  <span class="dim">traced temp-dir naming through 11 helpers</span>
+   <span class="dim">02</span>  <span class="mut">DECIDE</span>       <span class="ok">✓</span>  <span class="dim">add nanos() component to dir names</span>
+   <span class="dim">03</span>  <span class="mut">CHANGE</span>       <span class="b">●</span>  <span class="text">crates/kode-core/src/config.rs</span>
+   <span class="dim">04</span>  <span class="mut">VERIFY</span>       <span class="dim">○</span>  <span class="dim">fmt · clippy · test ×4 runs</span>
+
+   <span class="b mut">CURRENT CHANGE</span>  <span class="dim">config.rs:201</span>
+     <span class="dim">200 │</span> let dir = std::env::temp_dir().join(format!(
+   <span class="err">- 201 │</span><span class="err">     "kode-core-test-{}-{}", std::process::id(), n</span>
+   <span class="ok">+ 201 │</span><span class="ok">     "kode-core-test-{}-{}-{}", std::process::id(), nanos(), n</span>
+
+   <span class="b mut">WHY</span>
+   <span class="z">Z</span>  <span class="dim">temp_project_dir() is the only constructor for test dirs</span>
+   <span class="i">I</span>  <span class="dim">prior failure: PID reuse on Windows resurrected stale config</span>
+</pre>
+</div>
+<p class="cap">Codex-voice's boldest idea, staged safely: objective / steps / diff / proof as an alternate screen — understand state in five seconds after lunch. Home stays transcript.</p>
+
+<h2>Palette — color is provenance, never decoration</h2>
+<div class="row">
+  <div class="sw"><div class="chip" style="background:#63C5DA"></div><small>zindeks — structural knowledge</small><code>#63C5DA · 80</code></div>
+  <div class="sw"><div class="chip" style="background:#D7A85B"></div><small>ingat — recalled memory</small><code>#D7A85B · 179</code></div>
+  <div class="sw"><div class="chip" style="background:#8FAE8B"></div><small>git — repository state</small><code>#8FAE8B · 108</code></div>
+  <div class="sw"><div class="chip" style="background:#8C9BAB"></div><small>tools — execution</small><code>#8C9BAB · 103</code></div>
+  <div class="sw"><div class="chip" style="background:#74B88A"></div><small>verified / pass</small><code>#74B88A · 108</code></div>
+  <div class="sw"><div class="chip" style="background:#D16D72"></div><small>failure / blocker</small><code>#D16D72 · 167</code></div>
+  <div class="sw"><div class="chip" style="background:#D8DEE5"></div><small>primary text</small><code>#D8DEE5 · 253</code></div>
+  <div class="sw"><div class="chip" style="background:#7C8793"></div><small>muted</small><code>#7C8793 · 244</code></div>
+</div>
+<p class="cap">Two brand accents only (cyan + amber). Background = terminal default, user themes respected. Colored cells stay under ~15% of the screen. Every color pairs with a fixed glyph — shape carries meaning for colorblind users.</p>
+
+<h2>Glyph vocabulary</h2>
+<table>
+<tr><th>meaning</th><th>glyph</th><th>meaning</th><th>glyph</th></tr>
+<tr><td>zindeks / graph</td><td><span class="z b">Z</span></td><td>active step</td><td><span class="b">●</span> <span class="dim">(◉ alternate, 4 Hz)</span></td></tr>
+<tr><td>ingat / memory</td><td><span class="i b">I</span> <span class="dim">+ italic quoted text</span></td><td>pending</td><td><span class="dim">○</span></td></tr>
+<tr><td>git</td><td><span class="g b">G</span></td><td>complete / failed</td><td><span class="ok">✓</span> <span class="err">×</span></td></tr>
+<tr><td>tool</td><td><span class="t b">T</span> <span class="t">▸</span></td><td>trees</td><td><span class="dim">├─ └─ │</span></td></tr>
+<tr><td>verification</td><td><span class="ok b">V</span></td><td>input / relationships</td><td><span class="dim">›</span> <span class="dim">→</span></td></tr>
+</table>
+
+<h2>Motion rules</h2>
+<ul class="rules">
+<li>Streaming lands in word/sentence chunks — no character typewriter effect.</li>
+<li>ONE moving region maximum. Single spinner instance: <code>· • ● •</code></li>
+<li>Unknown duration shows elapsed time (<code>● cargo test 08.4s</code>), never fake progress.</li>
+<li>New Z/I evidence steps dim → normal over three frames; settled rows never move again.</li>
+<li>Diffs, provenance, verification results, and user input never animate.</li>
+<li><code>reduced_motion</code> config kills spinner + pulse entirely.</li>
+</ul>
+
+<h2>Anti-slop (non-negotiable)</h2>
+<ul class="rules">
+<li>No gradients · no emoji in core UI · no chat bubbles · no box around every section</li>
+<li>No permanent file-tree sidebar · no card grids · no spinner beside streaming prose</li>
+<li>No color without semantic meaning · no fake thinking animation</li>
+<li>No knowledge display without real zindeks/ingat data behind it</li>
+</ul>
+
+<p class="foot">Kode design system preview · generated by /design-consultation · voices: Claude Fable (synthesis) + Codex (workbench/aperture) + Claude subagent (marginalia/constellation)</p>
+</div>
+</body>
+</html>
