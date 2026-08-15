@@ -1,9 +1,11 @@
+mod markdown;
 mod theme;
 
 use std::collections::VecDeque;
 use std::io::Stdout;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
@@ -13,7 +15,7 @@ use crossterm::terminal::{
 };
 use futures::StreamExt;
 use kode_core::CancellationToken;
-use kode_core::config::KodeConfig;
+use kode_core::config::{KodeConfig, PermissionMode};
 use kode_core::event::{EventBus, KodeEvent, TaskStep};
 use kode_tools::permission::PermissionHandler;
 use ratatui::Terminal;
@@ -98,10 +100,15 @@ pub enum Gutter {
 }
 
 /// One line of transcript: its provenance gutter plus the rendered text.
+/// `md_kind`/`spans` are `Some` for markdown-rendered Prose lines (see
+/// `tui/markdown.rs`); `None` means legacy plain text — the gutter's own
+/// text is drawn as-is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptLine {
     pub gutter: Gutter,
     pub text: String,
+    pub md_kind: Option<markdown::MdKind>,
+    pub spans: Option<Vec<(String, markdown::MdStyle)>>,
 }
 
 impl TranscriptLine {
@@ -109,6 +116,24 @@ impl TranscriptLine {
         Self {
             gutter,
             text: text.into(),
+            md_kind: None,
+            spans: None,
+        }
+    }
+
+    /// A markdown-rendered Prose line: `text` is kept as the plain
+    /// fallback/search text, `kind`/`spans` drive styled rendering.
+    pub fn markdown(
+        gutter: Gutter,
+        text: impl Into<String>,
+        kind: markdown::MdKind,
+        spans: Vec<(String, markdown::MdStyle)>,
+    ) -> Self {
+        Self {
+            gutter,
+            text: text.into(),
+            md_kind: Some(kind),
+            spans: Some(spans),
         }
     }
 }
@@ -296,6 +321,21 @@ pub struct AppState {
     /// Whether ingat is enabled in config (`[ingat].enabled`). Same
     /// static-truth rule as `zindeks_enabled`.
     pub ingat_enabled: bool,
+    /// Auto mode (Shift+Tab): tools run without a permission prompt while
+    /// on. `auto_flag` is the shared handle the permission handler reads
+    /// from another task, so a toggle applies to in-flight runs too.
+    pub auto_mode: bool,
+    pub auto_flag: Arc<AtomicBool>,
+    /// The most recently *completed* agent message's full text — what
+    /// Ctrl+Y/`/copy` copy to the clipboard. Empty until the first message
+    /// finishes.
+    pub last_response: String,
+    /// Accumulates flushed prose chunks for the run currently in flight;
+    /// swapped into `last_response` on `TaskFinished`/`AgentError`.
+    response_buf: String,
+    /// Per-message ``` fence state for markdown rendering of flushed Prose
+    /// lines; reset on every new task submission.
+    md_in_code_block: bool,
 }
 
 impl AppState {
@@ -322,6 +362,11 @@ impl AppState {
             decide_marked_this_run: false,
             zindeks_enabled: true,
             ingat_enabled: true,
+            auto_mode: false,
+            auto_flag: Arc::new(AtomicBool::new(false)),
+            last_response: String::new(),
+            response_buf: String::new(),
+            md_in_code_block: false,
         }
     }
 
@@ -341,6 +386,8 @@ impl AppState {
         self.ledger = LedgerState::new(ledger_objective(task));
         self.decide_marked_this_run = false;
         self.aperture = None;
+        self.response_buf.clear();
+        self.md_in_code_block = false;
     }
 }
 
@@ -369,13 +416,23 @@ fn truncate_chars(s: &str, max: usize) -> String {
 pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
     if !matches!(ev, KodeEvent::ModelToken { .. }) && !state.current_stream.is_empty() {
         let text = std::mem::take(&mut state.current_stream);
+        state.response_buf.push_str(&text);
         for line in text.split('\n') {
             if line.is_empty() {
                 state.transcript.push(TranscriptLine::new(Gutter::None, ""));
             } else {
-                state
-                    .transcript
-                    .push(TranscriptLine::new(Gutter::Prose, line));
+                let rendered = markdown::render_line(line, &mut state.md_in_code_block);
+                if rendered.kind == markdown::MdKind::Heading
+                    && !matches!(state.transcript.last(), Some(l) if l.gutter == Gutter::None)
+                {
+                    state.transcript.push(TranscriptLine::new(Gutter::None, ""));
+                }
+                state.transcript.push(TranscriptLine::markdown(
+                    Gutter::Prose,
+                    line,
+                    rendered.kind,
+                    rendered.spans,
+                ));
             }
         }
     }
@@ -457,6 +514,9 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             state.status.state = RunState::Idle;
             state.run_started = None;
             state.current_tool = None;
+            if !state.response_buf.is_empty() {
+                state.last_response = std::mem::take(&mut state.response_buf);
+            }
         }
         KodeEvent::Note { text } => {
             state
@@ -479,6 +539,9 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             state.status.state = RunState::Idle;
             state.run_started = None;
             state.current_tool = None;
+            if !state.response_buf.is_empty() {
+                state.last_response = std::mem::take(&mut state.response_buf);
+            }
         }
         KodeEvent::Knowledge {
             zindeks,
@@ -564,6 +627,8 @@ pub enum SlashCommand {
     Effort(String),
     /// `/provider` (open picker) or `/provider <name>` (set directly).
     Provider(Option<String>),
+    /// `/copy` — copies `last_response` to the clipboard.
+    Copy,
     Help,
     Unknown(String),
 }
@@ -601,6 +666,7 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         } else {
             Some(rest.to_string())
         }),
+        "/copy" => SlashCommand::Copy,
         "/help" => SlashCommand::Help,
         other => SlashCommand::Unknown(other.to_string()),
     })
@@ -918,12 +984,15 @@ fn handle_slash_command(
                 ));
             }
         }
+        SlashCommand::Copy => perform_copy(state),
         SlashCommand::Help => {
             state.transcript.push(TranscriptLine::new(
                 Gutter::Note,
                 "commands: /model [name], /effort <minimal|low|medium|high|xhigh>, \
-                 /provider [name], /help · Ctrl+K toggles the Knowledge Band, Ctrl+L opens \
-                 the Ledger, Esc closes the Ledger or cancels the run",
+                 /provider [name], /copy, /help · shift+tab toggles auto mode (tools run \
+                 without asking) · ctrl+y copies the last response · text selection works \
+                 natively (no mouse capture) · Ctrl+K toggles the Knowledge Band, Ctrl+L \
+                 opens the Ledger, Esc closes the Ledger or cancels the run",
             ));
         }
         SlashCommand::Unknown(cmd) => {
@@ -936,20 +1005,29 @@ fn handle_slash_command(
 }
 
 /// Sends permission requests from tool execution to the UI loop, then awaits
-/// the user's y/n answer over a one-shot channel.
+/// the user's y/n answer over a one-shot channel. `auto` is shared with the
+/// UI's Shift+Tab auto-mode toggle: when set, `confirm` returns `true`
+/// immediately without ever queuing a prompt.
 pub struct TuiPermission {
     tx: mpsc::UnboundedSender<(String, oneshot::Sender<bool>)>,
+    auto: Arc<AtomicBool>,
 }
 
 impl TuiPermission {
-    pub fn new(tx: mpsc::UnboundedSender<(String, oneshot::Sender<bool>)>) -> Self {
-        Self { tx }
+    pub fn new(
+        tx: mpsc::UnboundedSender<(String, oneshot::Sender<bool>)>,
+        auto: Arc<AtomicBool>,
+    ) -> Self {
+        Self { tx, auto }
     }
 }
 
 #[async_trait::async_trait]
 impl PermissionHandler for TuiPermission {
     async fn confirm(&self, summary: &str) -> bool {
+        if self.auto.load(Ordering::Relaxed) {
+            return true;
+        }
         let (resp_tx, resp_rx) = oneshot::channel();
         if self.tx.send((summary.to_string(), resp_tx)).is_err() {
             return false;
@@ -1027,7 +1105,8 @@ pub async fn run(cwd: &Path, cancel: CancellationToken) -> anyhow::Result<()> {
     }
 
     let (perm_tx, mut perm_rx) = mpsc::unbounded_channel::<(String, oneshot::Sender<bool>)>();
-    let handler: Arc<dyn PermissionHandler> = Arc::new(TuiPermission::new(perm_tx));
+    let handler: Arc<dyn PermissionHandler> =
+        Arc::new(TuiPermission::new(perm_tx, state.auto_flag.clone()));
 
     let (picker_tx, mut picker_rx) = mpsc::unbounded_channel::<PickerLoaded>();
 
@@ -1111,7 +1190,13 @@ pub async fn run(cwd: &Path, cancel: CancellationToken) -> anyhow::Result<()> {
 
                                     let task_events = events.clone();
                                     let task_cwd = cwd.to_path_buf();
-                                    let task_config = config.clone();
+                                    let mut task_config = config.clone();
+                                    if state.auto_mode {
+                                        // Belt and braces alongside TuiPermission's
+                                        // `auto` flag: skip the Ask path entirely for
+                                        // runs started while auto mode is on.
+                                        task_config.permissions.default_mode = PermissionMode::Allow;
+                                    }
                                     let task_handler = handler.clone();
                                     tokio::spawn(async move {
                                         if let Err(err) = pipeline::run_task(
@@ -1139,8 +1224,14 @@ pub async fn run(cwd: &Path, cancel: CancellationToken) -> anyhow::Result<()> {
             }
 
             ev = event_rx.recv() => {
-                if let Ok(ev) = ev {
-                    apply_event(&mut state, ev);
+                match ev {
+                    Ok(ev) => apply_event(&mut state, ev),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        apply_event(&mut state, KodeEvent::Note {
+                            text: format!("event stream lagged — {n} events dropped"),
+                        });
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
                 }
             }
 
@@ -1205,6 +1296,16 @@ fn handle_key(
         return false;
     }
 
+    if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('y') {
+        perform_copy(state);
+        return false;
+    }
+
+    if code == KeyCode::BackTab {
+        toggle_auto_mode(state);
+        return false;
+    }
+
     match code {
         KeyCode::Esc => {
             if state.ledger_open {
@@ -1251,6 +1352,82 @@ fn handle_key(
         _ => {}
     }
     false
+}
+
+/// Toggles auto mode (Shift+Tab): flips both the UI-visible `auto_mode`
+/// bool and the `auto_flag` the permission handler reads from the task
+/// task, and leaves a transcript Note describing the new state.
+fn toggle_auto_mode(state: &mut AppState) {
+    state.auto_mode = !state.auto_mode;
+    state.auto_flag.store(state.auto_mode, Ordering::Relaxed);
+    let text = if state.auto_mode {
+        "auto mode on — tools run without asking"
+    } else {
+        "auto mode off"
+    };
+    state
+        .transcript
+        .push(TranscriptLine::new(Gutter::Note, text));
+}
+
+/// Copies `state.last_response` to the OS clipboard (Ctrl+Y / `/copy`) and
+/// leaves a transcript Note describing the outcome. Content is never
+/// logged — only the char count.
+fn perform_copy(state: &mut AppState) {
+    if state.last_response.is_empty() {
+        state
+            .transcript
+            .push(TranscriptLine::new(Gutter::Note, "nothing to copy yet"));
+        return;
+    }
+    let note = match copy_to_clipboard(&state.last_response) {
+        Ok(n) => format!("copied {n} chars"),
+        Err(()) => "no clipboard tool found".to_string(),
+    };
+    state
+        .transcript
+        .push(TranscriptLine::new(Gutter::Note, note));
+}
+
+/// Pipes `text` to stdin of a platform clipboard tool, trying each
+/// candidate in order until one spawns and exits successfully. Windows:
+/// `clip`. macOS: `pbcopy`. Linux: `wl-copy` then `xclip -selection
+/// clipboard`. Returns the copied char count, or `Err(())` when no
+/// candidate tool is available/working.
+fn copy_to_clipboard(text: &str) -> Result<usize, ()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let candidates: &[(&str, &[&str])] = if cfg!(target_os = "windows") {
+        &[("clip", &[])]
+    } else if cfg!(target_os = "macos") {
+        &[("pbcopy", &[])]
+    } else {
+        &[("wl-copy", &[]), ("xclip", &["-selection", "clipboard"])]
+    };
+
+    for (cmd, args) in candidates {
+        let Ok(mut child) = Command::new(cmd)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        let Some(mut stdin) = child.stdin.take() else {
+            continue;
+        };
+        if stdin.write_all(text.as_bytes()).is_err() {
+            continue;
+        }
+        drop(stdin);
+        if child.wait().map(|s| s.success()).unwrap_or(false) {
+            return Ok(text.chars().count());
+        }
+    }
+    Err(())
 }
 
 /// Renders an 8-cell (by default) meter string: `▓` for filled cells,
@@ -1483,15 +1660,58 @@ fn gutter_prefix(gutter: &Gutter) -> (&'static str, Color) {
     }
 }
 
-/// Renders one transcript line as a gutter span + text span. Long lines
+/// Maps a markdown inline style onto a ratatui `Style`, within the existing
+/// palette per `DESIGN.md` — no new colors, only bold/italic/dim + the
+/// zindeks cyan for inline code.
+fn md_span_style(style: &markdown::MdStyle) -> Style {
+    match style {
+        markdown::MdStyle::Plain => Style::default(),
+        markdown::MdStyle::Bold => Style::default().add_modifier(Modifier::BOLD),
+        markdown::MdStyle::Italic => Style::default().add_modifier(Modifier::ITALIC),
+        markdown::MdStyle::InlineCode => Style::default().fg(theme::Z),
+    }
+}
+
+/// Renders one transcript line as a gutter span + text span(s). Long lines
 /// wrap via `Paragraph`'s own word-wrap without gutter-aligned
-/// continuation (acceptable ceiling for this phase).
+/// continuation (acceptable ceiling for this phase). Markdown-rendered
+/// Prose lines (`md_kind`/`spans` both `Some`) render their styled spans;
+/// everything else falls back to the legacy plain-text span.
 fn transcript_line_to_ratatui(line: &TranscriptLine) -> Line<'static> {
     let (prefix, color) = gutter_prefix(&line.gutter);
-    Line::from(vec![
-        Span::styled(prefix, Style::default().fg(color)),
-        Span::raw(line.text.clone()),
-    ])
+    let mut spans = vec![Span::styled(prefix, Style::default().fg(color))];
+
+    match (&line.md_kind, &line.spans) {
+        (Some(markdown::MdKind::CodeFence), _) => {
+            spans.push(Span::styled(
+                "\u{2504}\u{2504}".to_string(),
+                Style::default().fg(theme::DIM),
+            ));
+        }
+        (Some(markdown::MdKind::Code), Some(md_spans)) => {
+            let text: String = md_spans.iter().map(|(t, _)| t.as_str()).collect();
+            spans.push(Span::styled(text, Style::default().fg(theme::T)));
+        }
+        (Some(markdown::MdKind::Bullet), Some(md_spans)) => {
+            for (i, (text, style)) in md_spans.iter().enumerate() {
+                if i == 0 {
+                    spans.push(Span::styled(text.clone(), Style::default().fg(theme::DIM)));
+                } else {
+                    spans.push(Span::styled(text.clone(), md_span_style(style)));
+                }
+            }
+        }
+        (Some(markdown::MdKind::Heading), Some(md_spans))
+        | (Some(markdown::MdKind::Plain), Some(md_spans)) => {
+            for (text, style) in md_spans {
+                spans.push(Span::styled(text.clone(), md_span_style(style)));
+            }
+        }
+        _ => {
+            spans.push(Span::raw(line.text.clone()));
+        }
+    }
+    Line::from(spans)
 }
 
 /// Builds the breadcrumb row: `kode  {repo} · {branch} · {provider}/{model}
@@ -1521,6 +1741,12 @@ fn breadcrumb_line(state: &AppState) -> Line<'static> {
     ];
     if !model_set {
         spans.push(Span::styled(" — /model", Style::default().fg(theme::DIM)));
+    }
+    if state.auto_mode {
+        spans.push(Span::styled(
+            " · auto",
+            Style::default().fg(theme::I).add_modifier(Modifier::BOLD),
+        ));
     }
     if let Some(ks) = &state.knowledge {
         let bar = meter(ks.context_tokens, ks.budget_tokens, 8);
@@ -2023,12 +2249,12 @@ mod tests {
                 name: "read_file".into(),
             },
         );
+        assert_eq!(s.transcript.len(), 2);
+        assert_eq!(s.transcript[0].gutter, Gutter::Prose);
+        assert_eq!(s.transcript[0].text, "thinking...");
         assert_eq!(
-            s.transcript,
-            vec![
-                TranscriptLine::new(Gutter::Prose, "thinking..."),
-                TranscriptLine::new(Gutter::Tool, "read_file"),
-            ]
+            s.transcript[1],
+            TranscriptLine::new(Gutter::Tool, "read_file")
         );
         assert!(s.current_stream.is_empty());
         assert_eq!(s.status.tools_used, 1);
@@ -3215,5 +3441,211 @@ mod tests {
 
     fn state_no_model() -> AppState {
         AppState::new("openai".to_string(), String::new(), String::new())
+    }
+
+    // -- auto mode (Shift+Tab) ------------------------------------------------
+
+    #[test]
+    fn backtab_toggles_auto_mode_and_shared_flag() {
+        let mut s = state();
+        assert!(!s.auto_mode);
+        assert!(!s.auto_flag.load(Ordering::Relaxed));
+
+        handle_key(&mut s, KeyCode::BackTab, KeyModifiers::NONE, &None);
+        assert!(s.auto_mode);
+        assert!(s.auto_flag.load(Ordering::Relaxed));
+        assert!(s.transcript.iter().any(|l| l.text.contains("auto mode on")));
+
+        handle_key(&mut s, KeyCode::BackTab, KeyModifiers::NONE, &None);
+        assert!(!s.auto_mode);
+        assert!(!s.auto_flag.load(Ordering::Relaxed));
+        assert!(s.transcript.iter().any(|l| l.text == "auto mode off"));
+    }
+
+    #[test]
+    fn breadcrumb_line_shows_auto_badge_only_when_on() {
+        let mut s = state();
+        assert!(!line_text(&breadcrumb_line(&s)).contains("auto"));
+        s.auto_mode = true;
+        assert!(line_text(&breadcrumb_line(&s)).contains("· auto"));
+    }
+
+    #[tokio::test]
+    async fn tui_permission_confirm_bypasses_prompt_when_auto_flag_set() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let auto = Arc::new(AtomicBool::new(true));
+        let handler = TuiPermission::new(tx, auto);
+        assert!(handler.confirm("run rm -rf").await);
+        assert!(rx.try_recv().is_err()); // no prompt was ever queued
+    }
+
+    #[tokio::test]
+    async fn tui_permission_confirm_queues_prompt_when_auto_flag_unset() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let auto = Arc::new(AtomicBool::new(false));
+        let handler = TuiPermission::new(tx, auto);
+        let confirm = tokio::spawn(async move { handler.confirm("run rm -rf").await });
+        let (summary, responder) = rx.recv().await.expect("prompt queued");
+        assert_eq!(summary, "run rm -rf");
+        responder.send(true).unwrap();
+        assert!(confirm.await.unwrap());
+    }
+
+    // -- clipboard copy (Ctrl+Y / /copy) --------------------------------------
+
+    #[test]
+    fn perform_copy_with_empty_last_response_notes_nothing_to_copy() {
+        let mut s = state();
+        perform_copy(&mut s);
+        assert_eq!(
+            s.transcript,
+            vec![TranscriptLine::new(Gutter::Note, "nothing to copy yet")]
+        );
+    }
+
+    #[test]
+    fn ctrl_y_triggers_copy_path() {
+        let mut s = state();
+        handle_key(&mut s, KeyCode::Char('y'), KeyModifiers::CONTROL, &None);
+        assert_eq!(s.transcript.len(), 1);
+        assert_eq!(s.transcript[0].gutter, Gutter::Note);
+    }
+
+    #[test]
+    fn parse_slash_command_copy() {
+        assert_eq!(parse_slash_command("/copy"), Some(SlashCommand::Copy));
+    }
+
+    #[test]
+    fn handle_slash_command_copy_dispatches_to_perform_copy() {
+        let dir = temp_project_dir();
+        let mut s = state();
+        let mut cfg = KodeConfig::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        handle_slash_command(&mut s, &dir, &mut cfg, &tx, SlashCommand::Copy);
+        assert!(s.transcript.iter().any(|l| l.text == "nothing to copy yet"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copy_to_clipboard_via_clip_exe_returns_char_count() {
+        let result = copy_to_clipboard("hello kode");
+        assert_eq!(result, Ok(10));
+    }
+
+    #[test]
+    fn handle_slash_command_help_mentions_new_shortcuts() {
+        let dir = temp_project_dir();
+        let mut s = state();
+        let mut cfg = KodeConfig::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        handle_slash_command(&mut s, &dir, &mut cfg, &tx, SlashCommand::Help);
+        assert!(s.transcript.iter().any(|l| l.text.contains("shift+tab")));
+        assert!(s.transcript.iter().any(|l| l.text.contains("ctrl+y")));
+        assert!(s.transcript.iter().any(|l| l.text.contains("/copy")));
+    }
+
+    // -- last_response tracking -----------------------------------------------
+
+    #[test]
+    fn task_finished_swaps_flushed_prose_into_last_response() {
+        let mut s = state();
+        apply_event(
+            &mut s,
+            KodeEvent::ModelToken {
+                text: "done here".into(),
+            },
+        );
+        apply_event(
+            &mut s,
+            KodeEvent::TaskFinished {
+                iterations: 1,
+                tool_calls: 0,
+                input_tokens: 10,
+                output_tokens: 5,
+            },
+        );
+        assert_eq!(s.last_response, "done here");
+    }
+
+    #[test]
+    fn agent_error_swaps_flushed_prose_into_last_response() {
+        let mut s = state();
+        apply_event(
+            &mut s,
+            KodeEvent::ModelToken {
+                text: "partial answer".into(),
+            },
+        );
+        apply_event(
+            &mut s,
+            KodeEvent::AgentError {
+                message: "boom".into(),
+            },
+        );
+        assert_eq!(s.last_response, "partial answer");
+    }
+
+    #[test]
+    fn start_new_task_does_not_clear_prior_last_response() {
+        let mut s = state();
+        s.last_response = "prior answer".to_string();
+        s.start_new_task("next task");
+        assert_eq!(s.last_response, "prior answer");
+    }
+
+    // -- markdown flush integration --------------------------------------------
+
+    #[test]
+    fn flushed_heading_line_gets_markdown_spans_and_leading_spacer() {
+        let mut s = state();
+        apply_event(
+            &mut s,
+            KodeEvent::ModelToken {
+                text: "## Plan".into(),
+            },
+        );
+        apply_event(
+            &mut s,
+            KodeEvent::ToolStarted {
+                name: "read_file".into(),
+            },
+        );
+        // spacer blank line, then the heading, then the tool line.
+        assert_eq!(s.transcript.len(), 3);
+        assert_eq!(s.transcript[0].gutter, Gutter::None);
+        assert_eq!(s.transcript[1].gutter, Gutter::Prose);
+        assert_eq!(s.transcript[1].md_kind, Some(markdown::MdKind::Heading));
+        assert_eq!(
+            s.transcript[1].spans,
+            Some(vec![("Plan".to_string(), markdown::MdStyle::Bold)])
+        );
+    }
+
+    #[test]
+    fn flushed_bold_line_splits_into_styled_spans() {
+        let mut s = state();
+        apply_event(
+            &mut s,
+            KodeEvent::ModelToken {
+                text: "do **this**".into(),
+            },
+        );
+        apply_event(&mut s, KodeEvent::AgentFinished);
+        let prose = s
+            .transcript
+            .iter()
+            .find(|l| l.gutter == Gutter::Prose)
+            .expect("prose line");
+        assert_eq!(prose.md_kind, Some(markdown::MdKind::Plain));
+        assert_eq!(
+            prose.spans,
+            Some(vec![
+                ("do ".to_string(), markdown::MdStyle::Plain),
+                ("this".to_string(), markdown::MdStyle::Bold),
+            ])
+        );
     }
 }

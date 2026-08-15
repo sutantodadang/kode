@@ -209,30 +209,43 @@ pub async fn run_task(
         done: true,
     });
 
-    let mut outcome = agent
+    let outcome1 = agent
         .run_with_context(task, compiled.render().as_deref(), &ctx)
         .await
         .map_err(|err| anyhow::anyhow!(err))?;
 
     events.emit(KodeEvent::TaskProgress {
         step: TaskStep::Change,
-        done: outcome.mutated,
+        done: outcome1.mutated,
     });
 
-    let mut final_mutated = outcome.mutated;
+    // outcome2 is only Some when a retry ran (i.e. the first verification
+    // failed). Metrics and the mutated flag must aggregate across both runs
+    // — see `combine_outcomes`.
+    let mut outcome2: Option<kode_agent::AgentOutcome> = None;
 
-    if outcome.mutated {
+    if outcome1.mutated {
         let profile = kode_verify::detect(cwd);
         events.emit(KodeEvent::VerificationStarted);
-        let mut report = kode_verify::run_verification(cwd, &profile, &ctx.cancel).await;
+        let report = kode_verify::run_verification(cwd, &profile, &ctx.cancel).await;
         emit_verify_steps(&events, &report);
-        events.emit(KodeEvent::VerificationFinished { ok: report.ok });
+        let verdict = verification_verdict(report.ok, report.ran_any());
+        events.emit(KodeEvent::VerificationFinished {
+            ok: verdict == Verdict::Verified,
+        });
         events.emit(KodeEvent::TaskProgress {
             step: TaskStep::Verify,
-            done: report.ok,
+            done: verdict == Verdict::Verified,
         });
 
-        if !report.ok {
+        if verdict == Verdict::NoChecks {
+            events.emit(KodeEvent::Note {
+                text: "no verification checks for this project — changes are unverified"
+                    .to_string(),
+            });
+        }
+
+        if verdict == Verdict::Failed {
             events.emit(KodeEvent::Note {
                 text: "verification failed — asking agent to fix".to_string(),
             });
@@ -247,28 +260,50 @@ pub async fn run_task(
                 .await
                 .map_err(|err| anyhow::anyhow!(err))?;
 
-            final_mutated = retry_outcome.mutated;
-            outcome = retry_outcome;
+            let mutated_any = outcome1.mutated || retry_outcome.mutated;
+            let mut retry_report = report;
 
-            if outcome.mutated {
+            if mutated_any {
                 let profile = kode_verify::detect(cwd);
                 events.emit(KodeEvent::VerificationStarted);
-                report = kode_verify::run_verification(cwd, &profile, &ctx.cancel).await;
-                emit_verify_steps(&events, &report);
-                events.emit(KodeEvent::VerificationFinished { ok: report.ok });
+                retry_report = kode_verify::run_verification(cwd, &profile, &ctx.cancel).await;
+                emit_verify_steps(&events, &retry_report);
+                let verdict2 = verification_verdict(retry_report.ok, retry_report.ran_any());
+                events.emit(KodeEvent::VerificationFinished {
+                    ok: verdict2 == Verdict::Verified,
+                });
                 events.emit(KodeEvent::TaskProgress {
                     step: TaskStep::Verify,
-                    done: report.ok,
+                    done: verdict2 == Verdict::Verified,
                 });
+                if verdict2 == Verdict::NoChecks {
+                    events.emit(KodeEvent::Note {
+                        text: "no verification checks for this project — changes are unverified"
+                            .to_string(),
+                    });
+                }
             }
             events.emit(KodeEvent::Note {
-                text: report.summary_line(),
+                text: retry_report.summary_line(),
             });
+
+            outcome2 = Some(retry_outcome);
         }
     }
 
+    let (iterations, tool_calls, input_tokens, output_tokens, mutated_any) = match &outcome2 {
+        Some(o2) => combine_outcomes(&outcome1, o2),
+        None => (
+            outcome1.iterations,
+            outcome1.tool_calls,
+            outcome1.usage.input_tokens,
+            outcome1.usage.output_tokens,
+            outcome1.mutated,
+        ),
+    };
+
     if let Some(adapter) = zindeks_adapter.as_ref()
-        && final_mutated
+        && mutated_any
     {
         match adapter.ensure_bound().await {
             Ok(()) => events.emit(KodeEvent::Note {
@@ -281,13 +316,51 @@ pub async fn run_task(
     }
 
     events.emit(KodeEvent::TaskFinished {
-        iterations: outcome.iterations,
-        tool_calls: outcome.tool_calls,
-        input_tokens: outcome.usage.input_tokens,
-        output_tokens: outcome.usage.output_tokens,
+        iterations,
+        tool_calls,
+        input_tokens,
+        output_tokens,
     });
 
     Ok(())
+}
+
+/// Verdict of a verification pass, derived from whether it found zero
+/// failures (`ok`) and whether any check actually ran (`ran_any`).
+/// `NoChecks` short-circuits retry — retrying can't conjure checks into
+/// existence — while still counting as "nothing failed" for exit purposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Verified,
+    Failed,
+    NoChecks,
+}
+
+fn verification_verdict(ok: bool, ran_any: bool) -> Verdict {
+    if !ran_any {
+        Verdict::NoChecks
+    } else if ok {
+        Verdict::Verified
+    } else {
+        Verdict::Failed
+    }
+}
+
+/// Aggregates two agent runs (initial + retry) into the metrics
+/// `TaskFinished` reports: summed iterations, summed tool calls, summed
+/// input/output tokens, and `mutated` OR'd across both runs (a mutation in
+/// either run means the workspace changed).
+fn combine_outcomes(
+    a: &kode_agent::AgentOutcome,
+    b: &kode_agent::AgentOutcome,
+) -> (u32, u32, u64, u64, bool) {
+    (
+        a.iterations + b.iterations,
+        a.tool_calls + b.tool_calls,
+        a.usage.input_tokens + b.usage.input_tokens,
+        a.usage.output_tokens + b.usage.output_tokens,
+        a.mutated || b.mutated,
+    )
 }
 
 /// Builds a `KodeEvent::Knowledge` digest from a compiled context. Pure —
@@ -450,6 +523,74 @@ fn emit_verify_steps(events: &EventBus, report: &kode_verify::VerificationReport
             skipped,
             duration_ms: step.duration.as_millis() as u64,
         });
+    }
+}
+
+#[cfg(test)]
+mod verification_tests {
+    use super::*;
+    use kode_agent::AgentOutcome;
+    use kode_model::Usage;
+
+    fn outcome(
+        iterations: u32,
+        tool_calls: u32,
+        input: u64,
+        output: u64,
+        mutated: bool,
+    ) -> AgentOutcome {
+        AgentOutcome {
+            final_text: String::new(),
+            iterations,
+            tool_calls,
+            usage: Usage {
+                input_tokens: input,
+                output_tokens: output,
+            },
+            mutated,
+        }
+    }
+
+    #[test]
+    fn verdict_no_checks_when_nothing_ran() {
+        assert_eq!(verification_verdict(true, false), Verdict::NoChecks);
+        // Even a report claiming `ok: false` with nothing run is NoChecks —
+        // `ran_any` gates first.
+        assert_eq!(verification_verdict(false, false), Verdict::NoChecks);
+    }
+
+    #[test]
+    fn verdict_verified_when_ok_and_ran() {
+        assert_eq!(verification_verdict(true, true), Verdict::Verified);
+    }
+
+    #[test]
+    fn verdict_failed_when_not_ok_and_ran() {
+        assert_eq!(verification_verdict(false, true), Verdict::Failed);
+    }
+
+    #[test]
+    fn combine_outcomes_sums_metrics_and_ors_mutated() {
+        let a = outcome(3, 5, 100, 200, true);
+        let b = outcome(2, 4, 50, 75, false);
+
+        let (iterations, tool_calls, input_tokens, output_tokens, mutated) =
+            combine_outcomes(&a, &b);
+
+        assert_eq!(iterations, 5);
+        assert_eq!(tool_calls, 9);
+        assert_eq!(input_tokens, 150);
+        assert_eq!(output_tokens, 275);
+        assert!(mutated);
+    }
+
+    #[test]
+    fn combine_outcomes_mutated_false_when_neither_mutated() {
+        let a = outcome(1, 1, 10, 10, false);
+        let b = outcome(1, 1, 10, 10, false);
+
+        let (.., mutated) = combine_outcomes(&a, &b);
+        assert!(!mutated);
     }
 }
 

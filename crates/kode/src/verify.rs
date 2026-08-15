@@ -17,6 +17,12 @@ pub async fn run(cwd: &Path, cancel: CancellationToken) -> anyhow::Result<()> {
     println!("{}", report.render());
     println!("{}", report.summary_line());
 
+    if !report.ran_any() {
+        // Nothing failed, but nothing ran either — exit 0 without claiming
+        // verification actually happened.
+        return Ok(());
+    }
+
     if report.ok {
         Ok(())
     } else {
