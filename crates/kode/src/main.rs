@@ -1,3 +1,4 @@
+mod doctor;
 mod exec;
 mod remember;
 mod setup;
@@ -29,6 +30,8 @@ enum Command {
     },
     /// Detect the project and run its verification pipeline.
     Verify,
+    /// Run diagnostic checks across config, LLM, zindeks, Ingat, git, and env.
+    Doctor,
     /// Install/bootstrap the zindeks and Ingat engines (consent-gated).
     Setup {
         /// Skip confirmation prompts and proceed with all installs.
@@ -92,6 +95,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Verify => {
             let cwd = std::env::current_dir()?;
             verify::run(&cwd, token).await?;
+        }
+        Command::Doctor => {
+            let cwd = std::env::current_dir()?;
+            doctor::run(&cwd).await?;
         }
         Command::Remember { text, kind, tags } => {
             let cwd = std::env::current_dir()?;

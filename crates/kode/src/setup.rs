@@ -142,7 +142,7 @@ async fn setup_zindeks(cfg: &ZindeksConfig, yes: bool) -> anyhow::Result<()> {
 
 /// Runs `cmd --version` with a 5s timeout; returns the first line of stdout
 /// on success, `None` on any failure (not found, timed out, nonzero exit).
-async fn probe_version(cmd: impl AsRef<std::ffi::OsStr>) -> Option<String> {
+pub(crate) async fn probe_version(cmd: impl AsRef<std::ffi::OsStr>) -> Option<String> {
     let output = tokio::time::timeout(
         Duration::from_secs(5),
         tokio::process::Command::new(cmd).arg("--version").output(),
