@@ -14,6 +14,20 @@ pub fn managed_bin_dir() -> Option<PathBuf> {
     }
 }
 
+/// Kode's own home directory: `$USERPROFILE/.kode` (or `$HOME/.kode`
+/// elsewhere). Returns `None` when neither environment variable is set.
+pub fn kode_home_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    Some(PathBuf::from(home).join(".kode"))
+}
+
+/// Kode's own credential store directory: `kode_home_dir()/auth`. This is
+/// where `kode auth login` writes `codex.json` / `opencode.json` — Kode
+/// never reads other tools' auth files (`~/.codex`, opencode's data dir).
+pub fn auth_dir() -> Option<PathBuf> {
+    Some(kode_home_dir()?.join("auth"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -25,6 +39,26 @@ mod tests {
         assert!(
             display.ends_with("kode/bin"),
             "unexpected managed bin dir: {display}"
+        );
+    }
+
+    #[test]
+    fn kode_home_dir_ends_with_expected_suffix() {
+        let dir = kode_home_dir().expect("environment should provide a home dir");
+        let display = dir.to_string_lossy().replace('\\', "/");
+        assert!(
+            display.ends_with(".kode"),
+            "unexpected kode home: {display}"
+        );
+    }
+
+    #[test]
+    fn auth_dir_ends_with_expected_suffix() {
+        let dir = auth_dir().expect("environment should provide a home dir");
+        let display = dir.to_string_lossy().replace('\\', "/");
+        assert!(
+            display.ends_with(".kode/auth"),
+            "unexpected auth dir: {display}"
         );
     }
 }

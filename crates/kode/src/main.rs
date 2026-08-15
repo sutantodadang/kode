@@ -1,3 +1,4 @@
+mod auth;
 mod doctor;
 mod exec;
 mod pipeline;
@@ -24,6 +25,12 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Command {
+    /// Manage Kode's own credential store for codex/opencode-family
+    /// providers.
+    Auth {
+        #[command(subcommand)]
+        cmd: AuthCmd,
+    },
     /// Show Kode's current status.
     Status,
     /// Run an agentic task against the configured model.
@@ -56,6 +63,23 @@ enum Command {
     },
 }
 
+#[derive(clap::Subcommand)]
+enum AuthCmd {
+    /// Log in to a provider (codex: OAuth+PKCE via browser; opencode-family:
+    /// paste an API key).
+    Login {
+        /// Provider id: codex, opencode-go, opencode, kilo, lmstudio.
+        provider: String,
+    },
+    /// Show which providers have credentials stored.
+    Status,
+    /// Remove stored credentials for a provider.
+    Logout {
+        /// Provider id: codex, opencode-go, opencode, kilo, lmstudio.
+        provider: String,
+    },
+}
+
 fn init_tracing(verbose: u8) {
     let filter = if std::env::var("RUST_LOG").is_ok() {
         tracing_subscriber::EnvFilter::from_default_env()
@@ -83,6 +107,11 @@ async fn main() -> anyhow::Result<()> {
     cancel_on_ctrl_c(token.clone());
 
     match cli.command {
+        Some(Command::Auth { cmd }) => match cmd {
+            AuthCmd::Login { provider } => auth::login(&provider).await?,
+            AuthCmd::Status => auth::status().await?,
+            AuthCmd::Logout { provider } => auth::logout(&provider).await?,
+        },
         None => {
             let cwd = std::env::current_dir()?;
             tui::run(&cwd, token).await?;

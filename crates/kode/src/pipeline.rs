@@ -26,28 +26,69 @@ pub async fn run_task(
     handler: Arc<dyn PermissionHandler>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    if config.model.provider != "openai" {
-        anyhow::bail!("provider {} not supported yet", config.model.provider);
-    }
-
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .or_else(|_| std::env::var("KODE_API_KEY"))
-        .map_err(|_| anyhow::anyhow!("set OPENAI_API_KEY to run `kode exec`"))?;
-
     if config.model.model.is_empty() {
         anyhow::bail!("set model.model in .kode/config.toml");
     }
 
-    let mut opts = OpenAiOptions {
-        api_key,
-        model: config.model.model.clone(),
-        ..Default::default()
-    };
-    if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
-        opts.base_url = base_url;
-    }
+    let model: Arc<dyn kode_model::Model> = match config.model.provider.as_str() {
+        "openai" => {
+            let api_key = std::env::var("OPENAI_API_KEY")
+                .or_else(|_| std::env::var("KODE_API_KEY"))
+                .map_err(|_| anyhow::anyhow!("set OPENAI_API_KEY to run `kode exec`"))?;
 
-    let model: Arc<dyn kode_model::Model> = Arc::new(OpenAiModel::new(opts));
+            let mut opts = OpenAiOptions {
+                api_key,
+                model: config.model.model.clone(),
+                ..Default::default()
+            };
+            if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
+                opts.base_url = base_url;
+            }
+            Arc::new(OpenAiModel::new(opts)) as Arc<dyn kode_model::Model>
+        }
+        "codex" => {
+            let auth_path = kode_model::codex::default_auth_path()
+                .ok_or_else(|| anyhow::anyhow!("cannot resolve home directory for codex auth"))?;
+            let auth = kode_model::codex::load(&auth_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            if auth.auth_mode == "apikey" {
+                let api_key = auth.api_key.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "codex auth.json has auth_mode=apikey but no OPENAI_API_KEY — run: kode auth login codex"
+                    )
+                })?;
+                let opts = OpenAiOptions {
+                    api_key,
+                    model: config.model.model.clone(),
+                    ..Default::default()
+                };
+                Arc::new(OpenAiModel::new(opts)) as Arc<dyn kode_model::Model>
+            } else {
+                let codex_model =
+                    kode_model::CodexModel::new(auth_path, config.model.model.clone())
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                Arc::new(codex_model) as Arc<dyn kode_model::Model>
+            }
+        }
+        "opencode-go" | "opencode" | "kilo" | "lmstudio" => {
+            let auth_path = kode_model::opencode::default_auth_path().ok_or_else(|| {
+                anyhow::anyhow!("cannot resolve home directory for opencode auth")
+            })?;
+            // Base URLs come from the builtin gateway table only; no reads of
+            // another tool's config.
+            let opencode_model = kode_model::opencode::resolve(
+                &config.model.provider,
+                config.model.model.clone(),
+                &auth_path,
+                None,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Arc::new(opencode_model) as Arc<dyn kode_model::Model>
+        }
+        other => anyhow::bail!(
+            "provider {other} not supported yet (supported: openai, codex, opencode-go, opencode, kilo, lmstudio)"
+        ),
+    };
 
     let ctx = ToolContext {
         workspace_root: cwd.to_path_buf(),

@@ -829,6 +829,7 @@ dependencies = [
  "kode-verify",
  "ratatui",
  "reqwest",
+ "serde",
  "serde_json",
  "sha2",
  "tokio",
@@ -926,6 +927,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
+ "kode-core",
  "reqwest",
  "serde",
  "serde_json",

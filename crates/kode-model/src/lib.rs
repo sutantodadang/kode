@@ -1,9 +1,13 @@
+pub mod codex;
 mod error;
 mod mock;
 mod openai;
+pub mod opencode;
+mod sse;
 mod stream;
 mod types;
 
+pub use codex::{CodexAuth, CodexModel};
 pub use error::{ModelError, Result};
 pub use mock::MockModel;
 pub use openai::{OpenAiModel, OpenAiOptions};

@@ -93,10 +93,24 @@ pub async fn run(cwd: &Path) -> anyhow::Result<()> {
 
     checks.push(provider_check(&config.model));
     checks.push(model_check(&config.model));
-    checks.push(api_key_check(
-        env_present("OPENAI_API_KEY"),
-        env_present("KODE_API_KEY"),
-    ));
+    match config.model.provider.as_str() {
+        "openai" => {
+            checks.push(api_key_check(
+                env_present("OPENAI_API_KEY"),
+                env_present("KODE_API_KEY"),
+            ));
+        }
+        "codex" => {
+            checks.push(codex_check(&codex_auth_result()));
+        }
+        "opencode-go" | "opencode" | "kilo" | "lmstudio" => {
+            checks.push(opencode_check(
+                &config.model.provider,
+                &opencode_auth_result(&config.model.provider),
+            ));
+        }
+        _ => {}
+    }
 
     if config.zindeks.enabled {
         collect_zindeks_checks(&mut checks, cwd, &config).await;
@@ -155,16 +169,112 @@ fn config_check(load: &Result<KodeConfig, String>, exists: bool) -> Check {
     }
 }
 
+const SUPPORTED_PROVIDERS: [&str; 6] = [
+    "openai",
+    "codex",
+    "opencode-go",
+    "opencode",
+    "kilo",
+    "lmstudio",
+];
+
 fn provider_check(model: &ModelConfig) -> Check {
-    if model.provider == "openai" {
+    if SUPPORTED_PROVIDERS.contains(&model.provider.as_str()) {
         Check::pass("LLM", "provider", model.provider.clone())
     } else {
         Check::fail(
             "LLM",
             "provider",
             format!("provider={}", model.provider),
-            "set [model] provider = \"openai\"",
+            format!(
+                "set [model] provider to one of: {}",
+                SUPPORTED_PROVIDERS.join(", ")
+            ),
         )
+    }
+}
+
+/// Loads codex auth via the default path, collapsing errors to `String` so
+/// the pass/fail mapping (`codex_check`) stays a pure, unit-testable
+/// function independent of file I/O.
+fn codex_auth_result() -> Result<kode_model::CodexAuth, String> {
+    let path = kode_model::codex::default_auth_path()
+        .ok_or_else(|| "cannot resolve home directory".to_string())?;
+    kode_model::codex::load(&path).map_err(|e| e.to_string())
+}
+
+fn codex_check(result: &Result<kode_model::CodexAuth, String>) -> Check {
+    match result {
+        Ok(auth) if auth.auth_mode == "apikey" => {
+            if auth.api_key.is_some() {
+                Check::pass("LLM", "codex auth", "apikey mode, key present")
+            } else {
+                Check::fail(
+                    "LLM",
+                    "codex auth",
+                    "apikey mode but no OPENAI_API_KEY in auth.json",
+                    "run: kode auth login codex",
+                )
+            }
+        }
+        Ok(auth) => Check::pass(
+            "LLM",
+            "codex auth",
+            format!(
+                "chatgpt auth (account ...{})",
+                last4_chars(&auth.account_id)
+            ),
+        ),
+        Err(err) => Check::fail(
+            "LLM",
+            "codex auth",
+            err.clone(),
+            "run: kode auth login codex",
+        ),
+    }
+}
+
+/// Last 4 characters only — never surface a full account id/token in
+/// diagnostic output.
+fn last4_chars(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let start = chars.len().saturating_sub(4);
+    chars[start..].iter().collect()
+}
+
+/// Checks whether `provider_id` has an `"api"`-type key in opencode's
+/// auth.json, collapsing errors to `String` for the same reason as
+/// `codex_auth_result`.
+fn opencode_auth_result(provider_id: &str) -> Result<bool, String> {
+    let path = kode_model::opencode::default_auth_path()
+        .ok_or_else(|| "cannot resolve home directory".to_string())?;
+    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let value: serde_json::Value = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+    let entry = value.get(provider_id);
+    let is_api = entry.and_then(|e| e.get("type")).and_then(|t| t.as_str()) == Some("api");
+    let has_key = entry
+        .and_then(|e| e.get("key"))
+        .and_then(|k| k.as_str())
+        .map(|k| !k.is_empty())
+        .unwrap_or(false);
+    Ok(is_api && has_key)
+}
+
+fn opencode_check(provider_id: &str, result: &Result<bool, String>) -> Check {
+    match result {
+        Ok(true) => Check::pass("LLM", "opencode auth", format!("key found ({provider_id})")),
+        Ok(false) => Check::fail(
+            "LLM",
+            "opencode auth",
+            format!("no api key for '{provider_id}'"),
+            format!("run: kode auth login {provider_id}"),
+        ),
+        Err(err) => Check::fail(
+            "LLM",
+            "opencode auth",
+            err.clone(),
+            format!("run: kode auth login {provider_id}"),
+        ),
     }
 }
 
@@ -583,10 +693,79 @@ mod tests {
         };
         let check = provider_check(&model);
         assert_eq!(check.status, CheckStatus::Fail);
-        assert_eq!(
-            check.fix.as_deref(),
-            Some("set [model] provider = \"openai\"")
-        );
+        let fix = check.fix.as_deref().unwrap();
+        assert!(fix.contains("openai"));
+        assert!(fix.contains("codex"));
+        assert!(fix.contains("opencode-go"));
+    }
+
+    #[test]
+    fn provider_check_codex_and_opencode_family_are_pass() {
+        for provider in ["codex", "opencode-go", "opencode", "kilo", "lmstudio"] {
+            let model = ModelConfig {
+                provider: provider.to_string(),
+                model: "m".to_string(),
+            };
+            assert_eq!(provider_check(&model).status, CheckStatus::Pass);
+        }
+    }
+
+    #[test]
+    fn codex_check_ok_chatgpt_mode_shows_last4_account_id_only() {
+        let auth = kode_model::CodexAuth {
+            access_token: "at".to_string(),
+            refresh_token: "rt".to_string(),
+            account_id: "abcd1234wxyz".to_string(),
+            last_refresh: "2026-08-15T00:00:00Z".to_string(),
+            api_key: None,
+            auth_mode: "chatgpt".to_string(),
+        };
+        let check = codex_check(&Ok(auth));
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert!(check.detail.contains("wxyz"));
+        assert!(!check.detail.contains("abcd1234wxyz"));
+    }
+
+    #[test]
+    fn codex_check_apikey_mode_missing_key_is_fail() {
+        let auth = kode_model::CodexAuth {
+            access_token: String::new(),
+            refresh_token: String::new(),
+            account_id: String::new(),
+            last_refresh: String::new(),
+            api_key: None,
+            auth_mode: "apikey".to_string(),
+        };
+        let check = codex_check(&Ok(auth));
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert_eq!(check.fix.as_deref(), Some("run: kode auth login codex"));
+    }
+
+    #[test]
+    fn codex_check_err_is_fail() {
+        let check = codex_check(&Err("boom".to_string()));
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert_eq!(check.detail, "boom");
+    }
+
+    #[test]
+    fn opencode_check_true_is_pass_with_provider_id() {
+        let check = opencode_check("kilo", &Ok(true));
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert!(check.detail.contains("kilo"));
+    }
+
+    #[test]
+    fn opencode_check_false_is_fail() {
+        let check = opencode_check("kilo", &Ok(false));
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert_eq!(check.fix.as_deref(), Some("run: kode auth login kilo"));
+    }
+
+    #[test]
+    fn last4_chars_short_string_returns_whole_string() {
+        assert_eq!(last4_chars("ab"), "ab");
+        assert_eq!(last4_chars("abcdef"), "cdef");
     }
 
     #[test]
