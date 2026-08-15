@@ -1,11 +1,14 @@
 pub mod error;
 pub mod ingat;
 pub mod mock;
+pub mod policy;
+pub mod tool;
 pub mod types;
 
 pub use error::{MemoryError, Result};
 pub use ingat::IngatAdapter;
 pub use mock::MockEngineeringMemory;
+pub use tool::RememberTool;
 pub use types::{Memory, MemoryContext, MemoryKind, MemoryQuery, NewMemory, Provenance};
 
 /// Domain-level access to a local engineering-memory backend (Ingat).

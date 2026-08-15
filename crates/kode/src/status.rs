@@ -48,7 +48,7 @@ pub async fn run(cwd: &Path) -> anyhow::Result<()> {
             .await
         {
             Ok(line) => line,
-            Err(_) => "zindeks: unavailable — timed out".to_string(),
+            Err(_) => "zindeks: unavailable — timed out — run: kode setup".to_string(),
         };
         println!("{line}");
     } else {
@@ -59,7 +59,7 @@ pub async fn run(cwd: &Path) -> anyhow::Result<()> {
         let line = match tokio::time::timeout(Duration::from_secs(5), ingat_status(&config)).await {
             Ok(line) => line,
             Err(_) => format!(
-                "ingat: unavailable — start the Ingat service (mcp-service) on {}",
+                "ingat: unavailable — run: kode setup (or start the Ingat app) [{}]",
                 config.ingat.url
             ),
         };
@@ -77,7 +77,7 @@ async fn ingat_status(config: &KodeConfig) -> String {
     let adapter = IngatAdapter::new(&config.ingat);
     let unavailable = || {
         format!(
-            "ingat: unavailable — start the Ingat service (mcp-service) on {}",
+            "ingat: unavailable — run: kode setup (or start the Ingat app) [{}]",
             config.ingat.url
         )
     };
@@ -101,7 +101,7 @@ async fn ingat_status(config: &KodeConfig) -> String {
 async fn zindeks_status(cwd: &Path, config: &KodeConfig) -> String {
     let adapter = match ZindeksAdapter::connect(&config.zindeks, cwd).await {
         Ok(adapter) => adapter,
-        Err(err) => return format!("zindeks: unavailable — {err}"),
+        Err(err) => return format!("zindeks: unavailable — {err} — run: kode setup"),
     };
 
     if let Err(err) = adapter.ensure_bound().await {
@@ -109,7 +109,7 @@ async fn zindeks_status(cwd: &Path, config: &KodeConfig) -> String {
             kode_intel::IntelError::NotIndexed(_) => {
                 "zindeks: not indexed — run: zindeks index .".to_string()
             }
-            other => format!("zindeks: unavailable — {other}"),
+            other => format!("zindeks: unavailable — {other} — run: kode setup"),
         };
     }
 
@@ -118,6 +118,6 @@ async fn zindeks_status(cwd: &Path, config: &KodeConfig) -> String {
             "zindeks: healthy — {} files, {} symbols indexed",
             health.documents, health.symbols
         ),
-        Err(err) => format!("zindeks: unavailable — {err}"),
+        Err(err) => format!("zindeks: unavailable — {err} — run: kode setup"),
     }
 }

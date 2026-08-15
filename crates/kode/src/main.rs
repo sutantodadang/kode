@@ -1,5 +1,6 @@
 mod exec;
 mod remember;
+mod setup;
 mod status;
 mod verify;
 
@@ -28,6 +29,12 @@ enum Command {
     },
     /// Detect the project and run its verification pipeline.
     Verify,
+    /// Install/bootstrap the zindeks and Ingat engines (consent-gated).
+    Setup {
+        /// Skip confirmation prompts and proceed with all installs.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Save an explicit engineering memory to Ingat.
     Remember {
         /// The memory text.
@@ -77,6 +84,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Exec { task } => {
             let cwd = std::env::current_dir()?;
             exec::run(&task, &cwd, token).await?;
+        }
+        Command::Setup { yes } => {
+            let cwd = std::env::current_dir()?;
+            setup::run(yes, &cwd).await?;
         }
         Command::Verify => {
             let cwd = std::env::current_dir()?;

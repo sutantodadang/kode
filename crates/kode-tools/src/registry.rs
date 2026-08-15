@@ -170,9 +170,20 @@ mod tests {
         assert!(matches!(err, ToolError::Denied(_)));
     }
 
+    fn nanos() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    }
+
     #[tokio::test]
     async fn mutating_with_auto_approve_executes() {
-        let dir = std::env::temp_dir().join(format!("kode-tools-registry-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "kode-tools-registry-{}-{}",
+            std::process::id(),
+            nanos()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let runtime = ToolRuntime::builtin_runtime(PermissionMode::Ask, Arc::new(AutoApprove));
         let out = runtime

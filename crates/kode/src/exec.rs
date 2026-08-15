@@ -8,11 +8,11 @@ use kode_core::CancellationToken;
 use kode_core::config::KodeConfig;
 use kode_core::event::{EventBus, KodeEvent};
 use kode_intel::{CodeIntelligence, ZindeksAdapter};
-use kode_memory::{EngineeringMemory, IngatAdapter};
+use kode_memory::{EngineeringMemory, IngatAdapter, RememberTool};
 use kode_model::{OpenAiModel, OpenAiOptions};
 use kode_tools::ToolContext;
 use kode_tools::permission::PermissionHandler;
-use kode_tools::registry::ToolRuntime;
+use kode_tools::registry::{ToolRegistry, ToolRuntime};
 
 struct StdinPermission;
 
@@ -57,33 +57,8 @@ pub async fn run(task: &str, cwd: &Path, cancel: CancellationToken) -> anyhow::R
     }
 
     let model: Arc<dyn kode_model::Model> = Arc::new(OpenAiModel::new(opts));
-    let tools =
-        ToolRuntime::builtin_runtime(config.permissions.default_mode, Arc::new(StdinPermission));
     let events = EventBus::new(256);
     let mut rx = events.subscribe();
-    let agent = Agent::new(model, tools, events.clone(), &config.agent);
-
-    let printer = tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(KodeEvent::ModelToken { text }) => {
-                    print!("{text}");
-                    let _ = std::io::stdout().flush();
-                }
-                Ok(KodeEvent::ToolStarted { name }) => {
-                    eprintln!("◆ {name}");
-                }
-                Ok(KodeEvent::ToolFinished { name, ok: false }) => {
-                    eprintln!("◆ {name} failed");
-                }
-                Ok(KodeEvent::AgentError { message }) => {
-                    eprintln!("{message}");
-                }
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
-    });
 
     let ctx = ToolContext {
         workspace_root: cwd.to_path_buf(),
@@ -133,6 +108,42 @@ pub async fn run(task: &str, cwd: &Path, cancel: CancellationToken) -> anyhow::R
     } else {
         None
     };
+
+    let mut registry = ToolRegistry::with_builtins();
+    if let Some(mem) = &memory {
+        let repository = cwd
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string());
+        registry.register(Arc::new(RememberTool::new(mem.clone(), repository)));
+    }
+    let tools = ToolRuntime::new(
+        registry,
+        config.permissions.default_mode,
+        Arc::new(StdinPermission),
+    );
+    let agent = Agent::new(model, tools, events.clone(), &config.agent);
+
+    let printer = tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(KodeEvent::ModelToken { text }) => {
+                    print!("{text}");
+                    let _ = std::io::stdout().flush();
+                }
+                Ok(KodeEvent::ToolStarted { name }) => {
+                    eprintln!("◆ {name}");
+                }
+                Ok(KodeEvent::ToolFinished { name, ok: false }) => {
+                    eprintln!("◆ {name} failed");
+                }
+                Ok(KodeEvent::AgentError { message }) => {
+                    eprintln!("{message}");
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    });
 
     events.emit(KodeEvent::ContextCompilationStarted);
     let compiler = ContextCompiler::new(intel, memory, config.agent.context_budget_tokens as usize);

@@ -100,10 +100,21 @@ mod tests {
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+    fn nanos() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    }
+
     fn temp_dir() -> std::path::PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir =
-            std::env::temp_dir().join(format!("kode-tools-patch-{}-{}", std::process::id(), n));
+        let dir = std::env::temp_dir().join(format!(
+            "kode-tools-patch-{}-{}-{}",
+            std::process::id(),
+            nanos(),
+            n
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

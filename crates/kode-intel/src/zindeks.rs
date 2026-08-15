@@ -36,19 +36,7 @@ impl ZindeksAdapter {
     pub async fn connect(cfg: &ZindeksConfig, root: &Path) -> Result<Self> {
         match cfg.transport.as_str() {
             "stdio" => {
-                let mut cmd = tokio::process::Command::new(&cfg.command);
-                cmd.arg("serve");
-                cmd.stdin(Stdio::piped());
-                cmd.stdout(Stdio::piped());
-                cmd.stderr(Stdio::null());
-                cmd.kill_on_drop(true);
-
-                let mut child = cmd.spawn().map_err(|e| {
-                    IntelError::Unavailable(format!(
-                        "cannot start {}: {e} — install zindeks or set [zindeks] command",
-                        cfg.command
-                    ))
-                })?;
+                let mut child = spawn_stdio_child(cfg).await?;
                 let stdin = child.stdin.take().ok_or_else(|| {
                     IntelError::Unavailable("zindeks child missing stdin".to_string())
                 })?;
@@ -161,6 +149,59 @@ impl ZindeksAdapter {
             }
             Err(e) => Err(e),
         }
+    }
+}
+
+/// Spawns `cfg.command serve` for the stdio transport. When `cfg.command` is
+/// the default (`"zindeks"`, meaning the caller never overrode it) and that
+/// spawn fails — most likely because zindeks isn't on `PATH` — retries once
+/// against the managed binary Kode's `kode setup` installs
+/// (`<managed_bin_dir>/zindeks[.exe]`) before giving up.
+async fn spawn_stdio_child(cfg: &ZindeksConfig) -> Result<Child> {
+    let mut cmd = tokio::process::Command::new(&cfg.command);
+    cmd.arg("serve");
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::null());
+    cmd.kill_on_drop(true);
+
+    match cmd.spawn() {
+        Ok(child) => Ok(child),
+        Err(first_err) if cfg.command == "zindeks" => {
+            let managed = kode_core::managed_bin_dir().map(|dir| {
+                let bin = if cfg!(windows) {
+                    "zindeks.exe"
+                } else {
+                    "zindeks"
+                };
+                dir.join(bin)
+            });
+
+            let Some(managed_path) = managed else {
+                return Err(IntelError::Unavailable(format!(
+                    "cannot start {}: {first_err} — run `kode setup` to install zindeks",
+                    cfg.command
+                )));
+            };
+
+            let mut fallback_cmd = tokio::process::Command::new(&managed_path);
+            fallback_cmd.arg("serve");
+            fallback_cmd.stdin(Stdio::piped());
+            fallback_cmd.stdout(Stdio::piped());
+            fallback_cmd.stderr(Stdio::null());
+            fallback_cmd.kill_on_drop(true);
+
+            fallback_cmd.spawn().map_err(|_| {
+                IntelError::Unavailable(format!(
+                    "cannot start {}: {first_err} — run `kode setup` to install zindeks",
+                    cfg.command
+                ))
+            })
+        }
+        Err(e) => Err(IntelError::Unavailable(format!(
+            "cannot start {}: {e} — run `kode setup` to install zindeks or set [zindeks] command",
+            cfg.command
+        ))),
     }
 }
 

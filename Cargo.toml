@@ -21,4 +21,5 @@ anyhow = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 futures = "0.3"
 async-trait = "0.1"
+sha2 = "0.10"
 kode-core = { path = "crates/kode-core" }
