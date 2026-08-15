@@ -289,12 +289,21 @@ async fn wait_for_health(cfg: &IngatConfig, budget: Duration) -> bool {
     }
 }
 
-/// Searches `%LOCALAPPDATA%\Programs\*ingat*` (case-insensitive) up to
-/// depth 3 for `mcp_service.exe`.
+/// Searches `%LOCALAPPDATA%\ingat` and `%LOCALAPPDATA%\Programs\*ingat*`
+/// (case-insensitive) up to depth 3 for `mcp_service.exe`. The Ingat NSIS
+/// installer uses `%LOCALAPPDATA%\ingat` as its per-user install dir.
 #[cfg(windows)]
 fn find_mcp_service() -> Option<PathBuf> {
-    let local_app_data = std::env::var_os("LOCALAPPDATA")?;
-    let programs_dir = PathBuf::from(local_app_data).join("Programs");
+    let local_app_data = PathBuf::from(std::env::var_os("LOCALAPPDATA")?);
+
+    let direct = local_app_data.join("ingat");
+    if direct.is_dir()
+        && let Some(found) = find_file_named(&direct, "mcp_service.exe", 3)
+    {
+        return Some(found);
+    }
+
+    let programs_dir = local_app_data.join("Programs");
     let entries = std::fs::read_dir(&programs_dir).ok()?;
     for entry in entries.flatten() {
         let path = entry.path();

@@ -31,6 +31,19 @@ pub enum KodeEvent {
     AgentError {
         message: String,
     },
+    /// A progress or degradation note (UI-agnostic; frontends render it as
+    /// they see fit, e.g. `◆ {text}`).
+    Note {
+        text: String,
+    },
+    /// Emitted once a task's agent loop (including any verification retry)
+    /// has fully completed, carrying the final summary counters.
+    TaskFinished {
+        iterations: u32,
+        tool_calls: u32,
+        input_tokens: u64,
+        output_tokens: u64,
+    },
 }
 
 /// Broadcast bus for `KodeEvent`s.

@@ -1,8 +1,10 @@
 mod doctor;
 mod exec;
+mod pipeline;
 mod remember;
 mod setup;
 mod status;
+mod tui;
 mod verify;
 
 use clap::Parser;
@@ -15,8 +17,9 @@ struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
+    /// Subcommand to run. When omitted, Kode launches the interactive TUI.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(clap::Subcommand)]
@@ -80,27 +83,31 @@ async fn main() -> anyhow::Result<()> {
     cancel_on_ctrl_c(token.clone());
 
     match cli.command {
-        Command::Status => {
+        None => {
+            let cwd = std::env::current_dir()?;
+            tui::run(&cwd, token).await?;
+        }
+        Some(Command::Status) => {
             let cwd = std::env::current_dir()?;
             status::run(&cwd).await?;
         }
-        Command::Exec { task } => {
+        Some(Command::Exec { task }) => {
             let cwd = std::env::current_dir()?;
             exec::run(&task, &cwd, token).await?;
         }
-        Command::Setup { yes } => {
+        Some(Command::Setup { yes }) => {
             let cwd = std::env::current_dir()?;
             setup::run(yes, &cwd).await?;
         }
-        Command::Verify => {
+        Some(Command::Verify) => {
             let cwd = std::env::current_dir()?;
             verify::run(&cwd, token).await?;
         }
-        Command::Doctor => {
+        Some(Command::Doctor) => {
             let cwd = std::env::current_dir()?;
             doctor::run(&cwd).await?;
         }
-        Command::Remember { text, kind, tags } => {
+        Some(Command::Remember { text, kind, tags }) => {
             let cwd = std::env::current_dir()?;
             remember::run(&text, &kind, tags, &cwd).await?;
         }
