@@ -27,3 +27,4 @@ serde_json = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 futures = { workspace = true }
+getrandom = { workspace = true }

@@ -100,8 +100,8 @@ pub async fn logout(provider: &str) -> anyhow::Result<()> {
 // --- codex OAuth (PKCE, authorization-code) --------------------------------
 
 async fn login_codex() -> anyhow::Result<()> {
-    let verifier = random_hex(64, 0x5A17_C0DE_0001);
-    let state = random_hex(32, 0x5A17_C0DE_0002);
+    let verifier = random_hex(64);
+    let state = random_hex(32);
     let challenge = base64url_nopad(&sha256(verifier.as_bytes()));
     let url = build_authorize_url(&challenge, &state);
 
@@ -272,10 +272,6 @@ fn write_codex_auth(
     refresh_token: &str,
     account_id: &str,
 ) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        // ponytail: plaintext at rest like codex/opencode; OS file ACLs only.
-        std::fs::create_dir_all(parent)?;
-    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -293,8 +289,40 @@ fn write_codex_auth(
         "last_refresh": last_refresh,
     });
     let pretty = serde_json::to_string_pretty(&value)?;
-    std::fs::write(path, pretty)?;
-    Ok(())
+    write_secret_file(path, &pretty)
+}
+
+/// Writes credential content with owner-only permissions: `0o600` file /
+/// `0o700` dir on Unix. On Windows the store lives under %USERPROFILE%,
+/// whose inherited DACL already restricts access to the owning user.
+fn write_secret_file(path: &Path, contents: &str) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        if let Some(parent) = path.parent() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(contents.as_bytes())?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, contents)?;
+        Ok(())
+    }
 }
 
 // --- opencode-family api-key login ------------------------------------------
@@ -330,12 +358,8 @@ fn load_opencode_map(path: &Path) -> anyhow::Result<serde_json::Map<String, Valu
 }
 
 fn save_opencode_map(path: &Path, map: &serde_json::Map<String, Value>) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let pretty = serde_json::to_string_pretty(&Value::Object(map.clone()))?;
-    std::fs::write(path, pretty)?;
-    Ok(())
+    write_secret_file(path, &pretty)
 }
 
 fn upsert_opencode_key(path: &Path, provider_id: &str, key: &str) -> anyhow::Result<()> {
@@ -383,29 +407,14 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Generates a pseudo-random lowercase-hex string of `len` hex characters
-/// (`len` capped at 64) by hashing a mix of the current time, process id,
-/// and a stack address, salted with `salt`.
-// ponytail: not a CSPRNG; PKCE verifier secrecy window is seconds and S256
-// protects the channel; swap to getrandom if ever needed.
-fn random_hex(len: usize, salt: u64) -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id() as u128;
-    let local = 0u8;
-    let addr = std::ptr::addr_of!(local) as usize as u128;
-
-    let mut hasher_input = Vec::with_capacity(64);
-    hasher_input.extend_from_slice(&nanos.to_le_bytes());
-    hasher_input.extend_from_slice(&pid.to_le_bytes());
-    hasher_input.extend_from_slice(&addr.to_le_bytes());
-    hasher_input.extend_from_slice(&salt.to_le_bytes());
-    let digest = sha256(&hasher_input);
+/// Generates a random lowercase-hex string of `len` hex characters
+/// (`len` capped at 64) from 32 bytes of OS CSPRNG entropy.
+fn random_hex(len: usize) -> String {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).expect("OS RNG unavailable");
 
     let mut hex = String::with_capacity(64);
-    for b in digest.iter() {
+    for b in bytes.iter() {
         hex.push_str(&format!("{b:02x}"));
     }
     hex.chars().take(len.min(64)).collect()
@@ -673,14 +682,15 @@ mod tests {
 
     #[test]
     fn random_hex_is_lowercase_hex_of_requested_length() {
-        let h = random_hex(64, 1);
+        let h = random_hex(64);
         assert_eq!(h.len(), 64);
         assert!(
             h.chars()
                 .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
         );
-        let h2 = random_hex(32, 2);
+        let h2 = random_hex(32);
         assert_eq!(h2.len(), 32);
+        assert_ne!(random_hex(64), random_hex(64));
     }
 
     #[test]
