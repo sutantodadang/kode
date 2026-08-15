@@ -1,0 +1,20 @@
+[package]
+name = "kode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kode-core = { workspace = true }
+kode-agent = { path = "../kode-agent" }
+kode-model = { path = "../kode-model" }
+kode-tools = { path = "../kode-tools" }
+kode-intel = { path = "../kode-intel" }
+kode-context = { path = "../kode-context" }
+kode-memory = { path = "../kode-memory" }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }

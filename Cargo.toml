@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["crates/kode-core", "crates/kode", "crates/kode-model", "crates/kode-tools", "crates/kode-agent", "crates/kode-intel", "crates/kode-context", "crates/kode-memory"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "process", "io-util", "net", "time"] }
+tokio-util = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures = "0.3"
+async-trait = "0.1"
+kode-core = { path = "crates/kode-core" }

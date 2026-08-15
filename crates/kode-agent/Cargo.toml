@@ -1,0 +1,18 @@
+[package]
+name = "kode-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+kode-core = { workspace = true }
+kode-model = { path = "../kode-model" }
+kode-tools = { path = "../kode-tools" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

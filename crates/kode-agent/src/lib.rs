@@ -1,0 +1,585 @@
+mod error;
+
+pub use error::{AgentError, Result};
+
+use std::sync::Arc;
+
+use futures::StreamExt;
+use kode_core::config::AgentConfig;
+use kode_core::event::{EventBus, KodeEvent};
+use kode_model::{Message, Model, ModelRequest, ResponseAccumulator, StreamEvent, Usage};
+use kode_tools::registry::ToolRuntime;
+use kode_tools::{ToolContext, ToolError};
+
+const SYSTEM_PROMPT: &str = "You are Kode, a coding agent operating on the user's repository. \
+Use the provided tools to inspect and modify files and run commands. Prefer reading before \
+writing. When the task is complete, reply with a concise final answer and stop calling tools.";
+
+/// A repeated identical tool call is blocked after this many occurrences in a
+/// row, to stop the model from looping on the same no-op action.
+const MAX_REPEAT_CALLS: u32 = 2;
+
+pub struct Agent {
+    model: Arc<dyn Model>,
+    tools: ToolRuntime,
+    events: EventBus,
+    max_iterations: u32,
+    max_tool_calls: u32,
+}
+
+#[derive(Debug)]
+pub struct AgentOutcome {
+    pub final_text: String,
+    pub iterations: u32,
+    pub tool_calls: u32,
+    pub usage: Usage,
+}
+
+impl Agent {
+    pub fn new(
+        model: Arc<dyn Model>,
+        tools: ToolRuntime,
+        events: EventBus,
+        agent_cfg: &AgentConfig,
+    ) -> Self {
+        Self {
+            model,
+            tools,
+            events,
+            max_iterations: agent_cfg.max_iterations,
+            max_tool_calls: agent_cfg.max_tool_calls,
+        }
+    }
+
+    pub async fn run(&self, task: &str, ctx: &ToolContext) -> Result<AgentOutcome> {
+        self.run_with_context(task, None, ctx).await
+    }
+
+    /// Like [`Self::run`], but with an optional pre-compiled context blob
+    /// (e.g. from `kode-context`) injected as a second system message
+    /// between the base system prompt and the user's task.
+    pub async fn run_with_context(
+        &self,
+        task: &str,
+        context: Option<&str>,
+        ctx: &ToolContext,
+    ) -> Result<AgentOutcome> {
+        self.events.emit(KodeEvent::AgentStarted);
+
+        let mut messages = vec![Message::System(SYSTEM_PROMPT.to_string())];
+        if let Some(c) = context {
+            messages.push(Message::System(format!(
+                "Repository and session context:\n\n{c}"
+            )));
+        }
+        messages.push(Message::User(task.to_string()));
+
+        let mut usage = Usage::default();
+        let mut total_tool_calls: u32 = 0;
+        let mut last_call: Option<(String, String)> = None;
+        let mut repeat_count: u32 = 0;
+
+        for iteration in 1..=self.max_iterations {
+            if ctx.cancel.is_cancelled() {
+                self.events.emit(KodeEvent::AgentError {
+                    message: "cancelled".to_string(),
+                });
+                return Err(AgentError::Cancelled);
+            }
+
+            self.events.emit(KodeEvent::ModelStarted);
+            let mut stream = self
+                .model
+                .stream(ModelRequest {
+                    messages: messages.clone(),
+                    tools: self.tools.specs(),
+                    max_tokens: None,
+                    temperature: None,
+                })
+                .await?;
+
+            let mut acc = ResponseAccumulator::new();
+            let response = loop {
+                tokio::select! {
+                    biased;
+                    _ = ctx.cancel.cancelled() => {
+                        self.events.emit(KodeEvent::AgentError {
+                            message: "cancelled".to_string(),
+                        });
+                        return Err(AgentError::Cancelled);
+                    }
+                    item = stream.next() => {
+                        match item {
+                            Some(Ok(event)) => {
+                                if let StreamEvent::TextDelta(text) = &event {
+                                    self.events.emit(KodeEvent::ModelToken { text: text.clone() });
+                                }
+                                acc.push(event);
+                            }
+                            Some(Err(e)) => return Err(AgentError::Model(e)),
+                            None => break acc.finish()?,
+                        }
+                    }
+                }
+            };
+
+            usage += response.usage.unwrap_or_default();
+
+            if response.tool_calls.is_empty() {
+                self.events.emit(KodeEvent::AgentFinished);
+                return Ok(AgentOutcome {
+                    final_text: response.content,
+                    iterations: iteration,
+                    tool_calls: total_tool_calls,
+                    usage,
+                });
+            }
+
+            messages.push(Message::Assistant {
+                content: response.content,
+                tool_calls: response.tool_calls.clone(),
+            });
+
+            for call in &response.tool_calls {
+                if total_tool_calls >= self.max_tool_calls {
+                    self.events.emit(KodeEvent::AgentError {
+                        message: format!("tool call limit reached ({})", self.max_tool_calls),
+                    });
+                    return Err(AgentError::ToolCallLimit(self.max_tool_calls));
+                }
+
+                let canonical_args = serde_json::to_string(&call.arguments).unwrap_or_default();
+                let is_repeat = last_call
+                    .as_ref()
+                    .is_some_and(|(name, args)| *name == call.name && *args == canonical_args);
+                repeat_count = if is_repeat { repeat_count + 1 } else { 1 };
+                last_call = Some((call.name.clone(), canonical_args));
+
+                if repeat_count > MAX_REPEAT_CALLS {
+                    total_tool_calls += 1;
+                    messages.push(Message::Tool {
+                        tool_call_id: call.id.clone(),
+                        content:
+                            "error: identical tool call repeated too many times; change approach"
+                                .to_string(),
+                    });
+                    continue;
+                }
+
+                self.events.emit(KodeEvent::ToolRequested {
+                    name: call.name.clone(),
+                });
+                self.events.emit(KodeEvent::ToolStarted {
+                    name: call.name.clone(),
+                });
+                total_tool_calls += 1;
+
+                match self
+                    .tools
+                    .execute(&call.name, call.arguments.clone(), ctx)
+                    .await
+                {
+                    Ok(out) => {
+                        self.events.emit(KodeEvent::ToolFinished {
+                            name: call.name.clone(),
+                            ok: true,
+                        });
+                        messages.push(Message::Tool {
+                            tool_call_id: call.id.clone(),
+                            content: out.content,
+                        });
+                    }
+                    Err(ToolError::Cancelled) => {
+                        self.events.emit(KodeEvent::AgentError {
+                            message: "cancelled".to_string(),
+                        });
+                        return Err(AgentError::Cancelled);
+                    }
+                    Err(e) => {
+                        self.events.emit(KodeEvent::ToolFinished {
+                            name: call.name.clone(),
+                            ok: false,
+                        });
+                        messages.push(Message::Tool {
+                            tool_call_id: call.id.clone(),
+                            content: format!("error: {e}"),
+                        });
+                    }
+                }
+            }
+        }
+
+        self.events.emit(KodeEvent::AgentError {
+            message: format!("iteration limit reached ({})", self.max_iterations),
+        });
+        Err(AgentError::IterationLimit(self.max_iterations))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kode_core::CancellationToken;
+    use kode_core::config::PermissionMode;
+    use kode_model::{FinishReason, MockModel};
+    use kode_tools::permission::{AutoApprove, AutoDeny};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn temp_dir() -> std::path::PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("kode-agent-test-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn ctx(root: std::path::PathBuf) -> ToolContext {
+        ToolContext {
+            workspace_root: root,
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    fn read_file_call(index: u32, id: &str, path: &str) -> Vec<StreamEvent> {
+        let args = serde_json::json!({ "path": path }).to_string();
+        let (first, second) = args.split_at(args.len() / 2);
+        vec![
+            StreamEvent::ToolCallDelta {
+                index,
+                id: Some(id.to_string()),
+                name: Some("read_file".to_string()),
+                arguments_delta: first.to_string(),
+            },
+            StreamEvent::ToolCallDelta {
+                index,
+                id: None,
+                name: None,
+                arguments_delta: second.to_string(),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn happy_path_tool_call_then_final_text() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("a.txt"), "hello world").unwrap();
+
+        let mock = MockModel::new();
+        let mut script1 = read_file_call(0, "call_1", "a.txt");
+        script1.push(StreamEvent::Finished {
+            reason: FinishReason::ToolCalls,
+            usage: Some(Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+            }),
+        });
+        mock.push_script(script1);
+        mock.push_script(vec![
+            StreamEvent::TextDelta("done".to_string()),
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: Some(Usage {
+                    input_tokens: 20,
+                    output_tokens: 7,
+                }),
+            },
+        ]);
+
+        let events = EventBus::new(64);
+        let mut rx = events.subscribe();
+
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let agent = Agent::new(Arc::new(mock), tools, events, &AgentConfig::default());
+
+        let outcome = agent.run("read the file", &ctx(dir)).await.unwrap();
+
+        assert_eq!(outcome.final_text, "done");
+        assert_eq!(outcome.iterations, 2);
+        assert_eq!(outcome.tool_calls, 1);
+        assert_eq!(
+            outcome.usage,
+            Usage {
+                input_tokens: 30,
+                output_tokens: 12
+            }
+        );
+
+        let mut collected = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            collected.push(e);
+        }
+        assert!(
+            collected
+                .iter()
+                .any(|e| matches!(e, KodeEvent::AgentStarted))
+        );
+        assert!(
+            collected
+                .iter()
+                .any(|e| matches!(e, KodeEvent::ModelStarted))
+        );
+        assert!(
+            collected
+                .iter()
+                .any(|e| matches!(e, KodeEvent::ToolStarted { name } if name == "read_file"))
+        );
+        assert!(
+            collected
+                .iter()
+                .any(|e| matches!(e, KodeEvent::ToolFinished { ok: true, .. }))
+        );
+        assert!(
+            collected
+                .iter()
+                .any(|e| matches!(e, KodeEvent::ModelToken { .. }))
+        );
+        assert!(
+            collected
+                .iter()
+                .any(|e| matches!(e, KodeEvent::AgentFinished))
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_error_is_fed_back_to_model() {
+        let dir = temp_dir();
+
+        let mock = MockModel::new();
+        let mut script1 = read_file_call(0, "call_1", "does_not_exist.txt");
+        script1.push(StreamEvent::Finished {
+            reason: FinishReason::ToolCalls,
+            usage: None,
+        });
+        mock.push_script(script1);
+        mock.push_script(vec![
+            StreamEvent::TextDelta("done".to_string()),
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: None,
+            },
+        ]);
+
+        let mock = Arc::new(mock);
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let agent = Agent::new(
+            mock.clone(),
+            tools,
+            EventBus::new(64),
+            &AgentConfig::default(),
+        );
+
+        let outcome = agent.run("read", &ctx(dir)).await.unwrap();
+        assert_eq!(outcome.final_text, "done");
+
+        let requests = mock.requests();
+        let second = &requests[1];
+        let has_error_message = second
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool { content, .. } if content.starts_with("error:")));
+        assert!(has_error_message);
+    }
+
+    #[tokio::test]
+    async fn denied_tool_call_is_fed_back_to_model() {
+        let dir = temp_dir();
+
+        let mock = MockModel::new();
+        let args = serde_json::json!({"path": "x.txt", "content": "y"}).to_string();
+        mock.push_script(vec![
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call_1".to_string()),
+                name: Some("write_file".to_string()),
+                arguments_delta: args,
+            },
+            StreamEvent::Finished {
+                reason: FinishReason::ToolCalls,
+                usage: None,
+            },
+        ]);
+        mock.push_script(vec![
+            StreamEvent::TextDelta("done".to_string()),
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: None,
+            },
+        ]);
+
+        let mock = Arc::new(mock);
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Ask, Arc::new(AutoDeny));
+        let agent = Agent::new(
+            mock.clone(),
+            tools,
+            EventBus::new(64),
+            &AgentConfig::default(),
+        );
+
+        let outcome = agent.run("write", &ctx(dir)).await.unwrap();
+        assert_eq!(outcome.final_text, "done");
+
+        let requests = mock.requests();
+        let second = &requests[1];
+        let tool_message_ok = second.messages.iter().any(|m| {
+            matches!(
+                m,
+                Message::Tool { content, .. }
+                    if content.starts_with("error:") && content.contains("denied")
+            )
+        });
+        assert!(tool_message_ok);
+    }
+
+    #[tokio::test]
+    async fn iteration_limit_returns_err() {
+        let dir = temp_dir();
+        let mock = MockModel::new();
+        for i in 0..3 {
+            let mut script = read_file_call(0, "call", &format!("f{i}.txt"));
+            script.push(StreamEvent::Finished {
+                reason: FinishReason::ToolCalls,
+                usage: None,
+            });
+            mock.push_script(script);
+        }
+
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let agent_cfg = AgentConfig {
+            max_iterations: 3,
+            ..Default::default()
+        };
+        let agent = Agent::new(Arc::new(mock), tools, EventBus::new(64), &agent_cfg);
+
+        let err = agent.run("loop forever", &ctx(dir)).await.unwrap_err();
+        assert!(matches!(err, AgentError::IterationLimit(3)));
+    }
+
+    #[tokio::test]
+    async fn tool_call_limit_returns_err() {
+        let dir = temp_dir();
+        let mock = MockModel::new();
+        for i in 0..3 {
+            let mut script = read_file_call(0, "call", &format!("f{i}.txt"));
+            script.push(StreamEvent::Finished {
+                reason: FinishReason::ToolCalls,
+                usage: None,
+            });
+            mock.push_script(script);
+        }
+
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let agent_cfg = AgentConfig {
+            max_tool_calls: 2,
+            ..Default::default()
+        };
+        let agent = Agent::new(Arc::new(mock), tools, EventBus::new(64), &agent_cfg);
+
+        let err = agent.run("call tools", &ctx(dir)).await.unwrap_err();
+        assert!(matches!(err, AgentError::ToolCallLimit(2)));
+    }
+
+    #[tokio::test]
+    async fn repeated_identical_call_is_blocked_then_agent_finishes() {
+        let dir = temp_dir();
+        let mock = MockModel::new();
+        for _ in 0..4 {
+            let mut script = read_file_call(0, "call", "same.txt");
+            script.push(StreamEvent::Finished {
+                reason: FinishReason::ToolCalls,
+                usage: None,
+            });
+            mock.push_script(script);
+        }
+        mock.push_script(vec![
+            StreamEvent::TextDelta("done".to_string()),
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: None,
+            },
+        ]);
+
+        let mock = Arc::new(mock);
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let agent = Agent::new(
+            mock.clone(),
+            tools,
+            EventBus::new(64),
+            &AgentConfig::default(),
+        );
+
+        let outcome = agent.run("repeat", &ctx(dir)).await.unwrap();
+        assert_eq!(outcome.final_text, "done");
+
+        let requests = mock.requests();
+        let has_repeat_message = requests.iter().any(|r| {
+            r.messages
+                .iter()
+                .any(|m| matches!(m, Message::Tool { content, .. } if content.contains("repeated")))
+        });
+        assert!(has_repeat_message);
+    }
+
+    #[tokio::test]
+    async fn cancelled_before_first_call_returns_err_and_makes_no_request() {
+        let dir = temp_dir();
+        let mock = MockModel::new();
+        let mock = Arc::new(mock);
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let agent = Agent::new(
+            mock.clone(),
+            tools,
+            EventBus::new(64),
+            &AgentConfig::default(),
+        );
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let ctx = ToolContext {
+            workspace_root: dir,
+            cancel,
+        };
+
+        let err = agent.run("do nothing", &ctx).await.unwrap_err();
+        assert!(matches!(err, AgentError::Cancelled));
+        assert!(mock.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_with_context_injects_system_message() {
+        let dir = temp_dir();
+        let mock = MockModel::new();
+        mock.push_script(vec![
+            StreamEvent::TextDelta("done".to_string()),
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: None,
+            },
+        ]);
+
+        let mock = Arc::new(mock);
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let agent = Agent::new(
+            mock.clone(),
+            tools,
+            EventBus::new(64),
+            &AgentConfig::default(),
+        );
+
+        let outcome = agent
+            .run_with_context("do the thing", Some("CTX_MARKER"), &ctx(dir))
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_text, "done");
+
+        let requests = mock.requests();
+        let first = &requests[0];
+        assert!(
+            first
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::System(content) if content.contains("CTX_MARKER")))
+        );
+    }
+}
