@@ -175,7 +175,12 @@ pub async fn run_task(
     };
 
     let tools = ToolRuntime::new(registry, config.permissions.default_mode, handler);
-    let agent = Agent::new(model, tools, events.clone(), &config.agent);
+    let effort = if config.model.effort.is_empty() {
+        None
+    } else {
+        Some(config.model.effort.clone())
+    };
+    let agent = Agent::new(model, tools, events.clone(), &config.agent).with_effort(effort);
 
     events.emit(KodeEvent::ContextCompilationStarted);
     let compiler = ContextCompiler::new(intel, memory, config.agent.context_budget_tokens as usize);

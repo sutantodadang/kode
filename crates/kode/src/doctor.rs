@@ -681,6 +681,7 @@ mod tests {
         let model = ModelConfig {
             provider: "openai".to_string(),
             model: "gpt-4".to_string(),
+            effort: String::new(),
         };
         assert_eq!(provider_check(&model).status, CheckStatus::Pass);
     }
@@ -690,6 +691,7 @@ mod tests {
         let model = ModelConfig {
             provider: "anthropic".to_string(),
             model: "gpt-4".to_string(),
+            effort: String::new(),
         };
         let check = provider_check(&model);
         assert_eq!(check.status, CheckStatus::Fail);
@@ -705,6 +707,7 @@ mod tests {
             let model = ModelConfig {
                 provider: provider.to_string(),
                 model: "m".to_string(),
+                effort: String::new(),
             };
             assert_eq!(provider_check(&model).status, CheckStatus::Pass);
         }
@@ -773,6 +776,7 @@ mod tests {
         let model = ModelConfig {
             provider: "openai".to_string(),
             model: String::new(),
+            effort: String::new(),
         };
         let check = model_check(&model);
         assert_eq!(check.status, CheckStatus::Fail);
@@ -787,6 +791,7 @@ mod tests {
         let model = ModelConfig {
             provider: "openai".to_string(),
             model: "gpt-4".to_string(),
+            effort: String::new(),
         };
         let check = model_check(&model);
         assert_eq!(check.status, CheckStatus::Pass);

@@ -1,6 +1,7 @@
 mod auth;
 mod doctor;
 mod exec;
+mod models;
 mod pipeline;
 mod remember;
 mod setup;
@@ -37,7 +38,15 @@ enum Command {
     Exec {
         /// The task to accomplish.
         task: String,
+        /// Override the configured model for this run.
+        #[arg(long)]
+        model: Option<String>,
+        /// Override reasoning effort for this run: minimal, low, medium, high, xhigh.
+        #[arg(long)]
+        effort: Option<String>,
     },
+    /// List available models for the configured provider.
+    Models,
     /// Detect the project and run its verification pipeline.
     Verify,
     /// Run diagnostic checks across config, LLM, zindeks, Ingat, git, and env.
@@ -120,9 +129,25 @@ async fn main() -> anyhow::Result<()> {
             let cwd = std::env::current_dir()?;
             status::run(&cwd).await?;
         }
-        Some(Command::Exec { task }) => {
+        Some(Command::Exec {
+            task,
+            model,
+            effort,
+        }) => {
+            if let Some(e) = &effort
+                && !kode_core::config::VALID_EFFORTS.contains(&e.as_str())
+            {
+                anyhow::bail!(
+                    "invalid --effort '{e}' (valid: {})",
+                    kode_core::config::VALID_EFFORTS.join(", ")
+                );
+            }
             let cwd = std::env::current_dir()?;
-            exec::run(&task, &cwd, token).await?;
+            exec::run(&task, &cwd, token, model, effort).await?;
+        }
+        Some(Command::Models) => {
+            let cwd = std::env::current_dir()?;
+            models::run(&cwd).await?;
         }
         Some(Command::Setup { yes }) => {
             let cwd = std::env::current_dir()?;

@@ -286,6 +286,9 @@ fn build_body(model: &str, request: &ModelRequest) -> serde_json::Value {
     if let Some(temperature) = request.temperature {
         body["temperature"] = serde_json::json!(temperature);
     }
+    if let Some(effort) = &request.effort {
+        body["reasoning_effort"] = serde_json::json!(effort);
+    }
     body
 }
 
@@ -358,6 +361,7 @@ mod tests {
             }],
             max_tokens: Some(100),
             temperature: Some(0.5),
+            effort: None,
         };
 
         let body = build_body("gpt-4o-mini", &request);
@@ -402,6 +406,7 @@ mod tests {
             tools: vec![],
             max_tokens: None,
             temperature: None,
+            effort: None,
         };
 
         let body = build_body("gpt-4o-mini", &request);
@@ -409,6 +414,34 @@ mod tests {
         assert!(body.get("tools").is_none());
         assert!(body.get("max_tokens").is_none());
         assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn build_body_includes_reasoning_effort_when_set() {
+        let request = ModelRequest {
+            messages: vec![Message::User("hi".to_string())],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            effort: Some("low".to_string()),
+        };
+
+        let body = build_body("gpt-5", &request);
+        assert_eq!(body["reasoning_effort"], serde_json::json!("low"));
+    }
+
+    #[test]
+    fn build_body_omits_reasoning_effort_when_absent() {
+        let request = ModelRequest {
+            messages: vec![Message::User("hi".to_string())],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            effort: None,
+        };
+
+        let body = build_body("gpt-5", &request);
+        assert!(body.get("reasoning_effort").is_none());
     }
 
     #[test]

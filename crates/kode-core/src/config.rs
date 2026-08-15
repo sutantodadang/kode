@@ -13,6 +13,14 @@ fn default_model_name() -> String {
     String::new()
 }
 
+fn default_model_effort() -> String {
+    String::new()
+}
+
+/// Valid values for `model.effort` / `--effort` / `/effort`, in ascending
+/// order of reasoning depth.
+pub const VALID_EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
+
 fn default_true() -> bool {
     true
 }
@@ -95,6 +103,73 @@ impl KodeConfig {
             message: err.to_string(),
         })
     }
+
+    /// Updates `[model].model` and/or `[model].effort` in
+    /// `<project_root>/.kode/config.toml`, preserving every other key
+    /// (including unknown/future ones). Creates the directory and file if
+    /// missing. Passing `None` for either argument leaves that key untouched.
+    pub fn update_model_selection(
+        project_root: &Path,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<()> {
+        let path = Self::config_path(project_root);
+
+        let mut root: toml::Value = match std::fs::read_to_string(&path) {
+            Ok(content) => toml::from_str(&content).map_err(|err| KodeError::Config {
+                path: path.clone(),
+                message: err.to_string(),
+            })?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                toml::Value::Table(toml::value::Table::new())
+            }
+            Err(err) => {
+                return Err(KodeError::Config {
+                    path,
+                    message: err.to_string(),
+                });
+            }
+        };
+
+        let table = root.as_table_mut().ok_or_else(|| KodeError::Config {
+            path: path.clone(),
+            message: "config root is not a table".to_string(),
+        })?;
+
+        let model_table = table
+            .entry("model")
+            .or_insert_with(|| toml::Value::Table(toml::value::Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| KodeError::Config {
+                path: path.clone(),
+                message: "[model] is not a table".to_string(),
+            })?;
+
+        if let Some(m) = model {
+            model_table.insert("model".to_string(), toml::Value::String(m.to_string()));
+        }
+        if let Some(e) = effort {
+            model_table.insert("effort".to_string(), toml::Value::String(e.to_string()));
+        }
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| KodeError::Config {
+                path: path.clone(),
+                message: err.to_string(),
+            })?;
+        }
+
+        let serialized = toml::to_string_pretty(&root).map_err(|err| KodeError::Config {
+            path: path.clone(),
+            message: err.to_string(),
+        })?;
+        std::fs::write(&path, serialized).map_err(|err| KodeError::Config {
+            path,
+            message: err.to_string(),
+        })?;
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -104,6 +179,8 @@ pub struct ModelConfig {
     pub provider: String,
     #[serde(default = "default_model_name")]
     pub model: String,
+    #[serde(default = "default_model_effort")]
+    pub effort: String,
 }
 
 impl Default for ModelConfig {
@@ -111,6 +188,7 @@ impl Default for ModelConfig {
         Self {
             provider: default_model_provider(),
             model: default_model_name(),
+            effort: default_model_effort(),
         }
     }
 }
@@ -270,6 +348,7 @@ mod tests {
         let cfg = KodeConfig::default();
         assert_eq!(cfg.model.provider, "openai");
         assert_eq!(cfg.model.model, "");
+        assert_eq!(cfg.model.effort, "");
         assert!(cfg.zindeks.enabled);
         assert_eq!(cfg.zindeks.transport, "stdio");
         assert_eq!(cfg.zindeks.command, "zindeks");
@@ -359,5 +438,38 @@ mod tests {
 
         let err = KodeConfig::load(&dir).unwrap_err();
         assert!(matches!(err, KodeError::Config { .. }));
+    }
+
+    #[test]
+    fn update_model_selection_creates_file() {
+        let dir = temp_project_dir();
+        assert!(!KodeConfig::config_path(&dir).exists());
+
+        KodeConfig::update_model_selection(&dir, Some("gpt-5.6-sol"), Some("high")).unwrap();
+
+        assert!(KodeConfig::config_path(&dir).exists());
+        let cfg = KodeConfig::load(&dir).unwrap();
+        assert_eq!(cfg.model.model, "gpt-5.6-sol");
+        assert_eq!(cfg.model.effort, "high");
+    }
+
+    #[test]
+    fn update_model_selection_preserves_unrelated_keys() {
+        let dir = temp_project_dir();
+        let kode_dir = dir.join(".kode");
+        std::fs::create_dir_all(&kode_dir).unwrap();
+        std::fs::write(
+            kode_dir.join("config.toml"),
+            "[agent]\nmax_iterations = 7\n\n[model]\nprovider = \"codex\"\n",
+        )
+        .unwrap();
+
+        KodeConfig::update_model_selection(&dir, Some("gpt-5.6-sol"), None).unwrap();
+
+        let cfg = KodeConfig::load(&dir).unwrap();
+        assert_eq!(cfg.agent.max_iterations, 7);
+        assert_eq!(cfg.model.provider, "codex");
+        assert_eq!(cfg.model.model, "gpt-5.6-sol");
+        assert_eq!(cfg.model.effort, "");
     }
 }

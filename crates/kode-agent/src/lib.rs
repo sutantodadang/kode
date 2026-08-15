@@ -25,6 +25,7 @@ pub struct Agent {
     events: EventBus,
     max_iterations: u32,
     max_tool_calls: u32,
+    effort: Option<String>,
 }
 
 #[derive(Debug)]
@@ -51,7 +52,15 @@ impl Agent {
             events,
             max_iterations: agent_cfg.max_iterations,
             max_tool_calls: agent_cfg.max_tool_calls,
+            effort: None,
         }
+    }
+
+    /// Sets the reasoning-effort hint forwarded on every [`ModelRequest`]
+    /// this agent builds. `None` (the default) omits it.
+    pub fn with_effort(mut self, effort: Option<String>) -> Self {
+        self.effort = effort;
+        self
     }
 
     pub async fn run(&self, task: &str, ctx: &ToolContext) -> Result<AgentOutcome> {
@@ -99,6 +108,7 @@ impl Agent {
                     tools: self.tools.specs(),
                     max_tokens: None,
                     temperature: None,
+                    effort: self.effort.clone(),
                 })
                 .await?;
 
@@ -605,6 +615,62 @@ mod tests {
         let err = agent.run("do nothing", &ctx).await.unwrap_err();
         assert!(matches!(err, AgentError::Cancelled));
         assert!(mock.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn with_effort_is_forwarded_on_model_request() {
+        let dir = temp_dir();
+        let mock = MockModel::new();
+        mock.push_script(vec![
+            StreamEvent::TextDelta("done".to_string()),
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: None,
+            },
+        ]);
+
+        let mock = Arc::new(mock);
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let agent = Agent::new(
+            mock.clone(),
+            tools,
+            EventBus::new(64),
+            &AgentConfig::default(),
+        )
+        .with_effort(Some("high".to_string()));
+
+        let outcome = agent.run("task", &ctx(dir)).await.unwrap();
+        assert_eq!(outcome.final_text, "done");
+
+        let requests = mock.requests();
+        assert_eq!(requests[0].effort, Some("high".to_string()));
+    }
+
+    #[tokio::test]
+    async fn without_effort_model_request_has_none() {
+        let dir = temp_dir();
+        let mock = MockModel::new();
+        mock.push_script(vec![
+            StreamEvent::TextDelta("done".to_string()),
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: None,
+            },
+        ]);
+
+        let mock = Arc::new(mock);
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let agent = Agent::new(
+            mock.clone(),
+            tools,
+            EventBus::new(64),
+            &AgentConfig::default(),
+        );
+
+        agent.run("task", &ctx(dir)).await.unwrap();
+
+        let requests = mock.requests();
+        assert_eq!(requests[0].effort, None);
     }
 
     #[tokio::test]

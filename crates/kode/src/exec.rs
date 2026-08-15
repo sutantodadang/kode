@@ -27,8 +27,20 @@ impl PermissionHandler for StdinPermission {
     }
 }
 
-pub async fn run(task: &str, cwd: &Path, cancel: CancellationToken) -> anyhow::Result<()> {
-    let config = KodeConfig::load(cwd)?;
+pub async fn run(
+    task: &str,
+    cwd: &Path,
+    cancel: CancellationToken,
+    model_override: Option<String>,
+    effort_override: Option<String>,
+) -> anyhow::Result<()> {
+    let mut config = KodeConfig::load(cwd)?;
+    if let Some(model) = model_override {
+        config.model.model = model;
+    }
+    if let Some(effort) = effort_override {
+        config.model.effort = effort;
+    }
 
     let events = EventBus::new(256);
     let mut rx = events.subscribe();

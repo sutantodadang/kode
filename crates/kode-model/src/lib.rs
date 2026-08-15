@@ -1,3 +1,4 @@
+pub mod catalog;
 pub mod codex;
 mod error;
 mod mock;

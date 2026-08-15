@@ -35,6 +35,9 @@ pub struct ModelRequest {
     pub tools: Vec<ToolSpec>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    /// Reasoning-effort hint: "minimal", "low", "medium", "high", "xhigh".
+    /// `None` omits it from the wire request entirely.
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
