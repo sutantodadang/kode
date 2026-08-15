@@ -104,12 +104,13 @@ impl KodeConfig {
         })
     }
 
-    /// Updates `[model].model` and/or `[model].effort` in
-    /// `<project_root>/.kode/config.toml`, preserving every other key
+    /// Updates `[model].provider`, `[model].model`, and/or `[model].effort`
+    /// in `<project_root>/.kode/config.toml`, preserving every other key
     /// (including unknown/future ones). Creates the directory and file if
-    /// missing. Passing `None` for either argument leaves that key untouched.
-    pub fn update_model_selection(
+    /// missing. Passing `None` for any argument leaves that key untouched.
+    pub fn update_model_config(
         project_root: &Path,
+        provider: Option<&str>,
         model: Option<&str>,
         effort: Option<&str>,
     ) -> Result<()> {
@@ -145,6 +146,9 @@ impl KodeConfig {
                 message: "[model] is not a table".to_string(),
             })?;
 
+        if let Some(p) = provider {
+            model_table.insert("provider".to_string(), toml::Value::String(p.to_string()));
+        }
         if let Some(m) = model {
             model_table.insert("model".to_string(), toml::Value::String(m.to_string()));
         }
@@ -169,6 +173,17 @@ impl KodeConfig {
         })?;
 
         Ok(())
+    }
+
+    /// Updates `[model].model` and/or `[model].effort` in
+    /// `<project_root>/.kode/config.toml`, preserving every other key.
+    /// Thin wrapper over [`Self::update_model_config`] with `provider: None`.
+    pub fn update_model_selection(
+        project_root: &Path,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<()> {
+        Self::update_model_config(project_root, None, model, effort)
     }
 }
 
@@ -471,5 +486,25 @@ mod tests {
         assert_eq!(cfg.model.provider, "codex");
         assert_eq!(cfg.model.model, "gpt-5.6-sol");
         assert_eq!(cfg.model.effort, "");
+    }
+
+    #[test]
+    fn update_model_config_persists_provider_and_preserves_unknown_keys() {
+        let dir = temp_project_dir();
+        let kode_dir = dir.join(".kode");
+        std::fs::create_dir_all(&kode_dir).unwrap();
+        std::fs::write(
+            kode_dir.join("config.toml"),
+            "[agent]\nmax_iterations = 7\n\n[mcp.servers.everything]\ncommand = \"npx\"\n",
+        )
+        .unwrap();
+
+        KodeConfig::update_model_config(&dir, Some("codex"), Some(""), None).unwrap();
+
+        let cfg = KodeConfig::load(&dir).unwrap();
+        assert_eq!(cfg.model.provider, "codex");
+        assert_eq!(cfg.model.model, "");
+        assert_eq!(cfg.agent.max_iterations, 7);
+        assert_eq!(cfg.mcp.servers.get("everything").unwrap().command, "npx");
     }
 }

@@ -220,12 +220,22 @@ pub struct PermReq {
     pub responder: oneshot::Sender<bool>,
 }
 
-/// State of the `/model` picker overlay. `items` holds the fetched catalog
-/// (or is empty while loading / on fetch failure); `note` carries a status
-/// line (loading / error) shown above the list.
+/// Which catalog a `PickerState` is currently showing — drives what
+/// `Enter`-ing a selection does (set the model vs. switch the provider).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PickerKind {
+    #[default]
+    Model,
+    Provider,
+}
+
+/// State of the `/model`/`/provider` picker overlay. `items` holds the
+/// fetched catalog (or is empty while loading / on fetch failure); `note`
+/// carries a status line (loading / error) shown above the list.
 #[derive(Debug, Clone, Default)]
 pub struct PickerState {
     pub open: bool,
+    pub kind: PickerKind,
     pub filter: String,
     pub items: Vec<String>,
     pub selected: usize,
@@ -279,6 +289,13 @@ pub struct AppState {
     /// True once the current run's `Decide` step has been marked done
     /// (first `ToolStarted` of the run). Reset on task submission.
     decide_marked_this_run: bool,
+    /// Whether zindeks is enabled in config (`[zindeks].enabled`). Static
+    /// config truth only — never probed at startup. Drives the idle
+    /// empty-state's "code intelligence" line.
+    pub zindeks_enabled: bool,
+    /// Whether ingat is enabled in config (`[ingat].enabled`). Same
+    /// static-truth rule as `zindeks_enabled`.
+    pub ingat_enabled: bool,
 }
 
 impl AppState {
@@ -303,6 +320,8 @@ impl AppState {
             ledger_open: false,
             ledger: LedgerState::default(),
             decide_marked_this_run: false,
+            zindeks_enabled: true,
+            ingat_enabled: true,
         }
     }
 
@@ -543,9 +562,21 @@ pub enum SlashCommand {
     Model(Option<String>),
     /// `/effort <value>`.
     Effort(String),
+    /// `/provider` (open picker) or `/provider <name>` (set directly).
+    Provider(Option<String>),
     Help,
     Unknown(String),
 }
+
+/// The providers `/provider` accepts, in picker display order.
+pub const VALID_PROVIDERS: &[&str] = &[
+    "openai",
+    "codex",
+    "opencode-go",
+    "opencode",
+    "kilo",
+    "lmstudio",
+];
 
 /// Parses `input` as a slash command. Returns `None` when `input` doesn't
 /// start with `/` — slash commands are only recognized at the start of the
@@ -565,9 +596,109 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
             Some(rest.to_string())
         }),
         "/effort" => SlashCommand::Effort(rest.to_string()),
+        "/provider" => SlashCommand::Provider(if rest.is_empty() {
+            None
+        } else {
+            Some(rest.to_string())
+        }),
         "/help" => SlashCommand::Help,
         other => SlashCommand::Unknown(other.to_string()),
     })
+}
+
+/// Auth-state annotation appended to a provider's name in the `/provider`
+/// picker. `" ✓ logged in"` when credentials for that provider are on disk
+/// (or in the environment for `openai`); `" (local)"` always for `lmstudio`
+/// (no login needed — it's a local server); `""` otherwise. Pure — callers
+/// gather `codex_auth`/`opencode_keys`/`env_key` from disk/env once per
+/// picker open.
+pub fn provider_auth_state(
+    provider: &str,
+    codex_auth: bool,
+    opencode_keys: &[String],
+    env_key: bool,
+) -> &'static str {
+    match provider {
+        "codex" => {
+            if codex_auth {
+                " ✓ logged in"
+            } else {
+                ""
+            }
+        }
+        "opencode-go" | "opencode" | "kilo" => {
+            if opencode_keys.iter().any(|k| k == provider) {
+                " ✓ logged in"
+            } else {
+                ""
+            }
+        }
+        "openai" => {
+            if env_key {
+                " ✓ logged in"
+            } else {
+                ""
+            }
+        }
+        "lmstudio" => " (local)",
+        _ => "",
+    }
+}
+
+/// Decides the startup hint (if any) shown once at TUI launch: a nudge to
+/// switch providers when the config is still on the `openai` default, no
+/// model has been explicitly chosen, no OpenAI credentials are available,
+/// but Kode's own credential store has something usable. Fires at most one
+/// hint — codex takes priority over opencode. Pure so the decision is
+/// unit-testable without touching the filesystem/env.
+fn startup_hint(
+    provider: &str,
+    model_set: bool,
+    env_key: bool,
+    codex_auth: bool,
+    opencode_any: bool,
+) -> Option<&'static str> {
+    if provider != "openai" || model_set || env_key {
+        return None;
+    }
+    if codex_auth {
+        Some("logged in via codex — run /provider codex to use it")
+    } else if opencode_any {
+        Some("opencode key found — run /provider opencode-go")
+    } else {
+        None
+    }
+}
+
+/// Whether Kode's own codex OAuth credentials file exists (`kode auth login
+/// codex`). Used only to power the `/provider` picker annotation and the
+/// startup hint — not a validity check of the tokens inside.
+fn codex_auth_exists() -> bool {
+    kode_model::codex::default_auth_path()
+        .map(|p| p.exists())
+        .unwrap_or(false)
+}
+
+/// Provider ids with a stored API key in Kode's opencode-family auth store
+/// (`~/.kode/auth/opencode.json`). Empty when the file is missing/invalid.
+fn opencode_key_ids() -> Vec<String> {
+    let Some(path) = kode_model::opencode::default_auth_path() else {
+        return Vec::new();
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<serde_json::Value>(&content)
+        .ok()
+        .and_then(|v| v.as_object().map(|o| o.keys().cloned().collect()))
+        .unwrap_or_default()
+}
+
+/// True when an OpenAI API key is available via environment variable
+/// (`OPENAI_API_KEY` or `KODE_API_KEY`) — the credential path the `openai`
+/// provider actually uses.
+fn openai_env_key_present() -> bool {
+    std::env::var("OPENAI_API_KEY").is_ok() || std::env::var("KODE_API_KEY").is_ok()
 }
 
 /// Validates a reasoning-effort value against
@@ -667,6 +798,7 @@ pub fn handle_picker_key(state: &mut AppState, code: KeyCode) -> PickerOutcome {
 /// catalog fetch for `provider`, delivered back via `tx`.
 fn open_picker(state: &mut AppState, provider: String, tx: &mpsc::UnboundedSender<PickerLoaded>) {
     state.picker.open = true;
+    state.picker.kind = PickerKind::Model;
     state.picker.filter.clear();
     state.picker.selected = 0;
     state.picker.items.clear();
@@ -683,6 +815,53 @@ fn open_picker(state: &mut AppState, provider: String, tx: &mpsc::UnboundedSende
         };
         let _ = tx.send(msg);
     });
+}
+
+/// Opens the `/provider` picker: a static list of [`VALID_PROVIDERS`], each
+/// annotated with its auth state via [`provider_auth_state`]. Synchronous —
+/// no catalog fetch, just local disk/env reads.
+fn open_provider_picker(state: &mut AppState) {
+    state.picker.open = true;
+    state.picker.kind = PickerKind::Provider;
+    state.picker.filter.clear();
+    state.picker.selected = 0;
+    state.picker.note = None;
+
+    let codex_auth = codex_auth_exists();
+    let opencode_keys = opencode_key_ids();
+    let env_key = openai_env_key_present();
+    state.picker.items = VALID_PROVIDERS
+        .iter()
+        .map(|p| {
+            format!(
+                "{p}{}",
+                provider_auth_state(p, codex_auth, &opencode_keys, env_key)
+            )
+        })
+        .collect();
+}
+
+/// Applies a validated `/provider` switch: persists the new provider
+/// (clearing `model` — it's very unlikely to be valid across providers),
+/// updates in-memory state, and auto-opens the model picker for the new
+/// provider so the user isn't left at "(no model)".
+fn apply_provider_selection(
+    state: &mut AppState,
+    cwd: &Path,
+    config: &mut KodeConfig,
+    picker_tx: &mpsc::UnboundedSender<PickerLoaded>,
+    provider: &str,
+) {
+    state.status.provider = provider.to_string();
+    state.status.model = String::new();
+    config.model.provider = provider.to_string();
+    config.model.model = String::new();
+    let _ = KodeConfig::update_model_config(cwd, Some(provider), Some(""), None);
+    state.transcript.push(TranscriptLine::new(
+        Gutter::Note,
+        format!("provider set: {provider}"),
+    ));
+    open_picker(state, provider.to_string(), picker_tx);
 }
 
 /// Applies a parsed slash command to `state`/`config`. `/model` with no
@@ -723,12 +902,28 @@ fn handle_slash_command(
                 .transcript
                 .push(TranscriptLine::new(Gutter::Note, msg)),
         },
+        SlashCommand::Provider(None) => {
+            open_provider_picker(state);
+        }
+        SlashCommand::Provider(Some(name)) => {
+            if VALID_PROVIDERS.contains(&name.as_str()) {
+                apply_provider_selection(state, cwd, config, picker_tx, &name);
+            } else {
+                state.transcript.push(TranscriptLine::new(
+                    Gutter::Note,
+                    format!(
+                        "invalid provider '{name}' (valid: {})",
+                        VALID_PROVIDERS.join(", ")
+                    ),
+                ));
+            }
+        }
         SlashCommand::Help => {
             state.transcript.push(TranscriptLine::new(
                 Gutter::Note,
-                "commands: /model [name], /effort <minimal|low|medium|high|xhigh>, /help · \
-                 Ctrl+K toggles the Knowledge Band, Ctrl+L opens the Ledger, Esc closes \
-                 the Ledger or cancels the run",
+                "commands: /model [name], /effort <minimal|low|medium|high|xhigh>, \
+                 /provider [name], /help · Ctrl+K toggles the Knowledge Band, Ctrl+L opens \
+                 the Ledger, Esc closes the Ledger or cancels the run",
             ));
         }
         SlashCommand::Unknown(cmd) => {
@@ -816,6 +1011,20 @@ pub async fn run(cwd: &Path, cancel: CancellationToken) -> anyhow::Result<()> {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| cwd.display().to_string());
     state.branch = detect_branch(cwd);
+    state.zindeks_enabled = config.zindeks.enabled;
+    state.ingat_enabled = config.ingat.enabled;
+
+    if let Some(hint) = startup_hint(
+        &config.model.provider,
+        !config.model.model.is_empty(),
+        openai_env_key_present(),
+        codex_auth_exists(),
+        !opencode_key_ids().is_empty(),
+    ) {
+        state
+            .transcript
+            .push(TranscriptLine::new(Gutter::Note, hint));
+    }
 
     let (perm_tx, mut perm_rx) = mpsc::unbounded_channel::<(String, oneshot::Sender<bool>)>();
     let handler: Arc<dyn PermissionHandler> = Arc::new(TuiPermission::new(perm_tx));
@@ -840,15 +1049,38 @@ pub async fn run(cwd: &Path, cancel: CancellationToken) -> anyhow::Result<()> {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                         if state.picker.open {
                             match handle_picker_key(&mut state, key.code) {
-                                PickerOutcome::Select(model) => {
-                                    state.status.model = model.clone();
-                                    config.model.model = model.clone();
-                                    let _ = KodeConfig::update_model_selection(cwd, Some(&model), None);
-                                    state.transcript.push(TranscriptLine::new(
-                                        Gutter::Note,
-                                        format!("model set: {model}"),
-                                    ));
+                                PickerOutcome::Select(selected) => {
                                     state.picker.open = false;
+                                    match state.picker.kind {
+                                        PickerKind::Model => {
+                                            let model = selected;
+                                            state.status.model = model.clone();
+                                            config.model.model = model.clone();
+                                            let _ = KodeConfig::update_model_selection(cwd, Some(&model), None);
+                                            state.transcript.push(TranscriptLine::new(
+                                                Gutter::Note,
+                                                format!("model set: {model}"),
+                                            ));
+                                        }
+                                        PickerKind::Provider => {
+                                            let name = selected
+                                                .split_whitespace()
+                                                .next()
+                                                .unwrap_or("")
+                                                .to_string();
+                                            if VALID_PROVIDERS.contains(&name.as_str()) {
+                                                apply_provider_selection(&mut state, cwd, &mut config, &picker_tx, &name);
+                                            } else {
+                                                state.transcript.push(TranscriptLine::new(
+                                                    Gutter::Note,
+                                                    format!(
+                                                        "invalid provider '{name}' (valid: {})",
+                                                        VALID_PROVIDERS.join(", ")
+                                                    ),
+                                                ));
+                                            }
+                                        }
+                                    }
                                 }
                                 PickerOutcome::Cancel => {
                                     state.picker.open = false;
@@ -1050,6 +1282,161 @@ pub fn knowledge_band_visible(state: &AppState) -> bool {
             .is_some_and(|k| !k.zindeks.is_empty() || !k.ingat.is_empty() || !k.git.is_empty())
 }
 
+/// True when the transcript area should render the idle empty-state block
+/// (version/tagline, engine status, input nudge) instead of the normal
+/// transcript. Per `DESIGN.md`, this is the calm-instrument first-run
+/// surface — it stays true while nothing but startup `Note` hints (model
+/// unset, provider suggestion) have landed, and goes away for good once
+/// any real activity (user input, prose, tool, verify, error) appears.
+/// Never true while a task is running.
+pub fn show_empty_state(transcript: &[TranscriptLine], running: bool) -> bool {
+    !running && transcript.iter().all(|l| l.gutter == Gutter::Note)
+}
+
+/// The idle empty-state's per-engine status word — derived from static
+/// config truth plus session state only, never by probing the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineStatus {
+    /// `[zindeks]`/`[ingat]` `enabled = false` in config.
+    Disabled,
+    /// Enabled, and at least one `Knowledge` event has surfaced data from
+    /// this source this session.
+    Ready,
+    /// Enabled, but no `Knowledge` event has surfaced data from this
+    /// source yet.
+    AvailableAfterFirstTask,
+}
+
+/// Decides an [`EngineStatus`] from config's `enabled` flag and whether
+/// this source has produced data in a `Knowledge` event yet this session.
+pub fn engine_status(enabled: bool, source_seen: bool) -> EngineStatus {
+    if !enabled {
+        EngineStatus::Disabled
+    } else if source_seen {
+        EngineStatus::Ready
+    } else {
+        EngineStatus::AvailableAfterFirstTask
+    }
+}
+
+/// The input line's right-aligned suffix: per-source context counts once a
+/// `Knowledge` event has arrived this session, else the `/help` hint. Pure
+/// decision — sizing and rendering both derive from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputSuffix {
+    Counts { z: usize, i: usize, g: usize },
+    Help,
+}
+
+impl InputSuffix {
+    /// Plain-text rendering, used to size the row for right-alignment.
+    fn plain_text(&self) -> String {
+        match self {
+            InputSuffix::Counts { z, i, g } => format!("ctx Z:{z} I:{i} G:{g}"),
+            InputSuffix::Help => "/help".to_string(),
+        }
+    }
+
+    /// Styled spans, colored per source (`ctx` label DIM, counts in source
+    /// colors) or a plain DIM `/help`.
+    fn spans(&self) -> Vec<Span<'static>> {
+        match self {
+            InputSuffix::Counts { z, i, g } => vec![
+                Span::styled("ctx ", Style::default().fg(theme::DIM)),
+                Span::styled(format!("Z:{z}"), Style::default().fg(theme::Z)),
+                Span::raw(" "),
+                Span::styled(format!("I:{i}"), Style::default().fg(theme::I)),
+                Span::raw(" "),
+                Span::styled(format!("G:{g}"), Style::default().fg(theme::G)),
+            ],
+            InputSuffix::Help => vec![Span::styled("/help", Style::default().fg(theme::DIM))],
+        }
+    }
+}
+
+/// Decides the input line's suffix from the session's last Knowledge
+/// digest (`None` until the first context compilation of the session).
+pub fn input_suffix(knowledge: Option<&KnowledgeState>) -> InputSuffix {
+    match knowledge {
+        Some(ks) => InputSuffix::Counts {
+            z: ks.zindeks.len(),
+            i: ks.ingat.len(),
+            g: ks.git.len(),
+        },
+        None => InputSuffix::Help,
+    }
+}
+
+/// One idle empty-state engine-status line: ` {label}: {status word}`.
+fn engine_status_line(
+    label: &str,
+    enabled: bool,
+    source_seen: bool,
+    ready_color: Color,
+) -> Line<'static> {
+    let (text, style) = match engine_status(enabled, source_seen) {
+        EngineStatus::Disabled => ("disabled".to_string(), Style::default().fg(theme::DIM)),
+        EngineStatus::Ready => ("ready".to_string(), Style::default().fg(ready_color)),
+        EngineStatus::AvailableAfterFirstTask => (
+            "available after first task".to_string(),
+            Style::default().fg(theme::DIM),
+        ),
+    };
+    Line::from(vec![
+        Span::styled(format!(" {label}: "), Style::default().fg(theme::MUTED)),
+        Span::styled(text, style),
+    ])
+}
+
+/// Builds the idle empty-state block: version/tagline, per-engine status
+/// (zindeks/ingat), then the input nudge and command list. Top-left
+/// anchored, one blank row down — never vertically centered, per
+/// `DESIGN.md`'s calm-instrument direction.
+fn empty_state_lines(state: &AppState) -> Vec<Line<'static>> {
+    let zindeks_seen = state
+        .knowledge
+        .as_ref()
+        .is_some_and(|k| !k.zindeks.is_empty());
+    let ingat_seen = state
+        .knowledge
+        .as_ref()
+        .is_some_and(|k| !k.ingat.is_empty());
+    vec![
+        Line::default(),
+        Line::from(vec![
+            Span::styled(" kode", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" v{} — calm instrument", env!("CARGO_PKG_VERSION")),
+                Style::default().fg(theme::MUTED),
+            ),
+        ]),
+        engine_status_line(
+            "code intelligence",
+            state.zindeks_enabled,
+            zindeks_seen,
+            theme::Z,
+        ),
+        engine_status_line(
+            "engineering memory",
+            state.ingat_enabled,
+            ingat_seen,
+            theme::I,
+        ),
+        Line::default(),
+        Line::from(vec![
+            Span::styled(" › ", Style::default().fg(theme::MUTED)),
+            Span::styled(
+                "type a task and press enter",
+                Style::default().fg(theme::MUTED),
+            ),
+        ]),
+        Line::from(Span::styled(
+            " /provider · /model · /effort · /help · ctrl+k band · ctrl+l ledger",
+            Style::default().fg(theme::DIM),
+        )),
+    ]
+}
+
 /// Formats a token count compactly: `<1000` verbatim, else `"{n:.1}k"`.
 fn format_k(n: usize) -> String {
     if n < 1000 {
@@ -1108,7 +1495,9 @@ fn transcript_line_to_ratatui(line: &TranscriptLine) -> Line<'static> {
 }
 
 /// Builds the breadcrumb row: `kode  {repo} · {branch} · {provider}/{model}
-/// · effort:{e} · ctx ▓▓░░ {used}/{budget}`. The context meter is omitted
+/// · effort:{e} · ctx ▓▓░░ {used}/{budget}`. `kode` renders dim/lowercase,
+/// the rest normal; when no model is selected, a dim ` — /model` nudge is
+/// appended after the provider/model cell. The context meter is omitted
 /// until the first `Knowledge` event of the session.
 fn breadcrumb_line(state: &AppState) -> Line<'static> {
     let branch = state.branch.clone().unwrap_or_else(|| "no git".to_string());
@@ -1117,16 +1506,22 @@ fn breadcrumb_line(state: &AppState) -> Line<'static> {
     } else {
         state.status.effort.clone()
     };
-    let model = if state.status.model.is_empty() {
-        "(no model)".to_string()
-    } else {
+    let model_set = !state.status.model.is_empty();
+    let model = if model_set {
         state.status.model.clone()
+    } else {
+        "(no model)".to_string()
     };
-    let prefix = format!(
-        " kode  {} · {branch} · {}/{model} · effort:{effort}",
-        state.repo_dir, state.status.provider
-    );
-    let mut spans = vec![Span::raw(prefix)];
+    let mut spans = vec![
+        Span::styled(" kode", Style::default().fg(theme::DIM)),
+        Span::raw(format!(
+            "  {} · {branch} · {}/{model} · effort:{effort}",
+            state.repo_dir, state.status.provider
+        )),
+    ];
+    if !model_set {
+        spans.push(Span::styled(" — /model", Style::default().fg(theme::DIM)));
+    }
     if let Some(ks) = &state.knowledge {
         let bar = meter(ks.context_tokens, ks.budget_tokens, 8);
         let filled = bar.chars().filter(|c| *c == '▓').count();
@@ -1293,7 +1688,7 @@ fn draw(f: &mut ratatui::Frame, state: &AppState) {
     if has_pending {
         constraints.push(Constraint::Length(3));
     }
-    constraints.push(Constraint::Length(3)); // input
+    constraints.push(Constraint::Length(2)); // input: rule + line, no box
 
     let areas = Layout::vertical(constraints).split(f.area());
     let mut idx = 0;
@@ -1309,11 +1704,17 @@ fn draw(f: &mut ratatui::Frame, state: &AppState) {
     if state.ledger_open {
         draw_ledger(f, areas[idx], &state.ledger);
     } else {
-        let mut text_lines: Vec<Line> = state
-            .transcript
-            .iter()
-            .map(transcript_line_to_ratatui)
-            .collect();
+        let mut text_lines: Vec<Line> = if show_empty_state(&state.transcript, state.running) {
+            let mut lines = empty_state_lines(state);
+            lines.extend(state.transcript.iter().map(transcript_line_to_ratatui));
+            lines
+        } else {
+            state
+                .transcript
+                .iter()
+                .map(transcript_line_to_ratatui)
+                .collect()
+        };
         if !state.current_stream.is_empty() {
             text_lines.push(transcript_line_to_ratatui(&TranscriptLine::new(
                 Gutter::Prose,
@@ -1360,12 +1761,59 @@ fn draw(f: &mut ratatui::Frame, state: &AppState) {
         areas[idx]
     };
 
-    let input = Paragraph::new(state.input.as_str())
-        .block(Block::default().borders(Borders::ALL).title("task"));
-    f.render_widget(input, next_area);
+    draw_input(f, next_area, state);
 
     if state.picker.open {
         draw_picker(f, &state.picker);
+    }
+}
+
+/// Renders the 2-row input form: a DIM full-width rule, then `› {input}`
+/// with a right-aligned suffix ([`InputSuffix`]). Replaces the old bordered
+/// "task" box entirely — `DESIGN.md`: input is a single borderless `›`
+/// line, no boxes, dim `─` rules only. Positions the terminal cursor at the
+/// end of the typed text, except while a picker or permission prompt has
+/// focus.
+fn draw_input(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &AppState) {
+    if area.height == 0 {
+        return;
+    }
+    let rule_area = ratatui::layout::Rect { height: 1, ..area };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(area.width as usize),
+            Style::default().fg(theme::DIM),
+        ))),
+        rule_area,
+    );
+
+    if area.height < 2 {
+        return;
+    }
+    let line_area = ratatui::layout::Rect {
+        y: area.y + 1,
+        height: 1,
+        ..area
+    };
+
+    let suffix = input_suffix(state.knowledge.as_ref());
+    let suffix_text = suffix.plain_text();
+    let prefix_width = 3 + state.input.chars().count(); // " › " + input
+    let pad = (line_area.width as usize).saturating_sub(prefix_width + suffix_text.chars().count());
+
+    let mut spans = vec![
+        Span::styled(" › ", Style::default().fg(theme::MUTED)),
+        Span::raw(state.input.clone()),
+        Span::raw(" ".repeat(pad)),
+    ];
+    spans.extend(suffix.spans());
+    f.render_widget(Paragraph::new(Line::from(spans)), line_area);
+
+    if !state.picker.open && state.pending.is_empty() {
+        let cursor_x = (line_area.x as usize + 3 + state.input.chars().count())
+            .min((line_area.x + line_area.width).saturating_sub(1) as usize)
+            as u16;
+        f.set_cursor_position((cursor_x, line_area.y));
     }
 }
 
@@ -1529,7 +1977,11 @@ fn draw_picker(f: &mut ratatui::Frame, picker: &PickerState) {
         lines.push(Line::from(format!("{marker}{item}")));
     }
 
-    let block = Block::default().borders(Borders::ALL).title("select model");
+    let title = match picker.kind {
+        PickerKind::Model => "select model",
+        PickerKind::Provider => "select provider",
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
     let paragraph = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false });
@@ -1946,6 +2398,104 @@ mod tests {
     }
 
     #[test]
+    fn parse_slash_command_provider_with_no_arg() {
+        assert_eq!(
+            parse_slash_command("/provider"),
+            Some(SlashCommand::Provider(None))
+        );
+    }
+
+    #[test]
+    fn parse_slash_command_provider_with_arg() {
+        assert_eq!(
+            parse_slash_command("/provider codex"),
+            Some(SlashCommand::Provider(Some("codex".to_string())))
+        );
+    }
+
+    // -- provider auth-state annotation (pure fn) --------------------------
+
+    #[test]
+    fn provider_auth_state_codex_logged_in() {
+        assert_eq!(
+            provider_auth_state("codex", true, &[], false),
+            " ✓ logged in"
+        );
+    }
+
+    #[test]
+    fn provider_auth_state_codex_not_logged_in() {
+        assert_eq!(provider_auth_state("codex", false, &[], false), "");
+    }
+
+    #[test]
+    fn provider_auth_state_opencode_family_matches_key() {
+        let keys = vec!["opencode-go".to_string()];
+        assert_eq!(
+            provider_auth_state("opencode-go", false, &keys, false),
+            " ✓ logged in"
+        );
+        assert_eq!(provider_auth_state("opencode", false, &keys, false), "");
+        assert_eq!(provider_auth_state("kilo", false, &keys, false), "");
+    }
+
+    #[test]
+    fn provider_auth_state_openai_uses_env_key() {
+        assert_eq!(
+            provider_auth_state("openai", false, &[], true),
+            " ✓ logged in"
+        );
+        assert_eq!(provider_auth_state("openai", false, &[], false), "");
+    }
+
+    #[test]
+    fn provider_auth_state_lmstudio_always_local() {
+        assert_eq!(
+            provider_auth_state("lmstudio", false, &[], false),
+            " (local)"
+        );
+        assert_eq!(provider_auth_state("lmstudio", true, &[], true), " (local)");
+    }
+
+    // -- startup hint (pure fn) ---------------------------------------------
+
+    #[test]
+    fn startup_hint_fresh_with_codex_auth_shows_codex_hint() {
+        assert_eq!(
+            startup_hint("openai", false, false, true, false),
+            Some("logged in via codex — run /provider codex to use it")
+        );
+    }
+
+    #[test]
+    fn startup_hint_provider_already_codex_is_none() {
+        assert_eq!(startup_hint("codex", false, false, true, false), None);
+    }
+
+    #[test]
+    fn startup_hint_env_key_set_is_none() {
+        assert_eq!(startup_hint("openai", false, true, true, false), None);
+    }
+
+    #[test]
+    fn startup_hint_nothing_is_none() {
+        assert_eq!(startup_hint("openai", false, false, false, false), None);
+    }
+
+    #[test]
+    fn startup_hint_opencode_key_found_when_no_codex_auth() {
+        assert_eq!(
+            startup_hint("openai", false, false, false, true),
+            Some("opencode key found — run /provider opencode-go")
+        );
+    }
+
+    #[test]
+    fn startup_hint_model_already_set_is_none() {
+        assert_eq!(startup_hint("openai", true, false, true, false), None);
+    }
+
+    #[test]
     fn validate_effort_accepts_known_values() {
         for v in kode_core::config::VALID_EFFORTS {
             assert_eq!(validate_effort(v), Ok(v.to_string()));
@@ -2147,7 +2697,59 @@ mod tests {
         handle_slash_command(&mut s, &dir, &mut cfg, &tx, SlashCommand::Help);
 
         assert!(s.transcript.iter().any(|l| l.text.contains("/model")));
+        assert!(s.transcript.iter().any(|l| l.text.contains("/provider")));
         assert!(s.transcript.iter().any(|l| l.text.contains("Ctrl+L")));
+    }
+
+    #[test]
+    fn handle_slash_command_provider_invalid_pushes_error_without_persisting() {
+        let dir = temp_project_dir();
+        let mut s = state();
+        let mut cfg = KodeConfig::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        handle_slash_command(
+            &mut s,
+            &dir,
+            &mut cfg,
+            &tx,
+            SlashCommand::Provider(Some("bogus".to_string())),
+        );
+
+        assert_eq!(cfg.model.provider, "openai");
+        assert!(
+            s.transcript
+                .iter()
+                .any(|l| l.text.contains("invalid provider"))
+        );
+        assert!(!KodeConfig::config_path(&dir).exists());
+    }
+
+    #[tokio::test]
+    async fn handle_slash_command_provider_valid_persists_clears_model_and_opens_picker() {
+        let dir = temp_project_dir();
+        let mut s = state();
+        let mut cfg = KodeConfig::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        handle_slash_command(
+            &mut s,
+            &dir,
+            &mut cfg,
+            &tx,
+            SlashCommand::Provider(Some("codex".to_string())),
+        );
+
+        assert_eq!(s.status.provider, "codex");
+        assert_eq!(cfg.model.provider, "codex");
+        assert_eq!(s.status.model, "");
+        assert_eq!(cfg.model.model, "");
+        assert!(s.picker.open);
+        assert_eq!(s.picker.kind, PickerKind::Model);
+
+        let reloaded = KodeConfig::load(&dir).unwrap();
+        assert_eq!(reloaded.model.provider, "codex");
+        assert_eq!(reloaded.model.model, "");
     }
 
     // -- verify step events ------------------------------------------------
@@ -2519,5 +3121,99 @@ mod tests {
         assert_eq!(gutter_prefix(&Gutter::Verify), ("V ", theme::OK));
         assert_eq!(gutter_prefix(&Gutter::VerifyFail), ("V ", theme::ERR));
         assert_eq!(gutter_prefix(&Gutter::VerifySkip), ("V ", theme::DIM));
+    }
+
+    // -- idle empty-state visibility (pure fn) -------------------------------
+
+    #[test]
+    fn show_empty_state_true_on_fresh_session() {
+        assert!(show_empty_state(&[], false));
+    }
+
+    #[test]
+    fn show_empty_state_false_while_running() {
+        assert!(!show_empty_state(&[], true));
+    }
+
+    #[test]
+    fn show_empty_state_true_with_only_startup_note_hints() {
+        let transcript = vec![TranscriptLine::new(Gutter::Note, "pick a model first")];
+        assert!(show_empty_state(&transcript, false));
+    }
+
+    #[test]
+    fn show_empty_state_false_once_real_content_present() {
+        let transcript = vec![
+            TranscriptLine::new(Gutter::Note, "pick a model first"),
+            TranscriptLine::new(Gutter::User, "fix the bug"),
+        ];
+        assert!(!show_empty_state(&transcript, false));
+    }
+
+    // -- engine status (pure fn) ---------------------------------------------
+
+    #[test]
+    fn engine_status_disabled_overrides_everything() {
+        assert_eq!(engine_status(false, true), EngineStatus::Disabled);
+        assert_eq!(engine_status(false, false), EngineStatus::Disabled);
+    }
+
+    #[test]
+    fn engine_status_ready_when_enabled_and_source_seen() {
+        assert_eq!(engine_status(true, true), EngineStatus::Ready);
+    }
+
+    #[test]
+    fn engine_status_available_after_first_task_when_enabled_not_seen() {
+        assert_eq!(
+            engine_status(true, false),
+            EngineStatus::AvailableAfterFirstTask
+        );
+    }
+
+    // -- input suffix (pure fn) -----------------------------------------------
+
+    #[test]
+    fn input_suffix_help_when_no_knowledge_yet() {
+        assert_eq!(input_suffix(None), InputSuffix::Help);
+        assert_eq!(input_suffix(None).plain_text(), "/help");
+    }
+
+    #[test]
+    fn input_suffix_counts_when_knowledge_present() {
+        let ks = KnowledgeState {
+            zindeks: vec!["a".to_string(), "b".to_string()],
+            ingat: vec!["c".to_string()],
+            git: vec![],
+            context_tokens: 100,
+            budget_tokens: 16_000,
+        };
+        assert_eq!(
+            input_suffix(Some(&ks)),
+            InputSuffix::Counts { z: 2, i: 1, g: 0 }
+        );
+        assert_eq!(input_suffix(Some(&ks)).plain_text(), "ctx Z:2 I:1 G:0");
+    }
+
+    // -- breadcrumb model nudge -------------------------------------------
+
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn breadcrumb_line_nudges_when_model_unset() {
+        let s = state_no_model();
+        assert!(line_text(&breadcrumb_line(&s)).contains("— /model"));
+    }
+
+    #[test]
+    fn breadcrumb_line_omits_nudge_when_model_set() {
+        let s = state();
+        assert!(!line_text(&breadcrumb_line(&s)).contains("— /model"));
+    }
+
+    fn state_no_model() -> AppState {
+        AppState::new("openai".to_string(), String::new(), String::new())
     }
 }
