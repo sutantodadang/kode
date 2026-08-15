@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/kode-core", "crates/kode", "crates/kode-model", "crates/kode-tools", "crates/kode-agent", "crates/kode-intel", "crates/kode-context", "crates/kode-memory"]
+members = ["crates/kode-core", "crates/kode", "crates/kode-model", "crates/kode-tools", "crates/kode-agent", "crates/kode-intel", "crates/kode-context", "crates/kode-memory", "crates/kode-verify"]
 
 [workspace.package]
 version = "0.1.0"

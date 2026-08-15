@@ -620,6 +620,7 @@ dependencies = [
  "kode-memory",
  "kode-model",
  "kode-tools",
+ "kode-verify",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -715,6 +716,18 @@ dependencies = [
  "kode-core",
  "kode-model",
  "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "kode-verify"
+version = "0.1.0"
+dependencies = [
+ "kode-core",
  "serde_json",
  "thiserror",
  "tokio",

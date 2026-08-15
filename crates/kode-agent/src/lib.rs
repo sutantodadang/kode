@@ -9,7 +9,7 @@ use kode_core::config::AgentConfig;
 use kode_core::event::{EventBus, KodeEvent};
 use kode_model::{Message, Model, ModelRequest, ResponseAccumulator, StreamEvent, Usage};
 use kode_tools::registry::ToolRuntime;
-use kode_tools::{ToolContext, ToolError};
+use kode_tools::{RequiredPermission, ToolContext, ToolError};
 
 const SYSTEM_PROMPT: &str = "You are Kode, a coding agent operating on the user's repository. \
 Use the provided tools to inspect and modify files and run commands. Prefer reading before \
@@ -33,6 +33,9 @@ pub struct AgentOutcome {
     pub iterations: u32,
     pub tool_calls: u32,
     pub usage: Usage,
+    /// True iff at least one tool whose `required_permission()` is
+    /// `Mutating` executed successfully during this run.
+    pub mutated: bool,
 }
 
 impl Agent {
@@ -78,6 +81,7 @@ impl Agent {
         let mut total_tool_calls: u32 = 0;
         let mut last_call: Option<(String, String)> = None;
         let mut repeat_count: u32 = 0;
+        let mut mutated = false;
 
         for iteration in 1..=self.max_iterations {
             if ctx.cancel.is_cancelled() {
@@ -132,6 +136,7 @@ impl Agent {
                     iterations: iteration,
                     tool_calls: total_tool_calls,
                     usage,
+                    mutated,
                 });
             }
 
@@ -180,6 +185,11 @@ impl Agent {
                     .await
                 {
                     Ok(out) => {
+                        if self.tools.required_permission(&call.name)
+                            == Some(RequiredPermission::Mutating)
+                        {
+                            mutated = true;
+                        }
                         self.events.emit(KodeEvent::ToolFinished {
                             name: call.name.clone(),
                             ok: true,
@@ -298,6 +308,10 @@ mod tests {
         assert_eq!(outcome.final_text, "done");
         assert_eq!(outcome.iterations, 2);
         assert_eq!(outcome.tool_calls, 1);
+        assert!(
+            !outcome.mutated,
+            "read_file-only run must not report mutated"
+        );
         assert_eq!(
             outcome.usage,
             Usage {
@@ -340,6 +354,42 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, KodeEvent::AgentFinished))
         );
+    }
+
+    #[tokio::test]
+    async fn write_file_call_sets_mutated_flag() {
+        let dir = temp_dir();
+
+        let mock = MockModel::new();
+        let args = serde_json::json!({"path": "out.txt", "content": "hi"}).to_string();
+        mock.push_script(vec![
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call_1".to_string()),
+                name: Some("write_file".to_string()),
+                arguments_delta: args,
+            },
+            StreamEvent::Finished {
+                reason: FinishReason::ToolCalls,
+                usage: None,
+            },
+        ]);
+        mock.push_script(vec![
+            StreamEvent::TextDelta("done".to_string()),
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: None,
+            },
+        ]);
+
+        let events = EventBus::new(64);
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let agent = Agent::new(Arc::new(mock), tools, events, &AgentConfig::default());
+
+        let outcome = agent.run("write a file", &ctx(dir)).await.unwrap();
+
+        assert_eq!(outcome.final_text, "done");
+        assert!(outcome.mutated, "write_file run must report mutated");
     }
 
     #[tokio::test]

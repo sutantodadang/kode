@@ -81,6 +81,10 @@ impl ToolRuntime {
         self.registry.specs()
     }
 
+    pub fn required_permission(&self, name: &str) -> Option<crate::RequiredPermission> {
+        self.registry.get(name).map(|t| t.required_permission())
+    }
+
     pub async fn execute(
         &self,
         name: &str,

@@ -1,6 +1,7 @@
 mod exec;
 mod remember;
 mod status;
+mod verify;
 
 use clap::Parser;
 use kode_core::{CancellationToken, cancel_on_ctrl_c};
@@ -25,6 +26,8 @@ enum Command {
         /// The task to accomplish.
         task: String,
     },
+    /// Detect the project and run its verification pipeline.
+    Verify,
     /// Save an explicit engineering memory to Ingat.
     Remember {
         /// The memory text.
@@ -74,6 +77,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Exec { task } => {
             let cwd = std::env::current_dir()?;
             exec::run(&task, &cwd, token).await?;
+        }
+        Command::Verify => {
+            let cwd = std::env::current_dir()?;
+            verify::run(&cwd, token).await?;
         }
         Command::Remember { text, kind, tags } => {
             let cwd = std::env::current_dir()?;
