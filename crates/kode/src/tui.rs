@@ -303,6 +303,9 @@ pub struct AppState {
     /// Name of the tool currently running, if any (drives the spinner
     /// label: tool name vs. generic "thinking").
     pub current_tool: Option<String>,
+    /// When the currently running tool started — drives the tool elapsed
+    /// label.
+    pub tool_started: Option<Instant>,
     /// The Knowledge Aperture's data, `Some` from the current run's
     /// `Knowledge` event until it contracts back to the normal band.
     pub aperture: Option<ApertureState>,
@@ -358,6 +361,7 @@ impl AppState {
             branch: None,
             run_started: None,
             current_tool: None,
+            tool_started: None,
             aperture: None,
             ledger_open: false,
             ledger: LedgerState::default(),
@@ -389,6 +393,7 @@ impl AppState {
         self.ledger = LedgerState::new(ledger_objective(task));
         self.decide_marked_this_run = false;
         self.aperture = None;
+        self.tool_started = None;
         self.response_buf.clear();
         self.md_in_code_block = false;
     }
@@ -472,6 +477,7 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             state.status.tools_used += 1;
             state.status.state = RunState::Tool;
             state.current_tool = Some(name);
+            state.tool_started = Some(Instant::now());
             if let Some(ap) = &mut state.aperture {
                 ap.trigger_seen = true;
             }
@@ -497,6 +503,7 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
                 state.ledger.record_change(&name);
             }
             state.current_tool = None;
+            state.tool_started = None;
         }
         KodeEvent::VerificationStarted => {
             state.status.state = RunState::Verify;
@@ -2052,7 +2059,13 @@ fn draw(f: &mut ratatui::Frame, state: &AppState) {
             let frame = spinner_frame(elapsed.as_millis());
             let secs = elapsed.as_secs_f64();
             let label = match &state.current_tool {
-                Some(tool) => format!("▸ {tool} · {secs:.1}s"),
+                Some(tool) => {
+                    let tool_secs = state
+                        .tool_started
+                        .map(|t| t.elapsed().as_secs_f64())
+                        .unwrap_or(secs);
+                    format!("▸ {tool} · {tool_secs:.1}s")
+                }
                 None => format!("{frame} {} · {secs:.1}s", state.status.state.label()),
             };
             text_lines.push(Line::from(Span::styled(
@@ -2450,6 +2463,27 @@ mod tests {
             vec![TranscriptLine::new(Gutter::ToolFail, "run_shell failed")]
         );
         assert_eq!(s.current_tool, None);
+    }
+
+    #[test]
+    fn tool_started_sets_tool_timer_and_finished_clears_it() {
+        let mut s = state();
+        assert!(s.tool_started.is_none());
+        apply_event(
+            &mut s,
+            KodeEvent::ToolStarted {
+                name: "read_file".into(),
+            },
+        );
+        assert!(s.tool_started.is_some());
+        apply_event(
+            &mut s,
+            KodeEvent::ToolFinished {
+                name: "read_file".into(),
+                ok: true,
+            },
+        );
+        assert!(s.tool_started.is_none());
     }
 
     #[test]
