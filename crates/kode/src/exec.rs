@@ -117,6 +117,7 @@ pub async fn run(
         events,
         Arc::new(StdinPermission),
         cancel,
+        &[],
     )
     .await;
 

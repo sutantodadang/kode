@@ -57,6 +57,10 @@ fn default_context_budget_tokens() -> u32 {
     16_000
 }
 
+fn default_history_budget_tokens() -> u32 {
+    6000
+}
+
 fn default_permission_mode() -> PermissionMode {
     PermissionMode::Ask
 }
@@ -264,6 +268,8 @@ pub struct AgentConfig {
     pub max_context_tokens: u32,
     #[serde(default = "default_context_budget_tokens")]
     pub context_budget_tokens: u32,
+    #[serde(default = "default_history_budget_tokens")]
+    pub history_budget_tokens: u32,
 }
 
 impl Default for AgentConfig {
@@ -273,6 +279,7 @@ impl Default for AgentConfig {
             max_tool_calls: default_max_tool_calls(),
             max_context_tokens: default_max_context_tokens(),
             context_budget_tokens: default_context_budget_tokens(),
+            history_budget_tokens: default_history_budget_tokens(),
         }
     }
 }
@@ -374,8 +381,25 @@ mod tests {
         assert_eq!(cfg.agent.max_tool_calls, 100);
         assert_eq!(cfg.agent.max_context_tokens, 100_000);
         assert_eq!(cfg.agent.context_budget_tokens, 16_000);
+        assert_eq!(cfg.agent.history_budget_tokens, 6000);
         assert_eq!(cfg.permissions.default_mode, PermissionMode::Ask);
         assert!(cfg.mcp.servers.is_empty());
+    }
+
+    #[test]
+    fn load_without_history_budget_tokens_defaults_to_6000() {
+        let dir = temp_project_dir();
+        let kode_dir = dir.join(".kode");
+        std::fs::create_dir_all(&kode_dir).unwrap();
+        std::fs::write(
+            kode_dir.join("config.toml"),
+            concat!("[agent]\n", "max_iterations = 5\n"),
+        )
+        .unwrap();
+
+        let cfg = KodeConfig::load(&dir).unwrap();
+        assert_eq!(cfg.agent.max_iterations, 5);
+        assert_eq!(cfg.agent.history_budget_tokens, 6000);
     }
 
     #[test]

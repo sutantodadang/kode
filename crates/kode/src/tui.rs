@@ -1250,6 +1250,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken) -> anyhow::Result<()> {
                                             task_events.clone(),
                                             task_handler,
                                             child,
+                                            &[],
                                         )
                                         .await
                                         {

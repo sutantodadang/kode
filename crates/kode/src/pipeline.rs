@@ -25,6 +25,7 @@ pub async fn run_task(
     events: EventBus,
     handler: Arc<dyn PermissionHandler>,
     cancel: CancellationToken,
+    history: &[kode_agent::HistoryTurn],
 ) -> anyhow::Result<()> {
     if config.model.model.is_empty() {
         anyhow::bail!("set model.model in .kode/config.toml");
@@ -209,8 +210,22 @@ pub async fn run_task(
         done: true,
     });
 
+    let (kept_history, history_truncated) =
+        kode_agent::select_history(history, config.agent.history_budget_tokens as usize);
+    if history_truncated {
+        events.emit(KodeEvent::Note {
+            text: "(older conversation truncated)".to_string(),
+        });
+    }
+
     let outcome1 = agent
-        .run_with_context(task, compiled.render().as_deref(), &[], false, &ctx)
+        .run_with_context(
+            task,
+            compiled.render().as_deref(),
+            kept_history,
+            history_truncated,
+            &ctx,
+        )
         .await
         .map_err(|err| anyhow::anyhow!(err))?;
 
@@ -256,7 +271,13 @@ pub async fn run_task(
             );
 
             let retry_outcome = agent
-                .run_with_context(&retry_task, compiled.render().as_deref(), &[], false, &ctx)
+                .run_with_context(
+                    &retry_task,
+                    compiled.render().as_deref(),
+                    kept_history,
+                    history_truncated,
+                    &ctx,
+                )
                 .await
                 .map_err(|err| anyhow::anyhow!(err))?;
 
