@@ -1177,7 +1177,7 @@ fn handle_slash_command(
         SlashCommand::Help => {
             state.transcript.push(TranscriptLine::new(
                 Gutter::Note,
-                "commands: /model [name], /effort <minimal|low|medium|high|xhigh>, \
+                "commands: /model [name], /effort <minimal|low|medium|high|xhigh|max|ultra>, \
                  /provider [name], /copy, /help · shift+tab toggles auto mode (tools run \
                  without asking) · ctrl+y copies the last response · text selection works \
                  natively (no mouse capture) · Ctrl+K toggles the Knowledge Band, Ctrl+L \

@@ -202,48 +202,9 @@ impl CodexModel {
     }
 
     /// Refreshes tokens via the OAuth refresh endpoint and persists the
-    /// result to `auth_path`, updating `auth` in place. Missing
-    /// `refresh_token` in the response keeps the old one, per OAuth refresh
-    /// convention.
+    /// result to `auth_path`, updating `auth` in place.
     async fn refresh(&self, auth: &mut CodexAuth) -> Result<()> {
-        let body = serde_json::json!({
-            "client_id": CODEX_CLIENT_ID,
-            "grant_type": "refresh_token",
-            "refresh_token": auth.refresh_token,
-            "scope": "openid profile email",
-        });
-        let resp = self
-            .client
-            .post(CODEX_REFRESH_URL)
-            .json(&body)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let text = resp.text().await.unwrap_or_default();
-            let message: String = text.chars().take(2000).collect();
-            return Err(ModelError::Api { status, message });
-        }
-
-        let wire: RefreshResponse = resp.json().await.map_err(ModelError::Http)?;
-        let last_refresh = format_rfc3339_secs(now_secs());
-        let new_refresh_token = wire
-            .refresh_token
-            .unwrap_or_else(|| auth.refresh_token.clone());
-
-        save_tokens(
-            &self.auth_path,
-            &wire.id_token,
-            &wire.access_token,
-            &new_refresh_token,
-            &last_refresh,
-        )?;
-
-        auth.access_token = wire.access_token;
-        auth.refresh_token = new_refresh_token;
-        auth.last_refresh = last_refresh;
-        Ok(())
+        refresh_tokens(&self.client, &self.auth_path, auth).await
     }
 
     async fn send_request(
@@ -267,6 +228,63 @@ impl CodexModel {
             .await?;
         Ok(resp)
     }
+}
+
+/// Refreshes tokens via the OAuth refresh endpoint and persists the result
+/// to `auth_path`, updating `auth` in place. Missing `refresh_token` in the
+/// response keeps the old one, per OAuth refresh convention. Shared by
+/// [`CodexModel::refresh`] and [`load_fresh`].
+async fn refresh_tokens(
+    client: &reqwest::Client,
+    auth_path: &Path,
+    auth: &mut CodexAuth,
+) -> Result<()> {
+    let body = serde_json::json!({
+        "client_id": CODEX_CLIENT_ID,
+        "grant_type": "refresh_token",
+        "refresh_token": auth.refresh_token,
+        "scope": "openid profile email",
+    });
+    let resp = client.post(CODEX_REFRESH_URL).json(&body).send().await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        let message: String = text.chars().take(2000).collect();
+        return Err(ModelError::Api { status, message });
+    }
+
+    let wire: RefreshResponse = resp.json().await.map_err(ModelError::Http)?;
+    let last_refresh = format_rfc3339_secs(now_secs());
+    let new_refresh_token = wire
+        .refresh_token
+        .unwrap_or_else(|| auth.refresh_token.clone());
+
+    save_tokens(
+        auth_path,
+        &wire.id_token,
+        &wire.access_token,
+        &new_refresh_token,
+        &last_refresh,
+    )?;
+
+    auth.access_token = wire.access_token;
+    auth.refresh_token = new_refresh_token;
+    auth.last_refresh = last_refresh;
+    Ok(())
+}
+
+/// Loads codex auth from `auth_path`, refreshing the access token first if
+/// stale (same 50-minute staleness window as [`CodexModel::stream`]). Used by
+/// callers that need a valid access token/account id without a full
+/// [`CodexModel`] — e.g. the live model-catalog fetch.
+pub async fn load_fresh(auth_path: &Path) -> Result<CodexAuth> {
+    let mut auth = load(auth_path)?;
+    if needs_refresh(&auth.last_refresh, now_secs()) {
+        let client = reqwest::Client::new();
+        refresh_tokens(&client, auth_path, &mut auth).await?;
+    }
+    Ok(auth)
 }
 
 #[derive(serde::Deserialize)]

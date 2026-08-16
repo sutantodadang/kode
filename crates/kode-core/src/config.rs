@@ -19,7 +19,7 @@ fn default_model_effort() -> String {
 
 /// Valid values for `model.effort` / `--effort` / `/effort`, in ascending
 /// order of reasoning depth.
-pub const VALID_EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
+pub const VALID_EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 
 fn default_true() -> bool {
     true

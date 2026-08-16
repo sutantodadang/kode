@@ -46,7 +46,7 @@ enum Command {
         /// Override the configured model for this run.
         #[arg(long)]
         model: Option<String>,
-        /// Override reasoning effort for this run: minimal, low, medium, high, xhigh.
+        /// Override reasoning effort for this run: minimal, low, medium, high, xhigh, max, ultra.
         #[arg(long)]
         effort: Option<String>,
         /// Continue the latest session: prior turns are sent as history and
