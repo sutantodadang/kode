@@ -124,6 +124,7 @@ async fn login_codex() -> anyhow::Result<()> {
         "codex: logged in (account \u{2026}{})",
         last4_chars(&account_id)
     );
+    print_available_models("codex").await;
     Ok(())
 }
 
@@ -345,7 +346,31 @@ async fn login_opencode_key(provider: &str) -> anyhow::Result<()> {
     let path = opencode_auth_path()?;
     upsert_opencode_key(&path, provider, &key)?;
     println!("{provider}: key saved");
+    print_available_models(provider).await;
     Ok(())
+}
+
+/// Prints the just-authenticated provider's model catalog, matching `kode
+/// models`' two-space-indent style. A catalog fetch failure is printed but
+/// never fails the (already-successful) login.
+async fn print_available_models(provider: &str) {
+    println!("available models:");
+    match kode_model::catalog::list_models(provider, None).await {
+        Ok(models) if models.is_empty() => println!("  (none found)"),
+        Ok(models) => {
+            for line in render_model_lines(&models) {
+                println!("{line}");
+            }
+        }
+        Err(e) => println!("could not list models: {e}"),
+    }
+    println!("pick one: kode models \u{00b7} /model inside the TUI");
+}
+
+/// Formats model ids as two-space-indented lines, matching `kode models`'
+/// output style.
+fn render_model_lines(models: &[String]) -> Vec<String> {
+    models.iter().map(|m| format!("  {m}")).collect()
 }
 
 fn load_opencode_map(path: &Path) -> anyhow::Result<serde_json::Map<String, Value>> {
@@ -733,5 +758,23 @@ mod tests {
         let path = dir.join("opencode.json");
         let removed = remove_opencode_key(&path, "kilo").unwrap();
         assert!(!removed);
+    }
+
+    #[test]
+    fn render_model_lines_indents_each_entry() {
+        let models = vec!["gpt-5.6-sol".to_string(), "codex-mini-latest".to_string()];
+        let lines = render_model_lines(&models);
+        assert_eq!(
+            lines,
+            vec![
+                "  gpt-5.6-sol".to_string(),
+                "  codex-mini-latest".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn render_model_lines_empty_input_is_empty() {
+        assert!(render_model_lines(&[]).is_empty());
     }
 }
