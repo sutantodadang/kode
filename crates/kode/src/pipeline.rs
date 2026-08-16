@@ -210,7 +210,7 @@ pub async fn run_task(
     });
 
     let outcome1 = agent
-        .run_with_context(task, compiled.render().as_deref(), &ctx)
+        .run_with_context(task, compiled.render().as_deref(), &[], false, &ctx)
         .await
         .map_err(|err| anyhow::anyhow!(err))?;
 
@@ -256,7 +256,7 @@ pub async fn run_task(
             );
 
             let retry_outcome = agent
-                .run_with_context(&retry_task, compiled.render().as_deref(), &ctx)
+                .run_with_context(&retry_task, compiled.render().as_deref(), &[], false, &ctx)
                 .await
                 .map_err(|err| anyhow::anyhow!(err))?;
 

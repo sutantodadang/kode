@@ -39,6 +39,37 @@ pub struct AgentOutcome {
     pub mutated: bool,
 }
 
+/// One prior conversation turn replayed to the model on resume /
+/// follow-up tasks. Tool traffic is intentionally absent — see the
+/// resume-chat spec (turn-level replay).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoryTurn {
+    pub task: String,
+    pub response: String,
+}
+
+/// Selects the newest suffix of `turns` whose estimated size (chars/4,
+/// consistent with kode-context) fits `budget_tokens`. Always keeps at
+/// least the newest turn when any exist. Returns the kept slice and
+/// whether anything was dropped.
+pub fn select_history(turns: &[HistoryTurn], budget_tokens: usize) -> (&[HistoryTurn], bool) {
+    let mut start = turns.len();
+    let mut used = 0usize;
+    while start > 0 {
+        let t = &turns[start - 1];
+        let cost = (t.task.len() + t.response.len()) / 4;
+        if used + cost > budget_tokens && start != turns.len() {
+            break;
+        }
+        used += cost;
+        start -= 1;
+        if used > budget_tokens {
+            break;
+        }
+    }
+    (&turns[start..], start > 0)
+}
+
 impl Agent {
     pub fn new(
         model: Arc<dyn Model>,
@@ -64,16 +95,23 @@ impl Agent {
     }
 
     pub async fn run(&self, task: &str, ctx: &ToolContext) -> Result<AgentOutcome> {
-        self.run_with_context(task, None, ctx).await
+        self.run_with_context(task, None, &[], false, ctx).await
     }
 
     /// Like [`Self::run`], but with an optional pre-compiled context blob
     /// (e.g. from `kode-context`) injected as a second system message
-    /// between the base system prompt and the user's task.
+    /// between the base system prompt and the user's task, and prior
+    /// conversation `history` replayed as alternating user/assistant
+    /// messages. `history` is an ALREADY-SELECTED slice (see
+    /// [`select_history`]) — the caller is responsible for budgeting; when
+    /// `truncated` is true a System marker is emitted so the model knows
+    /// older turns were dropped.
     pub async fn run_with_context(
         &self,
         task: &str,
         context: Option<&str>,
+        history: &[HistoryTurn],
+        truncated: bool,
         ctx: &ToolContext,
     ) -> Result<AgentOutcome> {
         self.events.emit(KodeEvent::AgentStarted);
@@ -83,6 +121,18 @@ impl Agent {
             messages.push(Message::System(format!(
                 "Repository and session context:\n\n{c}"
             )));
+        }
+        if truncated {
+            messages.push(Message::System(
+                "(older conversation truncated)".to_string(),
+            ));
+        }
+        for turn in history {
+            messages.push(Message::User(turn.task.clone()));
+            messages.push(Message::Assistant {
+                content: turn.response.clone(),
+                tool_calls: vec![],
+            });
         }
         messages.push(Message::User(task.to_string()));
 
@@ -695,7 +745,7 @@ mod tests {
         );
 
         let outcome = agent
-            .run_with_context("do the thing", Some("CTX_MARKER"), &ctx(dir))
+            .run_with_context("do the thing", Some("CTX_MARKER"), &[], false, &ctx(dir))
             .await
             .unwrap();
         assert_eq!(outcome.final_text, "done");
@@ -708,5 +758,138 @@ mod tests {
                 .iter()
                 .any(|m| matches!(m, Message::System(content) if content.contains("CTX_MARKER")))
         );
+    }
+
+    #[test]
+    fn select_history_all_fit() {
+        let turns = vec![
+            HistoryTurn {
+                task: "a".into(),
+                response: "b".into(),
+            },
+            HistoryTurn {
+                task: "c".into(),
+                response: "d".into(),
+            },
+        ];
+        let (kept, truncated) = select_history(&turns, 1000);
+        assert_eq!(kept.len(), 2);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn select_history_drops_oldest_first() {
+        let big = "x".repeat(4000); // ~1000 tokens
+        let turns = vec![
+            HistoryTurn {
+                task: big.clone(),
+                response: big.clone(),
+            },
+            HistoryTurn {
+                task: "new".into(),
+                response: "answer".into(),
+            },
+        ];
+        let (kept, truncated) = select_history(&turns, 100);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].task, "new");
+        assert!(truncated);
+    }
+
+    #[test]
+    fn select_history_single_oversize_turn_still_kept() {
+        let big = "x".repeat(40_000);
+        let turns = vec![HistoryTurn {
+            task: big.clone(),
+            response: big,
+        }];
+        let (kept, truncated) = select_history(&turns, 100);
+        assert_eq!(kept.len(), 1);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn select_history_empty_is_empty() {
+        let (kept, truncated) = select_history(&[], 100);
+        assert!(kept.is_empty());
+        assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn history_turns_replay_between_context_and_task() {
+        let dir = temp_dir();
+        let mock = MockModel::new();
+        mock.push_script(vec![
+            StreamEvent::TextDelta("done".to_string()),
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: None,
+            },
+        ]);
+
+        let mock = Arc::new(mock);
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let agent = Agent::new(
+            mock.clone(),
+            tools,
+            EventBus::new(64),
+            &AgentConfig::default(),
+        );
+
+        let history = vec![HistoryTurn {
+            task: "t1".into(),
+            response: "r1".into(),
+        }];
+
+        let outcome = agent
+            .run_with_context("t2", Some("CTX"), &history, false, &ctx(dir))
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_text, "done");
+
+        let requests = mock.requests();
+        let first = &requests[0];
+        assert_eq!(first.messages.len(), 5);
+        assert!(matches!(&first.messages[0], Message::System(_)));
+        assert!(matches!(&first.messages[1], Message::System(c) if c.contains("CTX")));
+        assert!(matches!(&first.messages[2], Message::User(t) if t == "t1"));
+        assert!(
+            matches!(&first.messages[3], Message::Assistant { content, tool_calls } if content == "r1" && tool_calls.is_empty())
+        );
+        assert!(matches!(&first.messages[4], Message::User(t) if t == "t2"));
+    }
+
+    #[tokio::test]
+    async fn history_truncated_marker_is_injected() {
+        let dir = temp_dir();
+        let mock = MockModel::new();
+        mock.push_script(vec![
+            StreamEvent::TextDelta("done".to_string()),
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: None,
+            },
+        ]);
+
+        let mock = Arc::new(mock);
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let agent = Agent::new(
+            mock.clone(),
+            tools,
+            EventBus::new(64),
+            &AgentConfig::default(),
+        );
+
+        let outcome = agent
+            .run_with_context("t2", None, &[], true, &ctx(dir))
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_text, "done");
+
+        let requests = mock.requests();
+        let first = &requests[0];
+        assert!(first.messages.iter().any(
+            |m| matches!(m, Message::System(c) if c.contains("older conversation truncated"))
+        ));
     }
 }
