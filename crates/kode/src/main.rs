@@ -4,6 +4,7 @@ mod exec;
 mod models;
 mod pipeline;
 mod remember;
+mod session;
 mod setup;
 mod status;
 mod tui;
