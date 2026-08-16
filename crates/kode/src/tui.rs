@@ -341,6 +341,12 @@ pub struct AppState {
     md_in_code_block: bool,
     /// Highlighted row in the slash-command hint menu.
     pub slash_selected: usize,
+    /// Completed turns of the active session — sent as model history.
+    pub history: Vec<crate::session::Turn>,
+    /// Active session file id; created lazily on first completed task.
+    pub session_id: Option<String>,
+    /// Task text of the in-flight run; consumed when TaskFinished arrives.
+    pub pending_task: Option<String>,
 }
 
 impl AppState {
@@ -374,6 +380,9 @@ impl AppState {
             response_buf: String::new(),
             md_in_code_block: false,
             slash_selected: 0,
+            history: Vec::new(),
+            session_id: None,
+            pending_task: None,
         }
     }
 
@@ -396,6 +405,55 @@ impl AppState {
         self.tool_started = None;
         self.response_buf.clear();
         self.md_in_code_block = false;
+        self.pending_task = Some(task.to_string());
+    }
+}
+
+/// Persists the in-flight task (if any) as a completed `session::Turn`: both
+/// to disk (creating the session lazily on first write) and into
+/// `state.history` for the next task's model replay. No-op when
+/// `pending_task` is `None` (nothing was in flight — e.g. a stray event).
+/// Store I/O failures are surfaced as transcript Notes, never fatal.
+fn record_completed_turn(
+    state: &mut AppState,
+    cwd: &Path,
+    provider: &str,
+    model: &str,
+    tool_calls: u32,
+) {
+    if let Some(task_text) = state.pending_task.take() {
+        let (_, ts) = crate::session::now_utc_stamp();
+        let turn = crate::session::Turn {
+            ts,
+            task: task_text,
+            response: state.last_response.clone(),
+            tool_calls,
+        };
+        let id = match state.session_id.clone() {
+            Some(id) => Some(id),
+            None => match crate::session::create(cwd, provider, model) {
+                Ok(id) => {
+                    state.session_id = Some(id.clone());
+                    Some(id)
+                }
+                Err(e) => {
+                    state.transcript.push(TranscriptLine::new(
+                        Gutter::Note,
+                        format!("session store unavailable: {e}"),
+                    ));
+                    None
+                }
+            },
+        };
+        if let Some(id) = id
+            && let Err(e) = crate::session::append_turn(cwd, &id, &turn)
+        {
+            state.transcript.push(TranscriptLine::new(
+                Gutter::Note,
+                format!("session append failed (non-fatal): {e}"),
+            ));
+        }
+        state.history.push(turn);
     }
 }
 
@@ -1244,6 +1302,14 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, _continue_: bool) -> any
                                         task_config.permissions.default_mode = PermissionMode::Allow;
                                     }
                                     let task_handler = handler.clone();
+                                    let task_history: Vec<kode_agent::HistoryTurn> = state
+                                        .history
+                                        .iter()
+                                        .map(|t| kode_agent::HistoryTurn {
+                                            task: t.task.clone(),
+                                            response: t.response.clone(),
+                                        })
+                                        .collect();
                                     tokio::spawn(async move {
                                         if let Err(err) = pipeline::run_task(
                                             &task,
@@ -1252,7 +1318,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, _continue_: bool) -> any
                                             task_events.clone(),
                                             task_handler,
                                             child,
-                                            &[],
+                                            &task_history,
                                         )
                                         .await
                                         {
@@ -1272,7 +1338,25 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, _continue_: bool) -> any
 
             ev = event_rx.recv() => {
                 match ev {
-                    Ok(ev) => apply_event(&mut state, ev),
+                    Ok(ev) => {
+                        let finished_tool_calls = match &ev {
+                            KodeEvent::TaskFinished { tool_calls, .. } => Some(*tool_calls),
+                            _ => None,
+                        };
+                        let is_agent_error = matches!(ev, KodeEvent::AgentError { .. });
+                        apply_event(&mut state, ev);
+                        if let Some(tool_calls) = finished_tool_calls {
+                            record_completed_turn(
+                                &mut state,
+                                cwd,
+                                &config.model.provider,
+                                &config.model.model,
+                                tool_calls,
+                            );
+                        } else if is_agent_error {
+                            state.pending_task = None;
+                        }
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         apply_event(&mut state, KodeEvent::Note {
                             text: format!("event stream lagged — {n} events dropped"),
@@ -3859,6 +3943,87 @@ mod tests {
         s.last_response = "prior answer".to_string();
         s.start_new_task("next task");
         assert_eq!(s.last_response, "prior answer");
+    }
+
+    // -- session persistence (record_completed_turn) ---------------------------
+
+    #[test]
+    fn task_finished_appends_turn_to_in_memory_history() {
+        let dir = temp_project_dir();
+        let mut s = state();
+
+        s.start_new_task("first task");
+        apply_event(
+            &mut s,
+            KodeEvent::ModelToken {
+                text: "first answer".into(),
+            },
+        );
+        apply_event(
+            &mut s,
+            KodeEvent::TaskFinished {
+                iterations: 1,
+                tool_calls: 2,
+                input_tokens: 10,
+                output_tokens: 5,
+            },
+        );
+        record_completed_turn(&mut s, &dir, "codex", "gpt-test", 2);
+
+        assert_eq!(s.history.len(), 1);
+        assert_eq!(s.history[0].task, "first task");
+        assert_eq!(s.history[0].response, "first answer");
+        assert_eq!(s.history[0].tool_calls, 2);
+        assert!(s.pending_task.is_none());
+        let id = s.session_id.clone().expect("session id set");
+        let (turns, corrupt) = crate::session::load(&dir, &id).unwrap();
+        assert_eq!(corrupt, 0);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].task, "first task");
+
+        // Second task appends to the same session.
+        s.start_new_task("second task");
+        apply_event(
+            &mut s,
+            KodeEvent::ModelToken {
+                text: "second answer".into(),
+            },
+        );
+        apply_event(
+            &mut s,
+            KodeEvent::TaskFinished {
+                iterations: 1,
+                tool_calls: 0,
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        );
+        record_completed_turn(&mut s, &dir, "codex", "gpt-test", 0);
+
+        assert_eq!(s.history.len(), 2);
+        assert_eq!(s.session_id.as_deref(), Some(id.as_str()));
+        let (turns, _) = crate::session::load(&dir, &id).unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[1].task, "second task");
+    }
+
+    #[test]
+    fn agent_error_discards_pending_task() {
+        let dir = temp_project_dir();
+        let mut s = state();
+
+        s.start_new_task("will fail");
+        apply_event(
+            &mut s,
+            KodeEvent::AgentError {
+                message: "boom".into(),
+            },
+        );
+        s.pending_task = None; // mirrors the run loop's AgentError arm
+
+        assert!(s.history.is_empty());
+        assert!(s.session_id.is_none());
+        assert!(!dir.join(".kode").join("sessions").exists());
     }
 
     // -- markdown flush integration --------------------------------------------
