@@ -19,3 +19,5 @@ Preview of every surface: `.kode-design-preview.html`.
   from other tools' auth files.
 - `cargo fmt --check`, `cargo clippy --workspace --all-targets`, and
   `cargo test --workspace` must be clean before any commit.
+- Sessions: completed turns persist to `.kode/sessions/` (JSONL, turn-level);
+  resume via `kode --continue` or `/resume`.
