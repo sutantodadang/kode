@@ -2128,12 +2128,6 @@ fn draw(f: &mut ratatui::Frame, state: &AppState) {
     }
 }
 
-/// Renders the 2-row input form: a DIM full-width rule, then `› {input}`
-/// with a right-aligned suffix ([`InputSuffix`]). Replaces the old bordered
-/// "task" box entirely — `DESIGN.md`: input is a single borderless `›`
-/// line, no boxes, dim `─` rules only. Positions the terminal cursor at the
-/// end of the typed text, except while a picker or permission prompt has
-/// focus.
 /// Hint-menu lines: highlighted row gets a `›` marker and bold name; others
 /// indent. Descriptions render muted. No borders — DESIGN.md overlay rules.
 fn slash_hint_lines(items: &[(&'static str, &'static str)], selected: usize) -> Vec<Line<'static>> {
@@ -2164,6 +2158,12 @@ fn slash_hint_lines(items: &[(&'static str, &'static str)], selected: usize) -> 
         .collect()
 }
 
+/// Renders the 2-row input form: a DIM full-width rule, then `› {input}`
+/// with a right-aligned suffix ([`InputSuffix`]). Replaces the old bordered
+/// "task" box entirely — `DESIGN.md`: input is a single borderless `›`
+/// line, no boxes, dim `─` rules only. Positions the terminal cursor at the
+/// end of the typed text, except while a picker or permission prompt has
+/// focus.
 fn draw_input(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &AppState) {
     if area.height == 0 {
         return;
