@@ -25,6 +25,13 @@ pub struct ZindeksAdapter {
     // unused otherwise.
     #[allow(dead_code)]
     child: Option<Child>,
+    // Whether the connected zindeks instance is running with its built-in
+    // poll-watcher enabled (`ZINDEKS_WATCH=1`), auto-applying incremental
+    // index updates in the background. The watcher itself lives inside the
+    // zindeks server process — Kode only sets the env var on the stdio child
+    // it spawns. TCP transports connect to a server Kode doesn't control, so
+    // this is always `false` for them.
+    watching: bool,
 }
 
 impl ZindeksAdapter {
@@ -51,6 +58,7 @@ impl ZindeksAdapter {
                     client: Mutex::new(client),
                     root: root.to_path_buf(),
                     child: Some(child),
+                    watching: watch_enabled(cfg.transport.as_str(), cfg.watch),
                 })
             }
             "tcp" => {
@@ -68,6 +76,7 @@ impl ZindeksAdapter {
                     client: Mutex::new(client),
                     root: root.to_path_buf(),
                     child: None,
+                    watching: watch_enabled(cfg.transport.as_str(), cfg.watch),
                 })
             }
             other => Err(IntelError::Unavailable(format!(
@@ -88,6 +97,7 @@ impl ZindeksAdapter {
             client: Mutex::new(McpClient::new(reader, writer)),
             root: root.into(),
             child: None,
+            watching: false,
         }
     }
 
@@ -96,6 +106,16 @@ impl ZindeksAdapter {
     pub async fn initialize(&self) -> Result<()> {
         let mut client = self.client.lock().await;
         client.initialize().await.map_err(IntelError::from)
+    }
+
+    /// Whether the connected zindeks instance is running with its watcher
+    /// enabled, i.e. it auto-applies incremental index updates in the
+    /// background and callers don't need to trigger `ensure_bound` after
+    /// mutating files. `true` only for a stdio child Kode spawned with
+    /// `cfg.watch` set; TCP connections and `from_transport` always report
+    /// `false`.
+    pub fn watching(&self) -> bool {
+        self.watching
     }
 
     /// Whether `root` is already indexed by the connected zindeks instance
@@ -164,6 +184,13 @@ async fn spawn_stdio_child(cfg: &ZindeksConfig) -> Result<Child> {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::null());
     cmd.kill_on_drop(true);
+    // Enables zindeks 0.9.2's built-in poll-watcher (default 2s interval via
+    // ZINDEKS_WATCH_INTERVAL_MS, left at default here) so the server applies
+    // incremental index updates on its own; Kode then skips its post-task
+    // `ensure_bound` refresh (see `ZindeksAdapter::watching`).
+    if cfg.watch {
+        cmd.env("ZINDEKS_WATCH", "1");
+    }
 
     match cmd.spawn() {
         Ok(child) => Ok(child),
@@ -190,6 +217,9 @@ async fn spawn_stdio_child(cfg: &ZindeksConfig) -> Result<Child> {
             fallback_cmd.stdout(Stdio::piped());
             fallback_cmd.stderr(Stdio::null());
             fallback_cmd.kill_on_drop(true);
+            if cfg.watch {
+                fallback_cmd.env("ZINDEKS_WATCH", "1");
+            }
 
             fallback_cmd.spawn().map_err(|_| {
                 IntelError::Unavailable(format!(
@@ -207,6 +237,14 @@ async fn spawn_stdio_child(cfg: &ZindeksConfig) -> Result<Child> {
 
 fn is_not_indexed_error(msg: &str) -> bool {
     msg.contains("No project loaded") || msg.contains("NO_PROJECT")
+}
+
+/// Pure decision backing [`ZindeksAdapter::watching`]: only a `stdio`
+/// transport is a child process Kode spawned (and thus can hand
+/// `ZINDEKS_WATCH=1` to); `tcp` connects to a server Kode doesn't control, so
+/// it can never report as watching regardless of `cfg.watch`.
+fn watch_enabled(transport: &str, watch: bool) -> bool {
+    transport == "stdio" && watch
 }
 
 fn normalize_path(p: &str) -> String {
@@ -459,6 +497,14 @@ mod tests {
             }),
         )
         .await;
+    }
+
+    #[test]
+    fn watch_enabled_only_for_stdio_with_watch_on() {
+        assert!(watch_enabled("stdio", true));
+        assert!(!watch_enabled("stdio", false));
+        assert!(!watch_enabled("tcp", true));
+        assert!(!watch_enabled("tcp", false));
     }
 
     #[tokio::test]

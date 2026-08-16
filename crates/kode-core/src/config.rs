@@ -37,6 +37,10 @@ fn default_zindeks_tcp_addr() -> String {
     "127.0.0.1:7717".to_string()
 }
 
+fn default_zindeks_watch() -> bool {
+    true
+}
+
 fn default_ingat_url() -> String {
     "http://127.0.0.1:3200".to_string()
 }
@@ -226,6 +230,13 @@ pub struct ZindeksConfig {
     /// Address used for tcp transport.
     #[serde(default = "default_zindeks_tcp_addr")]
     pub tcp_addr: String,
+    /// Whether to enable zindeks's built-in poll-watcher (`ZINDEKS_WATCH=1`)
+    /// on the stdio child Kode spawns, so the index refreshes itself in the
+    /// background instead of via Kode's post-task `ensure_bound` call. Only
+    /// takes effect for `transport = "stdio"` — Kode doesn't control TCP
+    /// servers, so it can't enable their watcher.
+    #[serde(default = "default_zindeks_watch")]
+    pub watch: bool,
 }
 
 impl Default for ZindeksConfig {
@@ -235,6 +246,7 @@ impl Default for ZindeksConfig {
             transport: default_zindeks_transport(),
             command: default_zindeks_command(),
             tcp_addr: default_zindeks_tcp_addr(),
+            watch: default_zindeks_watch(),
         }
     }
 }
@@ -375,6 +387,7 @@ mod tests {
         assert_eq!(cfg.zindeks.transport, "stdio");
         assert_eq!(cfg.zindeks.command, "zindeks");
         assert_eq!(cfg.zindeks.tcp_addr, "127.0.0.1:7717");
+        assert!(cfg.zindeks.watch);
         assert!(cfg.ingat.enabled);
         assert_eq!(cfg.ingat.url, "http://127.0.0.1:3200");
         assert_eq!(cfg.agent.max_iterations, 40);
@@ -466,6 +479,20 @@ mod tests {
         let cfg = KodeConfig::load(&dir).unwrap();
         assert_eq!(cfg.agent.max_iterations, 7);
         assert_eq!(cfg.permissions.default_mode, PermissionMode::Deny);
+    }
+
+    #[test]
+    fn zindeks_watch_defaults_true_and_honors_explicit_false() {
+        let dir = temp_project_dir();
+        let cfg = KodeConfig::load(&dir).unwrap();
+        assert!(cfg.zindeks.watch);
+
+        let kode_dir = dir.join(".kode");
+        std::fs::create_dir_all(&kode_dir).unwrap();
+        std::fs::write(kode_dir.join("config.toml"), "[zindeks]\nwatch = false\n").unwrap();
+
+        let cfg = KodeConfig::load(&dir).unwrap();
+        assert!(!cfg.zindeks.watch);
     }
 
     #[test]

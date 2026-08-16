@@ -326,13 +326,22 @@ pub async fn run_task(
     if let Some(adapter) = zindeks_adapter.as_ref()
         && mutated_any
     {
-        match adapter.ensure_bound().await {
-            Ok(()) => events.emit(KodeEvent::Note {
-                text: "zindeks index refreshed".to_string(),
-            }),
-            Err(e) => events.emit(KodeEvent::Note {
-                text: format!("zindeks refresh failed (non-fatal): {e}"),
-            }),
+        if adapter.watching() {
+            // The spawned zindeks server has its own poll-watcher running
+            // (ZINDEKS_WATCH=1) and will pick up the mutation on its own —
+            // no need for Kode to trigger an explicit refresh.
+            events.emit(KodeEvent::Note {
+                text: "zindeks watcher active — index updates automatically".to_string(),
+            });
+        } else {
+            match adapter.ensure_bound().await {
+                Ok(()) => events.emit(KodeEvent::Note {
+                    text: "zindeks index refreshed".to_string(),
+                }),
+                Err(e) => events.emit(KodeEvent::Note {
+                    text: format!("zindeks refresh failed (non-fatal): {e}"),
+                }),
+            }
         }
     }
 

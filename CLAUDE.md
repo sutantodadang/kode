@@ -21,3 +21,5 @@ Preview of every surface: `.kode-design-preview.html`.
   `cargo test --workspace` must be clean before any commit.
 - Sessions: completed turns persist to `.kode/sessions/` (JSONL, turn-level);
   resume via `kode --continue` or `/resume`.
+- Zindeks watch: spawned `zindeks serve` runs with `ZINDEKS_WATCH=1` (2s poll);
+  pipeline skips explicit refresh unless watch is off or transport is TCP.
