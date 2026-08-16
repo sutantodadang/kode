@@ -155,12 +155,35 @@ pub(crate) async fn probe_version(cmd: impl AsRef<std::ffi::OsStr>) -> Option<St
         return None;
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    let line = text.lines().next().unwrap_or("").trim();
+    let line = strip_ansi(text.lines().next().unwrap_or(""));
+    let line = line.trim();
     if line.is_empty() {
         None
     } else {
         Some(line.to_string())
     }
+}
+
+/// Strips ANSI CSI escape sequences (e.g. `\x1b[1m`) — styled tools emit them
+/// even when piped, and they'd otherwise leak into doctor/setup output.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.clone().next() == Some('[') {
+                chars.next();
+                for f in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&f) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Maps (os, arch) — as reported by `std::env::consts::{OS,ARCH}` — to the
@@ -460,6 +483,19 @@ mod tests {
     fn zindeks_asset_rejects_unsupported_platform() {
         assert_eq!(zindeks_asset("freebsd", "x86_64"), None);
         assert_eq!(zindeks_asset("windows", "arm"), None);
+    }
+
+    #[test]
+    fn strip_ansi_removes_csi_sequences() {
+        assert_eq!(
+            strip_ansi("\u{1b}[1mzindeks 0.9.2\u{1b}[0m"),
+            "zindeks 0.9.2"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_passes_plain_text_through() {
+        assert_eq!(strip_ansi("zindeks 0.9.2"), "zindeks 0.9.2");
     }
 
     #[test]
