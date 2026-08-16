@@ -252,6 +252,7 @@ pub enum PickerKind {
     #[default]
     Model,
     Provider,
+    Session,
 }
 
 /// State of the `/model`/`/provider` picker overlay. `items` holds the
@@ -519,6 +520,12 @@ fn ledger_objective(task: &str) -> String {
     truncate_chars(first_line, 70)
 }
 
+/// First whitespace-separated token of a `/resume` picker row (the session
+/// id) — rows are formatted `"<id>  <first-task>  · <N> turns"`.
+fn session_id_from_row(row: &str) -> String {
+    row.split_whitespace().next().unwrap_or("").to_string()
+}
+
 /// Truncates `s` to at most `max` chars, appending `…` when truncated.
 /// Char-safe (splits on `char_indices`, never mid-codepoint).
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -757,6 +764,8 @@ pub enum SlashCommand {
     Provider(Option<String>),
     /// `/copy` — copies `last_response` to the clipboard.
     Copy,
+    /// `/resume` — opens the session picker.
+    Resume,
     Help,
     Unknown(String),
 }
@@ -777,6 +786,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/effort", "set reasoning effort (minimal|low|medium|high)"),
     ("/provider", "pick provider"),
     ("/copy", "copy last response to clipboard"),
+    ("/resume", "resume a previous session"),
     ("/help", "list commands + shortcuts"),
 ];
 
@@ -818,6 +828,7 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
             Some(rest.to_string())
         }),
         "/copy" => SlashCommand::Copy,
+        "/resume" => SlashCommand::Resume,
         "/help" => SlashCommand::Help,
         other => SlashCommand::Unknown(other.to_string()),
     })
@@ -1136,6 +1147,33 @@ fn handle_slash_command(
             }
         }
         SlashCommand::Copy => perform_copy(state),
+        SlashCommand::Resume => {
+            let metas = crate::session::list(cwd, 20);
+            if metas.is_empty() {
+                state
+                    .transcript
+                    .push(TranscriptLine::new(Gutter::Note, "no sessions to resume"));
+            } else {
+                state.picker = PickerState {
+                    open: true,
+                    kind: PickerKind::Session,
+                    items: metas
+                        .iter()
+                        .map(|m| {
+                            format!(
+                                "{}  {}  · {} turns",
+                                m.id,
+                                truncate_chars(&m.first_task, 40),
+                                m.turns
+                            )
+                        })
+                        .collect(),
+                    filter: String::new(),
+                    selected: 0,
+                    note: None,
+                };
+            }
+        }
         SlashCommand::Help => {
             state.transcript.push(TranscriptLine::new(
                 Gutter::Note,
@@ -1322,6 +1360,10 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                                     ),
                                                 ));
                                             }
+                                        }
+                                        PickerKind::Session => {
+                                            let id = session_id_from_row(&selected);
+                                            restore_session(&mut state, cwd, &id);
                                         }
                                     }
                                 }
@@ -2507,6 +2549,7 @@ fn draw_picker(f: &mut ratatui::Frame, picker: &PickerState) {
     let title = match picker.kind {
         PickerKind::Model => "select model",
         PickerKind::Provider => "select provider",
+        PickerKind::Session => "resume session",
     };
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
@@ -3962,6 +4005,67 @@ mod tests {
         assert!(s.transcript.iter().any(|l| l.text.contains("/copy")));
     }
 
+    // -- /resume picker ----------------------------------------------------
+
+    #[test]
+    fn parse_slash_command_resume() {
+        assert_eq!(parse_slash_command("/resume"), Some(SlashCommand::Resume));
+    }
+
+    #[test]
+    fn resume_picker_session_id_extraction() {
+        assert_eq!(
+            session_id_from_row("20260817-010101  fix the bug  · 3 turns"),
+            "20260817-010101"
+        );
+    }
+
+    #[test]
+    fn handle_slash_command_resume_with_no_sessions_notes() {
+        let dir = temp_project_dir();
+        let mut s = state();
+        let mut cfg = KodeConfig::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        handle_slash_command(&mut s, &dir, &mut cfg, &tx, SlashCommand::Resume);
+
+        assert!(!s.picker.open);
+        assert!(
+            s.transcript
+                .iter()
+                .any(|l| l.text == "no sessions to resume")
+        );
+    }
+
+    #[test]
+    fn handle_slash_command_resume_with_sessions_opens_picker() {
+        let dir = temp_project_dir();
+        let id = crate::session::create(&dir, "codex", "gpt-test").unwrap();
+        crate::session::append_turn(
+            &dir,
+            &id,
+            &crate::session::Turn {
+                ts: "2026-08-17T00:00:00Z".to_string(),
+                task: "fix the bug".to_string(),
+                response: "done".to_string(),
+                tool_calls: 1,
+            },
+        )
+        .unwrap();
+
+        let mut s = state();
+        let mut cfg = KodeConfig::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        handle_slash_command(&mut s, &dir, &mut cfg, &tx, SlashCommand::Resume);
+
+        assert!(s.picker.open);
+        assert_eq!(s.picker.kind, PickerKind::Session);
+        assert_eq!(s.picker.items.len(), 1);
+        assert!(s.picker.items[0].starts_with(&id));
+        assert!(s.picker.items[0].contains("fix the bug"));
+    }
+
     // -- last_response tracking -----------------------------------------------
 
     #[test]
@@ -4213,6 +4317,7 @@ mod tests {
     #[test]
     fn slash_hint_items_bare_slash_lists_all() {
         assert_eq!(slash_hint_items("/").len(), SLASH_COMMANDS.len());
+        assert!(SLASH_COMMANDS.iter().any(|(name, _)| *name == "/resume"));
     }
 
     #[test]
