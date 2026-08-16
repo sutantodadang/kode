@@ -2293,30 +2293,62 @@ fn draw_picker(f: &mut ratatui::Frame, picker: &PickerState) {
 
     f.render_widget(Clear, popup);
 
-    let filtered = picker_filtered_items(&picker.items, &picker.filter);
-    let mut lines: Vec<Line> = vec![
-        Line::from(format!("filter: {}", picker.filter)),
-        Line::from("(type to filter; Enter on empty filter row = use typed text verbatim)"),
-    ];
-    if let Some(note) = &picker.note {
-        lines.push(Line::from(format!("note: {note}")));
-    }
-    if filtered.is_empty() && picker.items.is_empty() && picker.note.is_none() {
-        lines.push(Line::from("(loading...)"));
-    }
-    for (i, item) in filtered.iter().take(12).enumerate() {
-        let marker = if i == picker.selected { "> " } else { "  " };
-        lines.push(Line::from(format!("{marker}{item}")));
-    }
-
     let title = match picker.kind {
         PickerKind::Model => "select model",
         PickerKind::Provider => "select provider",
     };
-    let block = Block::default().borders(Borders::ALL).title(title);
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false });
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            format!(" {title}"),
+            Style::default()
+                .fg(theme::MUTED)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "─".repeat(popup.width as usize),
+            Style::default().fg(theme::DIM),
+        )),
+    ];
+
+    let filtered = picker_filtered_items(&picker.items, &picker.filter);
+    lines.push(Line::from(Span::styled(
+        format!("filter: {}", picker.filter),
+        Style::default().fg(theme::MUTED),
+    )));
+    lines.push(Line::from(Span::styled(
+        "(type to filter; Enter on empty filter row = use typed text verbatim)",
+        Style::default().fg(theme::MUTED),
+    )));
+    if let Some(note) = &picker.note {
+        lines.push(Line::from(Span::styled(
+            format!("note: {note}"),
+            Style::default().fg(theme::MUTED),
+        )));
+    }
+    if filtered.is_empty() && picker.items.is_empty() && picker.note.is_none() {
+        lines.push(Line::from(Span::styled(
+            "(loading…)",
+            Style::default().fg(theme::DIM),
+        )));
+    } else if filtered.is_empty() && !picker.items.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(no matches)",
+            Style::default().fg(theme::DIM),
+        )));
+    }
+    for (i, item) in filtered.iter().take(12).enumerate() {
+        let (marker, item_span) = if i == picker.selected {
+            (
+                Span::styled(" › ", Style::default().fg(theme::MUTED)),
+                Span::styled(item.clone(), Style::default().add_modifier(Modifier::BOLD)),
+            )
+        } else {
+            (Span::raw("   "), Span::raw(item.clone()))
+        };
+        lines.push(Line::from(vec![marker, item_span]));
+    }
+
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     f.render_widget(paragraph, popup);
 }
 
