@@ -336,6 +336,8 @@ pub struct AppState {
     /// Per-message ``` fence state for markdown rendering of flushed Prose
     /// lines; reset on every new task submission.
     md_in_code_block: bool,
+    /// Highlighted row in the slash-command hint menu.
+    pub slash_selected: usize,
 }
 
 impl AppState {
@@ -367,6 +369,7 @@ impl AppState {
             last_response: String::new(),
             response_buf: String::new(),
             md_in_code_block: false,
+            slash_selected: 0,
         }
     }
 
@@ -642,6 +645,29 @@ pub const VALID_PROVIDERS: &[&str] = &[
     "kilo",
     "lmstudio",
 ];
+
+/// Commands listed in the `/` hint menu: (name, one-line description).
+pub const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/model", "pick or set model"),
+    ("/effort", "set reasoning effort (minimal|low|medium|high)"),
+    ("/provider", "pick provider"),
+    ("/copy", "copy last response to clipboard"),
+    ("/help", "list commands + shortcuts"),
+];
+
+/// Hint-menu rows for the current input. Non-empty only while the input is a
+/// bare `/`-prefixed token with no whitespace (once arguments start, the menu
+/// hides). Bare `/` lists every command; `/mo` narrows by prefix.
+pub fn slash_hint_items(input: &str) -> Vec<(&'static str, &'static str)> {
+    if !input.starts_with('/') || input.contains(char::is_whitespace) {
+        return Vec::new();
+    }
+    SLASH_COMMANDS
+        .iter()
+        .copied()
+        .filter(|(name, _)| name.starts_with(input))
+        .collect()
+}
 
 /// Parses `input` as a slash command. Returns `None` when `input` doesn't
 /// start with `/` — slash commands are only recognized at the start of the
@@ -1171,7 +1197,13 @@ pub async fn run(cwd: &Path, cancel: CancellationToken) -> anyhow::Result<()> {
                                 break 'outer;
                             }
                             if key.code == KeyCode::Enter && !state.running && !state.input.trim().is_empty() {
-                                let input = std::mem::take(&mut state.input);
+                                let mut input = std::mem::take(&mut state.input);
+                                let hints = slash_hint_items(&input);
+                                if !hints.is_empty() {
+                                    // Enter on a hint row completes to the highlighted command.
+                                    input = hints[state.slash_selected.min(hints.len() - 1)].0.to_string();
+                                    state.slash_selected = 0;
+                                }
                                 if let Some(cmd) = parse_slash_command(&input) {
                                     handle_slash_command(&mut state, cwd, &mut config, &picker_tx, cmd);
                                 } else if state.status.model.is_empty() {
@@ -1306,9 +1338,18 @@ fn handle_key(
         return false;
     }
 
+    let hint_count = if state.pending.is_empty() && !state.picker.open {
+        slash_hint_items(&state.input).len()
+    } else {
+        0
+    };
+
     match code {
         KeyCode::Esc => {
-            if state.ledger_open {
+            if hint_count > 0 {
+                state.input.clear();
+                state.slash_selected = 0;
+            } else if state.ledger_open {
                 state.ledger_open = false;
             } else if state.running
                 && let Some(c) = current_cancel
@@ -1329,18 +1370,34 @@ fn handle_key(
                 let _ = req.responder.send(false);
             }
         }
+        KeyCode::Tab if hint_count > 0 => {
+            let items = slash_hint_items(&state.input);
+            let (name, _) = items[state.slash_selected.min(items.len() - 1)];
+            state.input = format!("{name} ");
+            state.slash_selected = 0;
+        }
         KeyCode::Char(c) => {
             state.input.push(c);
+            state.slash_selected = 0;
         }
         KeyCode::Backspace => {
             state.input.pop();
+            state.slash_selected = 0;
         }
         KeyCode::Up => {
-            state.scroll = state.scroll.saturating_sub(1);
-            state.follow = false;
+            if hint_count > 0 {
+                state.slash_selected = state.slash_selected.saturating_sub(1);
+            } else {
+                state.scroll = state.scroll.saturating_sub(1);
+                state.follow = false;
+            }
         }
         KeyCode::Down => {
-            state.scroll = state.scroll.saturating_add(1);
+            if hint_count > 0 {
+                state.slash_selected = (state.slash_selected + 1).min(hint_count - 1);
+            } else {
+                state.scroll = state.scroll.saturating_add(1);
+            }
         }
         KeyCode::PageUp => {
             state.scroll = state.scroll.saturating_sub(10);
@@ -1914,6 +1971,14 @@ fn draw(f: &mut ratatui::Frame, state: &AppState) {
     if has_pending {
         constraints.push(Constraint::Length(3));
     }
+    let hint_items = if !state.picker.open && state.pending.is_empty() && !state.ledger_open {
+        slash_hint_items(&state.input)
+    } else {
+        Vec::new()
+    };
+    if !hint_items.is_empty() {
+        constraints.push(Constraint::Length(hint_items.len() as u16));
+    }
     constraints.push(Constraint::Length(2)); // input: rule + line, no box
 
     let areas = Layout::vertical(constraints).split(f.area());
@@ -1987,7 +2052,18 @@ fn draw(f: &mut ratatui::Frame, state: &AppState) {
         areas[idx]
     };
 
-    draw_input(f, next_area, state);
+    let input_area = if hint_items.is_empty() {
+        next_area
+    } else {
+        f.render_widget(
+            Paragraph::new(slash_hint_lines(&hint_items, state.slash_selected)),
+            next_area,
+        );
+        idx += 1;
+        areas[idx]
+    };
+
+    draw_input(f, input_area, state);
 
     if state.picker.open {
         draw_picker(f, &state.picker);
@@ -2000,6 +2076,36 @@ fn draw(f: &mut ratatui::Frame, state: &AppState) {
 /// line, no boxes, dim `─` rules only. Positions the terminal cursor at the
 /// end of the typed text, except while a picker or permission prompt has
 /// focus.
+/// Hint-menu lines: highlighted row gets a `›` marker and bold name; others
+/// indent. Descriptions render muted. No borders — DESIGN.md overlay rules.
+fn slash_hint_lines(items: &[(&'static str, &'static str)], selected: usize) -> Vec<Line<'static>> {
+    let name_w = items
+        .iter()
+        .map(|(n, _)| n.chars().count())
+        .max()
+        .unwrap_or(0);
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, (name, desc))| {
+            let marker = if i == selected { " › " } else { "   " };
+            let name_span = if i == selected {
+                Span::styled(
+                    format!("{name:<name_w$}"),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw(format!("{name:<name_w$}"))
+            };
+            Line::from(vec![
+                Span::styled(marker.to_string(), Style::default().fg(theme::MUTED)),
+                name_span,
+                Span::styled(format!("  {desc}"), Style::default().fg(theme::MUTED)),
+            ])
+        })
+        .collect()
+}
+
 fn draw_input(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &AppState) {
     if area.height == 0 {
         return;
@@ -3647,5 +3753,89 @@ mod tests {
                 ("this".to_string(), markdown::MdStyle::Bold),
             ])
         );
+    }
+
+    // -- slash-command hint menu -----------------------------------------------
+
+    #[test]
+    fn slash_hint_items_bare_slash_lists_all() {
+        assert_eq!(slash_hint_items("/").len(), SLASH_COMMANDS.len());
+    }
+
+    #[test]
+    fn slash_hint_items_prefix_narrows() {
+        let items = slash_hint_items("/mo");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].0, "/model");
+    }
+
+    #[test]
+    fn slash_hint_items_non_slash_is_empty() {
+        assert!(slash_hint_items("hello").is_empty());
+    }
+
+    #[test]
+    fn slash_hint_items_hides_once_args_typed() {
+        assert!(slash_hint_items("/model g").is_empty());
+    }
+
+    #[test]
+    fn handle_key_down_moves_hint_selection_not_scroll() {
+        let mut s = state();
+        s.input = "/".to_string();
+        handle_key(&mut s, KeyCode::Down, KeyModifiers::NONE, &None);
+        assert_eq!(s.slash_selected, 1);
+        assert_eq!(s.scroll, 0);
+    }
+
+    #[test]
+    fn handle_key_up_down_clamp_hint_selection() {
+        let mut s = state();
+        s.input = "/".to_string();
+        for _ in 0..SLASH_COMMANDS.len() + 2 {
+            handle_key(&mut s, KeyCode::Down, KeyModifiers::NONE, &None);
+        }
+        assert_eq!(s.slash_selected, SLASH_COMMANDS.len() - 1);
+        for _ in 0..SLASH_COMMANDS.len() + 2 {
+            handle_key(&mut s, KeyCode::Up, KeyModifiers::NONE, &None);
+        }
+        assert_eq!(s.slash_selected, 0);
+    }
+
+    #[test]
+    fn handle_key_tab_completes_highlighted_command() {
+        let mut s = state();
+        s.input = "/".to_string();
+        handle_key(&mut s, KeyCode::Down, KeyModifiers::NONE, &None);
+        handle_key(&mut s, KeyCode::Tab, KeyModifiers::NONE, &None);
+        assert_eq!(s.input, "/effort ");
+        assert_eq!(s.slash_selected, 0);
+    }
+
+    #[test]
+    fn handle_key_typing_resets_hint_selection() {
+        let mut s = state();
+        s.input = "/".to_string();
+        s.slash_selected = 2;
+        handle_key(&mut s, KeyCode::Char('m'), KeyModifiers::NONE, &None);
+        assert_eq!(s.slash_selected, 0);
+        assert_eq!(s.input, "/m");
+    }
+
+    #[test]
+    fn handle_key_esc_clears_input_when_hint_visible() {
+        let mut s = state();
+        s.input = "/mo".to_string();
+        handle_key(&mut s, KeyCode::Esc, KeyModifiers::NONE, &None);
+        assert!(s.input.is_empty());
+        assert!(!s.running);
+    }
+
+    #[test]
+    fn slash_hint_lines_marks_selected_row() {
+        let items: Vec<(&'static str, &'static str)> = vec![("/model", "a"), ("/effort", "b")];
+        let lines = slash_hint_lines(&items, 1);
+        assert!(!lines[0].spans[0].content.contains('›'));
+        assert!(lines[1].spans[0].content.contains('›'));
     }
 }
