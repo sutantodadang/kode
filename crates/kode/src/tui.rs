@@ -561,7 +561,12 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
                 budget_tokens,
             };
             state.ledger.why = ledger_why_from(&ks);
-            if !ks.zindeks.is_empty() || !ks.ingat.is_empty() || !ks.git.is_empty() {
+            // The Aperture is a code-intelligence moment — it opens only
+            // when a zindeks or ingat engine actually contributed evidence.
+            // Git-only compilations still populate the Knowledge Band, but
+            // git impact alone isn't "intelligence made visible" (DESIGN.md:
+            // absent when engines are absent).
+            if !ks.zindeks.is_empty() || !ks.ingat.is_empty() {
                 state.aperture = Some(ApertureState {
                     received_at: Instant::now(),
                     knowledge: ks.clone(),
@@ -3440,6 +3445,27 @@ mod tests {
             },
         );
         assert!(s.aperture.is_none());
+    }
+
+    #[test]
+    fn knowledge_event_git_only_does_not_open_aperture() {
+        let mut s = state();
+        apply_event(
+            &mut s,
+            KodeEvent::Knowledge {
+                zindeks: vec![],
+                ingat: vec![],
+                git: vec!["3 files changed".to_string()],
+                context_tokens: 0,
+                budget_tokens: 16_000,
+            },
+        );
+        assert!(s.aperture.is_none());
+        // The Band still gets the git fact — only the Aperture is gated.
+        assert_eq!(
+            s.knowledge.as_ref().unwrap().git,
+            vec!["3 files changed".to_string()]
+        );
     }
 
     #[test]
