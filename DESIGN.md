@@ -38,6 +38,7 @@ Preview: `.kode-design-preview.html` (rendered mocks of every surface below).
 - Sources: `Z I G T V` (bold, colored)
 - Progress: `●` active (`◉` alternate), `○` pending, `✓` done, `×` failed
 - Trees: `├─ └─ │ ─┬─` · Relationships: `→` · Input: `›` · Tool: `▸` · Diff: `+ -`
+- Markdown list bullet (transcript): `•` · Skipped step mark: `–` · Code-fence rule (transcript): `┄`
 - Emphasis: **bold** = headings/active/agent conclusions · dim = history/meta/timestamps · *italic* = verbatim quoted ingat memory (only)
 - No emoji in core UI. No box-drawing borders around every section.
 
@@ -59,3 +60,4 @@ No gradients · no emoji spam · no chat bubbles · no card grids · no permanen
 | 2026-08-15 | Transcript stays home; ledger = alternate view | Stage Codex's boldest idea without betting the home screen |
 | 2026-08-15 | Cyan for zindeks, not violet | crush owns purple; cyan+amber unclaimed in the category |
 | 2026-08-15 | Gutter shows real event provenance only | No fake footnotes on LLM prose — honesty > theater |
+| 2026-08-17 | /design-review pass 1: picker de-boxed to match hint-menu vocabulary; italic restricted to ingat; provenance colors de-decorated; band capped at 3 rows; • – ┄ added to glyph vocabulary | cross-model audit (Codex + Claude) against this file |
