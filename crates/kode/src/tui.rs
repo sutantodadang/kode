@@ -1724,7 +1724,7 @@ fn md_span_style(style: &markdown::MdStyle) -> Style {
     match style {
         markdown::MdStyle::Plain => Style::default(),
         markdown::MdStyle::Bold => Style::default().add_modifier(Modifier::BOLD),
-        markdown::MdStyle::Italic => Style::default().add_modifier(Modifier::ITALIC),
+        markdown::MdStyle::Italic => Style::default(),
         markdown::MdStyle::InlineCode => Style::default().fg(theme::Z),
     }
 }
@@ -1878,19 +1878,20 @@ fn knowledge_band_lines(ks: &KnowledgeState) -> Vec<Line<'static>> {
 /// `─┬─`/`├─`/`└─`, last present row gets `└─`), then a context summary
 /// row. Rows are skipped for empty sources — never a decorative fake.
 fn aperture_lines(ks: &KnowledgeState) -> Vec<Line<'static>> {
-    let mut rows: Vec<(&'static str, String, Style)> = Vec::new();
+    let mut rows: Vec<(&'static str, Option<&'static str>, String, Style)> = Vec::new();
     for z in ks.zindeks.iter().take(2) {
-        rows.push(("Z", z.clone(), Style::default().fg(theme::Z)));
+        rows.push(("Z", None, z.clone(), Style::default().fg(theme::Z)));
     }
     if let Some(entry) = ks.ingat.first() {
         rows.push((
             "I",
-            format!("recalled: \u{201c}{entry}\u{201d}"),
+            Some("recalled: "),
+            format!("\u{201c}{entry}\u{201d}"),
             Style::default().fg(theme::I).add_modifier(Modifier::ITALIC),
         ));
     }
     if let Some(git_line) = ks.git.first() {
-        rows.push(("G", git_line.clone(), Style::default().fg(theme::G)));
+        rows.push(("G", None, git_line.clone(), Style::default().fg(theme::G)));
     }
 
     let mut lines = vec![Line::from(Span::styled(
@@ -1901,7 +1902,7 @@ fn aperture_lines(ks: &KnowledgeState) -> Vec<Line<'static>> {
     ))];
 
     let last = rows.len().saturating_sub(1);
-    for (idx, (src, text, style)) in rows.into_iter().enumerate() {
+    for (idx, (src, label, text, style)) in rows.into_iter().enumerate() {
         let (lead, connector) = if idx == 0 {
             (" request ", "─┬─ ")
         } else if idx == last {
@@ -1909,12 +1910,16 @@ fn aperture_lines(ks: &KnowledgeState) -> Vec<Line<'static>> {
         } else {
             ("          ", "├─ ")
         };
-        lines.push(Line::from(vec![
+        let mut row_spans = vec![
             Span::styled(lead, Style::default().fg(theme::MUTED)),
             Span::styled(connector, Style::default().fg(theme::DIM)),
             Span::styled(format!("{src} "), style.add_modifier(Modifier::BOLD)),
-            Span::styled(text, style),
-        ]));
+        ];
+        if let Some(label) = label {
+            row_spans.push(Span::styled(label, Style::default().fg(theme::MUTED)));
+        }
+        row_spans.push(Span::styled(text, style));
+        lines.push(Line::from(row_spans));
     }
 
     lines.push(Line::from(vec![
@@ -3485,6 +3490,14 @@ mod tests {
         assert_eq!(gutter_prefix(&Gutter::Verify), ("V ", theme::OK));
         assert_eq!(gutter_prefix(&Gutter::VerifyFail), ("V ", theme::ERR));
         assert_eq!(gutter_prefix(&Gutter::VerifySkip), ("V ", theme::DIM));
+    }
+
+    #[test]
+    fn md_span_style_italic_renders_plain() {
+        // DESIGN.md: italic is reserved for verbatim quoted ingat memory —
+        // markdown emphasis never gets the ITALIC modifier.
+        let style = md_span_style(&markdown::MdStyle::Italic);
+        assert!(!style.add_modifier.contains(Modifier::ITALIC));
     }
 
     // -- idle empty-state visibility (pure fn) -------------------------------
