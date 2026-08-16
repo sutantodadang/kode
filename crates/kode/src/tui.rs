@@ -1828,46 +1828,70 @@ fn breadcrumb_line(state: &AppState) -> Line<'static> {
 }
 
 /// Builds the Knowledge Band's content lines (not including the trailing
-/// rule line, which needs the render-time area width). Row 1: `Z {first
-/// zindeks fact}`, indented continuation lines for the rest; then one `I`
-/// line per ingat summary (quoted, italic); then one `G` line for the git
-/// impact. Sources with empty vecs render nothing.
+/// rule line, which needs the render-time area width). Bounded to at most 3
+/// rows — one per source (`Z`, `I`, `G`) — showing only the first fact from
+/// each; a dim ` +N more` suffix marks additional facts the source holds.
+/// Only the leading source glyph is bold+colored; the fact text itself
+/// renders in its normal weight (glyph-only bold, per `DESIGN.md`). Sources
+/// with empty vecs render nothing.
 fn knowledge_band_lines(ks: &KnowledgeState) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
 
-    if let Some((first, rest)) = ks.zindeks.split_first() {
-        lines.push(Line::from(vec![
+    if let Some(first) = ks.zindeks.first() {
+        let mut spans = vec![
             Span::raw(" KNOWS  "),
             Span::styled(
-                format!("Z {first}"),
+                "Z ",
                 Style::default().fg(theme::Z).add_modifier(Modifier::BOLD),
             ),
-        ]));
-        for extra in rest {
-            lines.push(Line::from(Span::styled(
-                format!("          {extra}"),
-                Style::default().fg(theme::Z),
-            )));
+            Span::raw(first.clone()),
+        ];
+        if ks.zindeks.len() > 1 {
+            spans.push(Span::styled(
+                format!(" +{} more", ks.zindeks.len() - 1),
+                Style::default().fg(theme::DIM),
+            ));
         }
+        lines.push(Line::from(spans));
     }
 
-    for entry in &ks.ingat {
-        lines.push(Line::from(vec![
+    if let Some(first) = ks.ingat.first() {
+        let mut spans = vec![
             Span::raw(" KNOWS  "),
-            Span::styled("I ", Style::default().fg(theme::I)),
             Span::styled(
-                format!("\u{201c}{entry}\u{201d}"),
+                "I ",
+                Style::default().fg(theme::I).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("\u{201c}{first}\u{201d}"),
                 Style::default().fg(theme::I).add_modifier(Modifier::ITALIC),
             ),
-        ]));
+        ];
+        if ks.ingat.len() > 1 {
+            spans.push(Span::styled(
+                format!(" +{} more", ks.ingat.len() - 1),
+                Style::default().fg(theme::DIM),
+            ));
+        }
+        lines.push(Line::from(spans));
     }
 
     if let Some(git_line) = ks.git.first() {
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::raw(" KNOWS  "),
-            Span::styled("G ", Style::default().fg(theme::G)),
-            Span::styled(git_line.clone(), Style::default().fg(theme::G)),
-        ]));
+            Span::styled(
+                "G ",
+                Style::default().fg(theme::G).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(git_line.clone()),
+        ];
+        if ks.git.len() > 1 {
+            spans.push(Span::styled(
+                format!(" +{} more", ks.git.len() - 1),
+                Style::default().fg(theme::DIM),
+            ));
+        }
+        lines.push(Line::from(spans));
     }
 
     lines
@@ -2548,6 +2572,22 @@ mod tests {
         assert_eq!(ks.git, vec!["3 files changed".to_string()]);
         assert_eq!(ks.context_tokens, 4200);
         assert_eq!(ks.budget_tokens, 16_000);
+    }
+
+    #[test]
+    fn knowledge_band_lines_capped_at_3_rows_with_more_suffix() {
+        let ks = KnowledgeState {
+            zindeks: vec!["src/foo.rs".to_string(), "src/bar.rs".to_string()],
+            ingat: vec!["always prefix with rtk".to_string(), "another".to_string()],
+            git: vec!["3 files changed".to_string()],
+            context_tokens: 100,
+            budget_tokens: 16_000,
+        };
+        let lines = knowledge_band_lines(&ks);
+        assert_eq!(lines.len(), 3);
+        assert!(line_text(&lines[0]).contains("+1 more"));
+        assert!(line_text(&lines[1]).contains("+1 more"));
+        assert!(!line_text(&lines[2]).contains("more"));
     }
 
     #[test]
