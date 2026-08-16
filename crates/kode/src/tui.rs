@@ -1718,14 +1718,15 @@ fn gutter_prefix(gutter: &Gutter) -> (&'static str, Color) {
 }
 
 /// Maps a markdown inline style onto a ratatui `Style`, within the existing
-/// palette per `DESIGN.md` — no new colors, only bold/italic/dim + the
-/// zindeks cyan for inline code.
+/// palette per `DESIGN.md` — no new colors, only bold/dim. Color is
+/// provenance, never decoration, so inline code is muted rather than tinted
+/// with a source color it doesn't carry.
 fn md_span_style(style: &markdown::MdStyle) -> Style {
     match style {
         markdown::MdStyle::Plain => Style::default(),
         markdown::MdStyle::Bold => Style::default().add_modifier(Modifier::BOLD),
         markdown::MdStyle::Italic => Style::default(),
-        markdown::MdStyle::InlineCode => Style::default().fg(theme::Z),
+        markdown::MdStyle::InlineCode => Style::default().fg(theme::MUTED),
     }
 }
 
@@ -1747,7 +1748,7 @@ fn transcript_line_to_ratatui(line: &TranscriptLine) -> Line<'static> {
         }
         (Some(markdown::MdKind::Code), Some(md_spans)) => {
             let text: String = md_spans.iter().map(|(t, _)| t.as_str()).collect();
-            spans.push(Span::styled(text, Style::default().fg(theme::T)));
+            spans.push(Span::raw(text));
         }
         (Some(markdown::MdKind::Bullet), Some(md_spans)) => {
             for (i, (text, style)) in md_spans.iter().enumerate() {
@@ -1802,7 +1803,7 @@ fn breadcrumb_line(state: &AppState) -> Line<'static> {
     if state.auto_mode {
         spans.push(Span::styled(
             " · auto",
-            Style::default().fg(theme::I).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::T).add_modifier(Modifier::BOLD),
         ));
     }
     if let Some(ks) = &state.knowledge {
@@ -2047,7 +2048,7 @@ fn draw(f: &mut ratatui::Frame, state: &AppState) {
         f.render_widget(
             Paragraph::new(Span::styled(
                 req_line,
-                Style::default().fg(theme::I).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme::T).add_modifier(Modifier::BOLD),
             )),
             areas[idx],
         );
