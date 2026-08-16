@@ -457,6 +457,61 @@ fn record_completed_turn(
     }
 }
 
+/// Loads session `id` into the app: history armed for the model, transcript
+/// replayed for the human. Returns false (with a transcript Note) on
+/// failure or an empty session.
+fn restore_session(state: &mut AppState, cwd: &Path, id: &str) -> bool {
+    match crate::session::load(cwd, id) {
+        Ok((turns, corrupt)) => {
+            if turns.is_empty() {
+                state.transcript.push(TranscriptLine::new(
+                    Gutter::Note,
+                    format!("session {id} has no turns"),
+                ));
+                return false;
+            }
+            state.transcript.clear();
+            state.history.clear();
+            state.transcript.push(TranscriptLine::new(
+                Gutter::Note,
+                format!("— resumed {id} · {} turns —", turns.len()),
+            ));
+            if corrupt > 0 {
+                state.transcript.push(TranscriptLine::new(
+                    Gutter::Note,
+                    format!("session {id}: skipped {corrupt} corrupt lines"),
+                ));
+            }
+            for t in &turns {
+                state
+                    .transcript
+                    .push(TranscriptLine::new(Gutter::User, t.task.clone()));
+                let mut in_code_block = false;
+                for line in t.response.lines() {
+                    let rendered = markdown::render_line(line, &mut in_code_block);
+                    state.transcript.push(TranscriptLine::markdown(
+                        Gutter::Prose,
+                        line,
+                        rendered.kind,
+                        rendered.spans,
+                    ));
+                }
+            }
+            state.last_response = turns.last().map(|t| t.response.clone()).unwrap_or_default();
+            state.session_id = Some(id.to_string());
+            state.history = turns;
+            true
+        }
+        Err(e) => {
+            state.transcript.push(TranscriptLine::new(
+                Gutter::Note,
+                format!("could not load session {id}: {e}"),
+            ));
+            false
+        }
+    }
+}
+
 /// First line of `task`, truncated to 70 chars (char-safe) — the Ledger
 /// view's OBJECTIVE text.
 fn ledger_objective(task: &str) -> String {
@@ -1164,10 +1219,9 @@ fn detect_branch(cwd: &Path) -> Option<String> {
 }
 
 /// Launches the interactive TUI. Runs until the user quits (Ctrl-C/'q' while
-/// idle) or the process is otherwise terminated. `_continue_` resumes the
-/// latest session (wired in a later task; accepted now so call sites are
-/// stable).
-pub async fn run(cwd: &Path, cancel: CancellationToken, _continue_: bool) -> anyhow::Result<()> {
+/// idle) or the process is otherwise terminated. `continue_` resumes the
+/// latest session: transcript replayed, history armed for the model.
+pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyhow::Result<()> {
     let mut config = KodeConfig::load(cwd).unwrap_or_default();
 
     enable_raw_mode()?;
@@ -1200,6 +1254,18 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, _continue_: bool) -> any
         state
             .transcript
             .push(TranscriptLine::new(Gutter::Note, hint));
+    }
+
+    if continue_ {
+        match crate::session::latest(cwd) {
+            Some(id) => {
+                restore_session(&mut state, cwd, &id);
+            }
+            None => state.transcript.push(TranscriptLine::new(
+                Gutter::Note,
+                "no previous session — starting fresh",
+            )),
+        }
     }
 
     let (perm_tx, mut perm_rx) = mpsc::unbounded_channel::<(String, oneshot::Sender<bool>)>();
@@ -4024,6 +4090,69 @@ mod tests {
         assert!(s.history.is_empty());
         assert!(s.session_id.is_none());
         assert!(!dir.join(".kode").join("sessions").exists());
+    }
+
+    // -- resume (restore_session) ----------------------------------------------
+
+    #[test]
+    fn restore_session_replays_transcript_and_history() {
+        let dir = temp_project_dir();
+        let id = crate::session::create(&dir, "codex", "gpt-test").unwrap();
+        crate::session::append_turn(
+            &dir,
+            &id,
+            &crate::session::Turn {
+                ts: "2026-08-17T00:00:00Z".to_string(),
+                task: "first task".to_string(),
+                response: "first answer".to_string(),
+                tool_calls: 1,
+            },
+        )
+        .unwrap();
+        crate::session::append_turn(
+            &dir,
+            &id,
+            &crate::session::Turn {
+                ts: "2026-08-17T00:01:00Z".to_string(),
+                task: "second task".to_string(),
+                response: "second answer".to_string(),
+                tool_calls: 0,
+            },
+        )
+        .unwrap();
+
+        let mut s = state();
+        let ok = restore_session(&mut s, &dir, &id);
+        assert!(ok);
+
+        assert_eq!(s.transcript[0].gutter, Gutter::Note);
+        assert!(s.transcript[0].text.contains(&id));
+        assert!(s.transcript[0].text.contains("2 turns"));
+        let user_lines: Vec<&TranscriptLine> = s
+            .transcript
+            .iter()
+            .filter(|l| l.gutter == Gutter::User)
+            .collect();
+        assert_eq!(user_lines.len(), 2);
+        assert_eq!(user_lines[0].text, "first task");
+        assert_eq!(user_lines[1].text, "second task");
+        assert_eq!(s.history.len(), 2);
+        assert_eq!(s.session_id.as_deref(), Some(id.as_str()));
+        assert_eq!(s.last_response, "second answer");
+    }
+
+    #[test]
+    fn restore_session_missing_file_notes_and_returns_false() {
+        let dir = temp_project_dir();
+        let mut s = state();
+        let ok = restore_session(&mut s, &dir, "20260817-000000");
+        assert!(!ok);
+        assert!(
+            s.transcript
+                .iter()
+                .any(|l| l.text.contains("could not load session"))
+        );
+        assert!(s.session_id.is_none());
     }
 
     // -- markdown flush integration --------------------------------------------
