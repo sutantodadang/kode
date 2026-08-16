@@ -20,6 +20,10 @@ struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
+    /// Resume the latest chat session (TUI: restores transcript + history).
+    #[arg(short = 'c', long = "continue")]
+    continue_: bool,
+
     /// Subcommand to run. When omitted, Kode launches the interactive TUI.
     #[command(subcommand)]
     command: Option<Command>,
@@ -45,6 +49,10 @@ enum Command {
         /// Override reasoning effort for this run: minimal, low, medium, high, xhigh.
         #[arg(long)]
         effort: Option<String>,
+        /// Continue the latest session: prior turns are sent as history and
+        /// this task is appended to it.
+        #[arg(short = 'c', long = "continue")]
+        continue_: bool,
     },
     /// List available models for the configured provider.
     Models,
@@ -124,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
         },
         None => {
             let cwd = std::env::current_dir()?;
-            tui::run(&cwd, token).await?;
+            tui::run(&cwd, token, cli.continue_).await?;
         }
         Some(Command::Status) => {
             let cwd = std::env::current_dir()?;
@@ -134,6 +142,7 @@ async fn main() -> anyhow::Result<()> {
             task,
             model,
             effort,
+            continue_,
         }) => {
             if let Some(e) = &effort
                 && !kode_core::config::VALID_EFFORTS.contains(&e.as_str())
@@ -144,7 +153,7 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             let cwd = std::env::current_dir()?;
-            exec::run(&task, &cwd, token, model, effort).await?;
+            exec::run(&task, &cwd, token, model, effort, continue_).await?;
         }
         Some(Command::Models) => {
             let cwd = std::env::current_dir()?;

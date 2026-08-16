@@ -1106,8 +1106,10 @@ fn detect_branch(cwd: &Path) -> Option<String> {
 }
 
 /// Launches the interactive TUI. Runs until the user quits (Ctrl-C/'q' while
-/// idle) or the process is otherwise terminated.
-pub async fn run(cwd: &Path, cancel: CancellationToken) -> anyhow::Result<()> {
+/// idle) or the process is otherwise terminated. `_continue_` resumes the
+/// latest session (wired in a later task; accepted now so call sites are
+/// stable).
+pub async fn run(cwd: &Path, cancel: CancellationToken, _continue_: bool) -> anyhow::Result<()> {
     let mut config = KodeConfig::load(cwd).unwrap_or_default();
 
     enable_raw_mode()?;

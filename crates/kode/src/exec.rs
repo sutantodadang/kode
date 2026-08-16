@@ -9,6 +9,7 @@ use kode_tools::permission::PermissionHandler;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::pipeline;
+use crate::session;
 
 struct StdinPermission;
 
@@ -34,6 +35,7 @@ pub async fn run(
     cancel: CancellationToken,
     model_override: Option<String>,
     effort_override: Option<String>,
+    continue_session: bool,
 ) -> anyhow::Result<()> {
     let mut config = KodeConfig::load(cwd)?;
     if let Some(model) = model_override {
@@ -43,15 +45,49 @@ pub async fn run(
         config.model.effort = effort;
     }
 
+    let session_id = if continue_session {
+        session::latest(cwd)
+    } else {
+        None
+    };
+    let mut history_turns: Vec<kode_agent::HistoryTurn> = Vec::new();
+    if continue_session {
+        if let Some(id) = &session_id {
+            match session::load(cwd, id) {
+                Ok((turns, corrupt)) => {
+                    if corrupt > 0 {
+                        println!("session {id}: skipped {corrupt} corrupt lines");
+                    }
+                    history_turns = turns
+                        .into_iter()
+                        .map(|t| kode_agent::HistoryTurn {
+                            task: t.task,
+                            response: t.response,
+                        })
+                        .collect();
+                }
+                Err(e) => println!("could not load session {id}: {e}"),
+            }
+        } else {
+            println!("no previous session — starting fresh");
+        }
+    }
+
     let events = EventBus::new(256);
     let mut rx = events.subscribe();
 
     let printer = tokio::spawn(async move {
+        // Mirrors how the TUI's `AppState.response_buf` accumulates flushed
+        // model text across a task's run and snapshots it into
+        // `last_response` on `TaskFinished` — see `tui.rs::apply_event`.
+        let mut response_buf = String::new();
+        let mut final_tool_calls: u32 = 0;
         loop {
             match rx.recv().await {
                 Ok(KodeEvent::ModelToken { text }) => {
                     print!("{text}");
                     let _ = std::io::stdout().flush();
+                    response_buf.push_str(&text);
                 }
                 Ok(KodeEvent::Note { text }) => {
                     eprintln!("◆ {text}");
@@ -94,6 +130,7 @@ pub async fn run(
                         "— {} iterations, {} tool calls, {}→{} tokens",
                         iterations, tool_calls, input_tokens, output_tokens
                     );
+                    final_tool_calls = tool_calls;
                 }
                 Ok(KodeEvent::AgentError { message }) => {
                     eprintln!("{message}");
@@ -108,6 +145,7 @@ pub async fn run(
                 }
             }
         }
+        (response_buf, final_tool_calls)
     });
 
     let result = pipeline::run_task(
@@ -117,14 +155,30 @@ pub async fn run(
         events,
         Arc::new(StdinPermission),
         cancel,
-        &[],
+        &history_turns,
     )
     .await;
 
-    let _ = printer.await;
+    let (final_text, tool_calls) = printer.await.unwrap_or_default();
 
     if result.is_ok() {
         println!();
+        if continue_session {
+            let id = match session_id.clone() {
+                Some(id) => id,
+                None => session::create(cwd, &config.model.provider, &config.model.model)?,
+            };
+            let (_, ts) = session::now_utc_stamp();
+            let turn = session::Turn {
+                ts,
+                task: task.to_string(),
+                response: final_text,
+                tool_calls,
+            };
+            if let Err(e) = session::append_turn(cwd, &id, &turn) {
+                println!("session append failed (non-fatal): {e}");
+            }
+        }
     }
     result
 }
