@@ -1749,7 +1749,17 @@ fn md_span_style(style: &markdown::MdStyle) -> Style {
 /// everything else falls back to the legacy plain-text span.
 fn transcript_line_to_ratatui(line: &TranscriptLine) -> Line<'static> {
     let (prefix, color) = gutter_prefix(&line.gutter);
-    let mut spans = vec![Span::styled(prefix, Style::default().fg(color))];
+    let mut prefix_style = Style::default().fg(color);
+    // Source-letter glyphs (`T`/`V`) are bold+colored per DESIGN.md's glyph
+    // vocabulary; the plain `│` prose bar and other non-letter glyphs stay
+    // unbolded.
+    if matches!(
+        line.gutter,
+        Gutter::Tool | Gutter::ToolFail | Gutter::Verify | Gutter::VerifyFail | Gutter::VerifySkip
+    ) {
+        prefix_style = prefix_style.add_modifier(Modifier::BOLD);
+    }
+    let mut spans = vec![Span::styled(prefix, prefix_style)];
 
     match (&line.md_kind, &line.spans) {
         (Some(markdown::MdKind::CodeFence), _) => {
