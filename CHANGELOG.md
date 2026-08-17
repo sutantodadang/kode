@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Added
+
+- `kode update`: self-update from the latest GitHub release with consent
+  prompt, sha256 verification, and in-place binary swap.
+- Transcript provenance gutter: knowledge-derived lines show `Z` (zindeks),
+  `I` (Ingat), or `G` (git) markers.
+- Ingat memory confidence shown as a dim suffix in the knowledge band.
+- Breadcrumb dirty-worktree indicator (`*` after the branch name).
+- Ledger shows real `git diff --numstat` rows instead of a change counter.
+- `[ui] reduced_motion` config to disable all TUI animation.
+- Stream coalescing (word-boundary or 120ms flush) with a frozen spinner
+  while tokens stream; evidence-row fade-in; ledger active-marker pulse.
+
 ## [0.1.0] - 2026-08-17
 
 ### Added
