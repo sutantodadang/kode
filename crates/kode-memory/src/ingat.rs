@@ -340,7 +340,11 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
     fn cfg(url: String) -> IngatConfig {
-        IngatConfig { enabled: true, url }
+        IngatConfig {
+            enabled: true,
+            url,
+            autostart: true,
+        }
     }
 
     struct FakeRequest {

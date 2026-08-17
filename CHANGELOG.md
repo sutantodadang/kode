@@ -21,6 +21,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Transcript scrollbar (auto-hides when content fits) with proper scroll
   clamping, and mouse wheel scrolling (3 lines per notch). Terminal text
   selection is superseded by `/copy` while mouse capture is on.
+- Ingat service autostart: when the memory service is unreachable, Kode
+  starts the installed service once and retries (`[ingat] autostart`,
+  default true). zindeks already autostarts via its stdio child.
+
+### Fixed
+
+- CI on Linux/macOS: Windows-only Ingat setup helpers are now
+  `#[cfg(windows)]`-gated instead of tripping `-D dead-code`.
 
 ## [0.1.0] - 2026-08-17
 

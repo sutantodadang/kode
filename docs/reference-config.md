@@ -59,11 +59,13 @@ watch = true
 |---|---|---|---|
 | `enabled` | bool | `true` | Whether Kode uses Ingat for engineering-memory context. |
 | `url` | string | `"http://127.0.0.1:3200"` | Base URL of the Ingat REST API. |
+| `autostart` | bool | `true` | When the Ingat service is unreachable at task start, automatically locate and start the installed service, then retry once before falling back to memory-less operation. At most one attempt per `kode` process. |
 
 ```toml
 [ingat]
 enabled = true
 url = "http://127.0.0.1:3200"
+autostart = true
 ```
 
 ## `[agent]`
@@ -144,6 +146,7 @@ watch = true
 [ingat]
 enabled = true
 url = "http://127.0.0.1:3200"
+autostart = true
 
 [agent]
 max_iterations = 40

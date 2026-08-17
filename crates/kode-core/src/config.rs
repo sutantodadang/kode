@@ -263,6 +263,12 @@ pub struct IngatConfig {
     pub enabled: bool,
     #[serde(default = "default_ingat_url")]
     pub url: String,
+    /// When the Ingat service is unreachable at task start, automatically
+    /// locate and start the installed `mcp_service.exe` and retry once
+    /// before falling back to memory-less operation. One attempt per `kode`
+    /// process, regardless of how many tasks it runs.
+    #[serde(default = "default_true")]
+    pub autostart: bool,
 }
 
 impl Default for IngatConfig {
@@ -270,6 +276,7 @@ impl Default for IngatConfig {
         Self {
             enabled: default_true(),
             url: default_ingat_url(),
+            autostart: default_true(),
         }
     }
 }
@@ -415,6 +422,7 @@ mod tests {
         assert!(cfg.zindeks.watch);
         assert!(cfg.ingat.enabled);
         assert_eq!(cfg.ingat.url, "http://127.0.0.1:3200");
+        assert!(cfg.ingat.autostart);
         assert_eq!(cfg.agent.max_iterations, 40);
         assert_eq!(cfg.agent.max_tool_calls, 100);
         assert_eq!(cfg.agent.max_context_tokens, 100_000);
@@ -549,6 +557,23 @@ mod tests {
 
         let cfg = KodeConfig::load(&dir).unwrap();
         assert!(!cfg.zindeks.watch);
+    }
+
+    #[test]
+    fn ingat_autostart_defaults_true_and_honors_explicit_false() {
+        let dir = temp_project_dir();
+        let cfg = KodeConfig::load(&dir).unwrap();
+        assert!(cfg.ingat.autostart);
+
+        let kode_dir = dir.join(".kode");
+        std::fs::create_dir_all(&kode_dir).unwrap();
+        std::fs::write(kode_dir.join("config.toml"), "[ingat]\nautostart = false\n").unwrap();
+
+        let cfg = KodeConfig::load(&dir).unwrap();
+        assert!(!cfg.ingat.autostart);
+        // Untouched keys in the same section keep their own defaults.
+        assert!(cfg.ingat.enabled);
+        assert_eq!(cfg.ingat.url, "http://127.0.0.1:3200");
     }
 
     #[test]

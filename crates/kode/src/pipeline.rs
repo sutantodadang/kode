@@ -1,10 +1,11 @@
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use kode_agent::Agent;
 use kode_context::{CompiledContext, ContextCompiler, ContextRequest, ContextSource};
 use kode_core::CancellationToken;
-use kode_core::config::KodeConfig;
+use kode_core::config::{IngatConfig, KodeConfig};
 use kode_core::event::{EventBus, KodeEvent, NoteSource, TaskStep};
 use kode_intel::{CodeIntelligence, ZindeksAdapter};
 use kode_memory::{EngineeringMemory, IngatAdapter, RememberTool};
@@ -12,6 +13,11 @@ use kode_model::{OpenAiModel, OpenAiOptions};
 use kode_tools::ToolContext;
 use kode_tools::permission::PermissionHandler;
 use kode_tools::registry::{ToolRegistry, ToolRuntime};
+
+/// Set once this process has made its one autostart attempt for the Ingat
+/// service (successful or not). Guards against re-attempting on every task
+/// within a long-lived `kode` process (e.g. the TUI running many turns).
+static INGAT_AUTOSTART_ATTEMPTED: OnceLock<()> = OnceLock::new();
 
 /// Runs one agentic task end-to-end: model/config setup, code intelligence
 /// and engineering memory binding, context compilation, the agent loop, and
@@ -131,21 +137,21 @@ pub async fn run_task(
 
     let memory: Option<Arc<dyn EngineeringMemory>> = if config.ingat.enabled {
         let adapter = IngatAdapter::new(&config.ingat);
-        match tokio::time::timeout(std::time::Duration::from_secs(3), adapter.health()).await {
+        match tokio::time::timeout(Duration::from_secs(3), adapter.health()).await {
             Ok(Ok(())) => Some(Arc::new(adapter) as Arc<dyn EngineeringMemory>),
             Ok(Err(e)) => {
                 events.emit(KodeEvent::SourcedNote {
                     text: format!("engineering memory unavailable: {e}"),
                     source: NoteSource::Ingat,
                 });
-                None
+                maybe_autostart_ingat(&config.ingat, &events).await
             }
             Err(_) => {
                 events.emit(KodeEvent::SourcedNote {
                     text: "engineering memory unavailable: request timed out".to_string(),
                     source: NoteSource::Ingat,
                 });
-                None
+                maybe_autostart_ingat(&config.ingat, &events).await
             }
         }
     } else {
@@ -360,6 +366,83 @@ pub async fn run_task(
     });
 
     Ok(())
+}
+
+/// Whether the Ingat autostart flow should run: only when the config opts
+/// in and this process hasn't already made its one attempt. Pure — kept
+/// separate from the I/O so the decision is unit-testable on its own.
+fn should_attempt_autostart(autostart: bool, already_attempted: bool) -> bool {
+    autostart && !already_attempted
+}
+
+/// Polls `adapter.health()` up to `attempts` times (2s timeout per call),
+/// sleeping `interval` between attempts, returning `true` on the first
+/// success and `false` if every attempt fails. With the defaults used below
+/// (10 attempts, 500ms interval) this budgets roughly 5s total.
+async fn poll_ingat_health(adapter: &IngatAdapter, attempts: u32, interval: Duration) -> bool {
+    for attempt in 0..attempts {
+        if let Ok(Ok(())) = tokio::time::timeout(Duration::from_secs(2), adapter.health()).await {
+            return true;
+        }
+        if attempt + 1 < attempts {
+            tokio::time::sleep(interval).await;
+        }
+    }
+    false
+}
+
+/// Called only after the initial Ingat health check has already failed.
+/// When autostart is enabled and this process hasn't tried yet, locates the
+/// installed service, starts it detached, and re-polls health — reporting
+/// each step via `KodeEvent::SourcedNote`. Returns `Some` when the retry
+/// succeeds, `None` otherwise (task proceeds without engineering memory).
+async fn maybe_autostart_ingat(
+    cfg: &IngatConfig,
+    events: &EventBus,
+) -> Option<Arc<dyn EngineeringMemory>> {
+    let already_attempted = INGAT_AUTOSTART_ATTEMPTED.get().is_some();
+    if !should_attempt_autostart(cfg.autostart, already_attempted) {
+        return None;
+    }
+    // Mark the attempt immediately (not just on success) — this is a
+    // one-shot-per-process flag regardless of outcome.
+    let _ = INGAT_AUTOSTART_ATTEMPTED.set(());
+
+    events.emit(KodeEvent::SourcedNote {
+        text: "ingat: service not running — starting it".to_string(),
+        source: NoteSource::Ingat,
+    });
+
+    let Some(path) = crate::setup::find_mcp_service() else {
+        events.emit(KodeEvent::SourcedNote {
+            text: "ingat: service not installed — run kode setup".to_string(),
+            source: NoteSource::Ingat,
+        });
+        return None;
+    };
+
+    if let Err(e) = crate::setup::spawn_detached(&path) {
+        events.emit(KodeEvent::SourcedNote {
+            text: format!("ingat: failed to start service: {e}"),
+            source: NoteSource::Ingat,
+        });
+        return None;
+    }
+
+    let adapter = IngatAdapter::new(cfg);
+    if poll_ingat_health(&adapter, 10, Duration::from_millis(500)).await {
+        events.emit(KodeEvent::SourcedNote {
+            text: "ingat: service started".to_string(),
+            source: NoteSource::Ingat,
+        });
+        Some(Arc::new(adapter) as Arc<dyn EngineeringMemory>)
+    } else {
+        events.emit(KodeEvent::SourcedNote {
+            text: "ingat: service did not become healthy — continuing without memory".to_string(),
+            source: NoteSource::Ingat,
+        });
+        None
+    }
 }
 
 /// Verdict of a verification pass, derived from whether it found zero
@@ -585,6 +668,31 @@ fn emit_verify_steps(events: &EventBus, report: &kode_verify::VerificationReport
             skipped,
             duration_ms: step.duration.as_millis() as u64,
         });
+    }
+}
+
+#[cfg(test)]
+mod ingat_autostart_tests {
+    use super::should_attempt_autostart;
+
+    #[test]
+    fn attempts_when_enabled_and_not_yet_attempted() {
+        assert!(should_attempt_autostart(true, false));
+    }
+
+    #[test]
+    fn skips_when_disabled() {
+        assert!(!should_attempt_autostart(false, false));
+    }
+
+    #[test]
+    fn skips_when_already_attempted() {
+        assert!(!should_attempt_autostart(true, true));
+    }
+
+    #[test]
+    fn skips_when_disabled_and_already_attempted() {
+        assert!(!should_attempt_autostart(false, true));
     }
 }
 

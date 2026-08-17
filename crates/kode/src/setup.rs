@@ -8,6 +8,7 @@ use kode_memory::{EngineeringMemory, IngatAdapter};
 const ZINDEKS_RELEASES_BASE: &str =
     "https://github.com/sutantodadang/zindeks/releases/latest/download";
 const INGAT_RELEASES_URL: &str = "https://github.com/sutantodadang/Ingat/releases";
+#[cfg(windows)]
 const INGAT_LATEST_API: &str = "https://api.github.com/repos/sutantodadang/Ingat/releases/latest";
 
 /// Runs `kode setup`: a consent-gated installer/bootstrapper for the two
@@ -298,6 +299,7 @@ async fn try_start_ingat(cfg: &IngatConfig, path: &Path, yes: bool) {
     }
 }
 
+#[cfg(windows)]
 async fn wait_for_health(cfg: &IngatConfig, budget: Duration) -> bool {
     let adapter = IngatAdapter::new(cfg);
     let deadline = std::time::Instant::now() + budget;
@@ -316,7 +318,7 @@ async fn wait_for_health(cfg: &IngatConfig, budget: Duration) -> bool {
 /// (case-insensitive) up to depth 3 for `mcp_service.exe`. The Ingat NSIS
 /// installer uses `%LOCALAPPDATA%\ingat` as its per-user install dir.
 #[cfg(windows)]
-fn find_mcp_service() -> Option<PathBuf> {
+pub(crate) fn find_mcp_service() -> Option<PathBuf> {
     let local_app_data = PathBuf::from(std::env::var_os("LOCALAPPDATA")?);
 
     let direct = local_app_data.join("ingat");
@@ -341,6 +343,15 @@ fn find_mcp_service() -> Option<PathBuf> {
             return Some(found);
         }
     }
+    None
+}
+
+/// Non-Windows stub: Kode only knows how to locate the installed Ingat
+/// service on Windows (NSIS install layout). Always reports "not found" so
+/// autostart callers fall through to their "not installed" branch instead of
+/// needing per-platform `cfg` in the caller.
+#[cfg(not(windows))]
+pub(crate) fn find_mcp_service() -> Option<PathBuf> {
     None
 }
 
@@ -403,7 +414,7 @@ async fn install_ingat() -> anyhow::Result<()> {
 }
 
 #[cfg(windows)]
-fn spawn_detached(path: &Path) -> std::io::Result<()> {
+pub(crate) fn spawn_detached(path: &Path) -> std::io::Result<()> {
     use std::os::windows::process::CommandExt;
     // DETACHED_PROCESS | CREATE_NO_WINDOW
     const CREATION_FLAGS: u32 = 0x0800_0008;
@@ -416,9 +427,21 @@ fn spawn_detached(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Non-Windows stub: nothing to spawn since `find_mcp_service` never
+/// returns `Some` off Windows, but this keeps the signature callable from
+/// platform-agnostic autostart code without a `cfg` at the call site.
+#[cfg(not(windows))]
+pub(crate) fn spawn_detached(_path: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "starting the Ingat service is only supported on Windows",
+    ))
+}
+
 /// Depth-limited search for a file named `filename` (case-insensitive)
 /// under `root`. `max_depth` is measured in directories descended below
 /// `root` (0 = only `root` itself).
+#[cfg(windows)]
 fn find_file_named(root: &Path, filename: &str, max_depth: usize) -> Option<PathBuf> {
     let entries = std::fs::read_dir(root).ok()?;
     let mut subdirs = Vec::new();
@@ -522,6 +545,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     fn nanos() -> u128 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -529,6 +553,7 @@ mod tests {
             .as_nanos()
     }
 
+    #[cfg(windows)]
     fn temp_test_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "kode-setup-test-{label}-{}-{}",
@@ -540,6 +565,7 @@ mod tests {
         dir
     }
 
+    #[cfg(windows)]
     #[test]
     fn find_file_named_locates_nested_file_within_depth() {
         let root = temp_test_dir("found");
@@ -551,6 +577,7 @@ mod tests {
         assert_eq!(found, Some(nested.join("mcp_service.exe")));
     }
 
+    #[cfg(windows)]
     #[test]
     fn find_file_named_respects_max_depth() {
         let root = temp_test_dir("toodeep");
@@ -563,6 +590,7 @@ mod tests {
         assert_eq!(found, None);
     }
 
+    #[cfg(windows)]
     #[test]
     fn find_file_named_not_found_returns_none() {
         let root = temp_test_dir("missing");
