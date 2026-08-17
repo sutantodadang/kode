@@ -1,0 +1,87 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-13
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release -p kode --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE_DIR="$(mktemp -d)"
+          BIN_PATH="target/${{ matrix.target }}/release/kode"
+          ARCHIVE="kode-${{ matrix.target }}.tar.gz"
+
+          cp "$BIN_PATH" "$STAGE_DIR/kode"
+          cp LICENSE "$STAGE_DIR/LICENSE"
+          cp README.md "$STAGE_DIR/README.md"
+
+          tar -czf "$ARCHIVE" -C "$STAGE_DIR" kode LICENSE README.md
+
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            shasum -a 256 "$ARCHIVE" | awk '{print $1"  "$2}' > "$ARCHIVE.sha256"
+          else
+            sha256sum "$ARCHIVE" | awk '{print $1"  "$2}' > "$ARCHIVE.sha256"
+          fi
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $StageDir = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP 'stage') -Force
+          $BinPath = "target/${{ matrix.target }}/release/kode.exe"
+          $Archive = "kode-${{ matrix.target }}.zip"
+
+          Copy-Item $BinPath (Join-Path $StageDir.FullName 'kode.exe')
+          Copy-Item 'LICENSE' (Join-Path $StageDir.FullName 'LICENSE')
+          Copy-Item 'README.md' (Join-Path $StageDir.FullName 'README.md')
+
+          Compress-Archive -Path (Join-Path $StageDir.FullName '*') -DestinationPath $Archive -Force
+
+          $Hash = (Get-FileHash -Algorithm SHA256 -Path $Archive).Hash.ToLower()
+          "$Hash  $Archive" | Out-File -FilePath "$Archive.sha256" -Encoding ascii -NoNewline
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: kode-${{ matrix.target }}.*
+          generate_release_notes: true
