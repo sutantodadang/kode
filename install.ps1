@@ -4,7 +4,7 @@
     Kode installer for Windows.
 .DESCRIPTION
     Downloads, verifies, and installs the kode binary for x64 Windows.
-    Usage: iwr https://raw.githubusercontent.com/sutantodadang/kode/master/install.ps1 -useb | iex
+    Usage: iwr https://raw.githubusercontent.com/sutantodadang/kode/main/install.ps1 -useb | iex
 #>
 
 $ErrorActionPreference = 'Stop'

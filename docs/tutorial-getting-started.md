@@ -11,13 +11,13 @@ A terminal, a git repo you can experiment in, and network access for the install
 On Linux or macOS:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/sutantodadang/kode/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/sutantodadang/kode/main/install.sh | sh
 ```
 
 On Windows (PowerShell):
 
 ```
-powershell -c "irm https://raw.githubusercontent.com/sutantodadang/kode/master/install.ps1 | iex"
+powershell -c "irm https://raw.githubusercontent.com/sutantodadang/kode/main/install.ps1 | iex"
 ```
 
 Verify the install:

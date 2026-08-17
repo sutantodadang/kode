@@ -45,7 +45,7 @@ cargo test --workspace
 
 ## PR process
 
-- Branch from `master`.
+- Branch from `main`.
 - Keep PRs small and focused on one change.
 - CI must be green before merge.
 - No DCO-style sign-off is required.

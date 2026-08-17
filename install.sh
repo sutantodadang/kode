@@ -1,6 +1,6 @@
 #!/bin/sh
 # Kode installer for Linux/macOS.
-# Usage: curl -fsSL https://raw.githubusercontent.com/sutantodadang/kode/master/install.sh | sh
+# Usage: curl -fsSL https://raw.githubusercontent.com/sutantodadang/kode/main/install.sh | sh
 set -eu
 
 REPO="sutantodadang/kode"

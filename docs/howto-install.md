@@ -5,13 +5,13 @@
 Linux or macOS:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/sutantodadang/kode/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/sutantodadang/kode/main/install.sh | sh
 ```
 
 Windows (PowerShell):
 
 ```
-powershell -c "irm https://raw.githubusercontent.com/sutantodadang/kode/master/install.ps1 | iex"
+powershell -c "irm https://raw.githubusercontent.com/sutantodadang/kode/main/install.ps1 | iex"
 ```
 
 What the script does:

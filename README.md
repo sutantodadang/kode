@@ -19,11 +19,11 @@ Local-first coding agent that thinks in your code graph, not just your files.
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sutantodadang/kode/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/sutantodadang/kode/main/install.sh | sh
 ```
 
 ```powershell
-powershell -c "irm https://raw.githubusercontent.com/sutantodadang/kode/master/install.ps1 | iex"
+powershell -c "irm https://raw.githubusercontent.com/sutantodadang/kode/main/install.ps1 | iex"
 ```
 
 Or grab a binary from [Releases](https://github.com/sutantodadang/kode/releases).
