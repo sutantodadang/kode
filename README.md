@@ -51,6 +51,7 @@ kode --continue               # resume your last session
 | `verify` | Run the verification pipeline against the workspace |
 | `doctor` | Diagnose the local Kode install and engine health |
 | `setup` | Consent-gated install of zindeks and Ingat |
+| `update` | Consent-gated self-update from the latest GitHub release |
 | `remember` | Write to engineering memory (Ingat) directly |
 
 ## Documentation

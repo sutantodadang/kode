@@ -8,6 +8,7 @@ mod session;
 mod setup;
 mod status;
 mod tui;
+mod update;
 mod verify;
 
 use clap::Parser;
@@ -63,6 +64,13 @@ enum Command {
     /// Install/bootstrap the zindeks and Ingat engines (consent-gated).
     Setup {
         /// Skip confirmation prompts and proceed with all installs.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Self-update the kode binary from the latest GitHub release
+    /// (consent-gated).
+    Update {
+        /// Skip confirmation prompt and proceed with the update.
         #[arg(long)]
         yes: bool,
     },
@@ -170,6 +178,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Doctor) => {
             let cwd = std::env::current_dir()?;
             doctor::run(&cwd).await?;
+        }
+        Some(Command::Update { yes }) => {
+            update::run(yes).await?;
         }
         Some(Command::Remember { text, kind, tags }) => {
             let cwd = std::env::current_dir()?;

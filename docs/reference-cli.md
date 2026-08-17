@@ -125,6 +125,19 @@ kode setup
 kode setup --yes
 ```
 
+## `kode update`
+
+Self-update the `kode` binary from the latest GitHub release. Consent-gated: prompts before downloading anything unless `--yes` is passed. Downloads the release archive and its `.sha256` sidecar, verifies the checksum, extracts with `tar`, and replaces the running binary (a restart is needed to use the new version).
+
+| Flag | Description |
+|---|---|
+| `--yes` | Skip the confirmation prompt and proceed with the update. |
+
+```
+kode update
+kode update --yes
+```
+
 ## `kode remember <TEXT>`
 
 Save an explicit engineering memory to Ingat.
