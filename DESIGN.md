@@ -61,3 +61,7 @@ No gradients · no emoji spam · no chat bubbles · no card grids · no permanen
 | 2026-08-15 | Cyan for zindeks, not violet | crush owns purple; cyan+amber unclaimed in the category |
 | 2026-08-15 | Gutter shows real event provenance only | No fake footnotes on LLM prose — honesty > theater |
 | 2026-08-17 | /design-review pass 1: picker de-boxed to match hint-menu vocabulary; italic restricted to ingat; provenance colors de-decorated; band capped at 3 rows; • – ┄ added to glyph vocabulary | cross-model audit (Codex + Claude) against this file |
+| 2026-08-17 | Transcript gutter gains `Z`/`I`/`G` glyphs (cyan bold / amber bold / dim bold) for single-source knowledge notes (`KodeEvent::SourcedNote`) | Design audit item 1 — knowledge-derived facts had no provenance lane in the transcript, only Z/I/G lines |
+| 2026-08-17 | Breadcrumb branch segment gets a dim `*` suffix when the worktree is dirty, refreshed by a lazy (non-interval) git poll at TUI start + after each task | Design audit item 3 — breadcrumb never showed clean/dirty state |
+| 2026-08-17 | Ledger CURRENT CHANGE renders up to 3 real `git diff --numstat` rows (`<file>  +A -D`, dim numbers) + `+N more`, replacing the apply_patch/write_file call counter; shares the item-3 git poll | Design audit item 4 — counter was a proxy, not the actual diff |
+| 2026-08-17 | Ingat knowledge-band/aperture rows get a dim `┄ 0.NN` confidence suffix, split off the ingat text (never baked into the amber/italic color) | Design audit item 2 — Ingat's search `score` field existed but wasn't surfaced |

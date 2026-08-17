@@ -260,7 +260,11 @@ fn provenance_rank(provenance: Option<Provenance>) -> u8 {
 }
 
 /// Formats one memory as a markdown bullet:
-/// `- **[kind]** summary — body _(inferred, low confidence)_`.
+/// `- **[kind]** summary — body _(inferred, low confidence)_ (0.87)`.
+/// The trailing `(0.NN)` is Ingat's search-result `score`/confidence,
+/// always appended last so `kode`'s pipeline can split it back off (see
+/// `pipeline::split_confidence_suffix`) to render as a dim suffix in the
+/// TUI's Knowledge Band, distinct from the amber ingat text color.
 fn format_memory_bullet(memory: &Memory) -> String {
     let kind_label = memory.kind.map(|k| k.as_kebab()).unwrap_or("memory");
     let body = truncate_memory_body(&memory.body);
@@ -272,6 +276,7 @@ fn format_memory_bullet(memory: &Memory) -> String {
     if memory.provenance == Some(Provenance::AgentInference) {
         line.push_str(" _(inferred, low confidence)_");
     }
+    line.push_str(&format!(" ({:.2})", memory.score));
     line
 }
 
@@ -538,6 +543,31 @@ mod tests {
         assert_eq!(compiled.stats.memory_status, "ok");
         assert_eq!(compiled.stats.memories_retrieved, 3);
         assert_eq!(compiled.stats.memories_retained, 3);
+    }
+
+    #[test]
+    fn format_memory_bullet_appends_two_decimal_confidence_tag() {
+        let memory = new_memory(
+            Some(MemoryKind::ProjectRule),
+            Some(Provenance::ExplicitUser),
+            "always prefix with rtk",
+            "always prefix with rtk",
+            0.873,
+        );
+        assert!(format_memory_bullet(&memory).ends_with(" (0.87)"));
+    }
+
+    #[test]
+    fn format_memory_bullet_confidence_tag_follows_inferred_marker() {
+        let memory = new_memory(
+            Some(MemoryKind::HistoricalSolution),
+            Some(Provenance::AgentInference),
+            "retry flaky test",
+            "retry flaky test",
+            0.5,
+        );
+        let bullet = format_memory_bullet(&memory);
+        assert!(bullet.ends_with("_(inferred, low confidence)_ (0.50)"));
     }
 
     #[tokio::test]

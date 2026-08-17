@@ -5,7 +5,7 @@ use kode_agent::Agent;
 use kode_context::{CompiledContext, ContextCompiler, ContextRequest, ContextSource};
 use kode_core::CancellationToken;
 use kode_core::config::KodeConfig;
-use kode_core::event::{EventBus, KodeEvent, TaskStep};
+use kode_core::event::{EventBus, KodeEvent, NoteSource, TaskStep};
 use kode_intel::{CodeIntelligence, ZindeksAdapter};
 use kode_memory::{EngineeringMemory, IngatAdapter, RememberTool};
 use kode_model::{OpenAiModel, OpenAiOptions};
@@ -109,16 +109,18 @@ pub async fn run_task(
                         Some(adapter as Arc<dyn CodeIntelligence>)
                     }
                     Err(e) => {
-                        events.emit(KodeEvent::Note {
+                        events.emit(KodeEvent::SourcedNote {
                             text: format!("code intelligence unavailable: {e}"),
+                            source: NoteSource::Zindeks,
                         });
                         None
                     }
                 }
             }
             Err(e) => {
-                events.emit(KodeEvent::Note {
+                events.emit(KodeEvent::SourcedNote {
                     text: format!("code intelligence unavailable: {e}"),
+                    source: NoteSource::Zindeks,
                 });
                 None
             }
@@ -132,14 +134,16 @@ pub async fn run_task(
         match tokio::time::timeout(std::time::Duration::from_secs(3), adapter.health()).await {
             Ok(Ok(())) => Some(Arc::new(adapter) as Arc<dyn EngineeringMemory>),
             Ok(Err(e)) => {
-                events.emit(KodeEvent::Note {
+                events.emit(KodeEvent::SourcedNote {
                     text: format!("engineering memory unavailable: {e}"),
+                    source: NoteSource::Ingat,
                 });
                 None
             }
             Err(_) => {
-                events.emit(KodeEvent::Note {
+                events.emit(KodeEvent::SourcedNote {
                     text: "engineering memory unavailable: request timed out".to_string(),
+                    source: NoteSource::Ingat,
                 });
                 None
             }
@@ -330,16 +334,19 @@ pub async fn run_task(
             // The spawned zindeks server has its own poll-watcher running
             // (ZINDEKS_WATCH=1) and will pick up the mutation on its own —
             // no need for Kode to trigger an explicit refresh.
-            events.emit(KodeEvent::Note {
+            events.emit(KodeEvent::SourcedNote {
                 text: "zindeks watcher active — index updates automatically".to_string(),
+                source: NoteSource::Zindeks,
             });
         } else {
             match adapter.ensure_bound().await {
-                Ok(()) => events.emit(KodeEvent::Note {
+                Ok(()) => events.emit(KodeEvent::SourcedNote {
                     text: "zindeks index refreshed".to_string(),
+                    source: NoteSource::Zindeks,
                 }),
-                Err(e) => events.emit(KodeEvent::Note {
+                Err(e) => events.emit(KodeEvent::SourcedNote {
                     text: format!("zindeks refresh failed (non-fatal): {e}"),
+                    source: NoteSource::Zindeks,
                 }),
             }
         }
@@ -465,6 +472,10 @@ fn parse_zindeks_header(line: &str) -> Option<String> {
 
 /// First bullet's summary text (leading `- **[kind]** ` stripped) per
 /// Memory-source section, max 2, each truncated to 60 chars (char-safe).
+/// When the bullet carries a trailing `(0.NN)` confidence tag (see
+/// `kode_context::compile::format_memory_bullet`), it's split off before
+/// truncation and re-appended as a ` ┄ 0.NN` suffix — the TUI knowledge
+/// band renders that suffix dim, distinct from the ingat text color.
 fn ingat_lines(compiled: &CompiledContext) -> Vec<String> {
     let mut lines = Vec::new();
     for section in compiled
@@ -473,13 +484,34 @@ fn ingat_lines(compiled: &CompiledContext) -> Vec<String> {
         .filter(|s| s.source == ContextSource::Memory)
     {
         if let Some(first_bullet) = section.body.lines().next() {
-            lines.push(truncate_chars(strip_bullet_prefix(first_bullet), 60));
+            let (text, confidence) = split_confidence_suffix(strip_bullet_prefix(first_bullet));
+            let mut line = truncate_chars(text, 60);
+            if let Some(score) = confidence {
+                line.push_str(&format!(" \u{2504} {score:.2}"));
+            }
+            lines.push(line);
             if lines.len() == 2 {
                 break;
             }
         }
     }
     lines
+}
+
+/// Splits a trailing `" (0.87)"`-style confidence tag off `text`, returning
+/// `(text_without_tag, Some(score))` when the tag parses as a float, else
+/// `(text, None)`. The tag is the *last* parenthesized group only — earlier
+/// parens (e.g. the `_(inferred, low confidence)_` marker) are left alone
+/// since they don't sit at the very end of the string.
+fn split_confidence_suffix(text: &str) -> (&str, Option<f32>) {
+    let trimmed = text.trim_end();
+    if let Some(rest) = trimmed.strip_suffix(')')
+        && let Some(open) = rest.rfind('(')
+        && let Ok(score) = rest[open + 1..].parse::<f32>()
+    {
+        return (trimmed[..open].trim_end(), Some(score));
+    }
+    (text, None)
 }
 
 /// Strips the `- **[kind]** ` prefix `format_memory_bullet` in
@@ -745,6 +777,66 @@ mod knowledge_tests {
             }
             other => panic!("expected Knowledge, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn split_confidence_suffix_extracts_trailing_score() {
+        assert_eq!(
+            split_confidence_suffix("always prefix with rtk (0.87)"),
+            ("always prefix with rtk", Some(0.87))
+        );
+    }
+
+    #[test]
+    fn split_confidence_suffix_leaves_earlier_parens_alone_without_trailing_score() {
+        let text = "rule text _(inferred, low confidence)_";
+        assert_eq!(split_confidence_suffix(text), (text, None));
+    }
+
+    #[test]
+    fn split_confidence_suffix_none_when_no_trailing_parens() {
+        assert_eq!(
+            split_confidence_suffix("plain text, no tag"),
+            ("plain text, no tag", None)
+        );
+    }
+
+    #[test]
+    fn split_confidence_suffix_handles_inferred_marker_before_score() {
+        let text = "rule text _(inferred, low confidence)_ (0.42)";
+        assert_eq!(
+            split_confidence_suffix(text),
+            ("rule text _(inferred, low confidence)_", Some(0.42))
+        );
+    }
+
+    #[test]
+    fn ingat_lines_appends_dim_confidence_suffix_when_tag_present() {
+        let c = compiled(
+            vec![section(
+                ContextSource::Memory,
+                "Project rules & conventions",
+                "- **[project-rule]** always prefix with rtk (0.87)",
+            )],
+            10,
+        );
+        assert_eq!(
+            ingat_lines(&c),
+            vec!["always prefix with rtk \u{2504} 0.87".to_string()]
+        );
+    }
+
+    #[test]
+    fn ingat_lines_omits_suffix_when_no_tag_present() {
+        let c = compiled(
+            vec![section(
+                ContextSource::Memory,
+                "Project rules & conventions",
+                "- **[project-rule]** always prefix with rtk",
+            )],
+            10,
+        );
+        assert_eq!(ingat_lines(&c), vec!["always prefix with rtk".to_string()]);
     }
 
     #[test]

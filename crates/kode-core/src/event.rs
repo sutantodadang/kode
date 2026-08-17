@@ -9,6 +9,17 @@ pub enum TaskStep {
     Verify,
 }
 
+/// Which engine a [`KodeEvent::SourcedNote`] traces back to — drives the
+/// TUI transcript gutter's `Z`/`I`/`G` provenance glyph. Kept separate from
+/// the plain `Note` variant (used for status/error text with no single
+/// engine behind it) so existing `Note` call sites are untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteSource {
+    Zindeks,
+    Ingat,
+    Git,
+}
+
 /// Events emitted during an agent run.
 #[derive(Debug, Clone)]
 pub enum KodeEvent {
@@ -44,6 +55,15 @@ pub enum KodeEvent {
     /// they see fit, e.g. `◆ {text}`).
     Note {
         text: String,
+    },
+    /// A `Note` with known single-engine provenance (zindeks/ingat/git),
+    /// emitted where the pipeline can attribute the fact to exactly one
+    /// source. Frontends render this distinctly (TUI: `Z`/`I`/`G` gutter;
+    /// headless: same as `Note`). Never emitted for multi-source or
+    /// no-source text — those stay plain `Note`.
+    SourcedNote {
+        text: String,
+        source: NoteSource,
     },
     /// Emitted once a task's agent loop (including any verification retry)
     /// has fully completed, carrying the final summary counters.
@@ -124,5 +144,22 @@ mod tests {
     fn emit_with_no_subscribers_does_not_panic() {
         let bus = EventBus::new(8);
         bus.emit(KodeEvent::AgentStarted);
+    }
+
+    #[tokio::test]
+    async fn sourced_note_round_trips_with_its_source() {
+        let bus = EventBus::new(8);
+        let mut rx = bus.subscribe();
+        bus.emit(KodeEvent::SourcedNote {
+            text: "zindeks index refreshed".to_string(),
+            source: NoteSource::Zindeks,
+        });
+        match rx.recv().await.unwrap() {
+            KodeEvent::SourcedNote { text, source } => {
+                assert_eq!(text, "zindeks index refreshed");
+                assert_eq!(source, NoteSource::Zindeks);
+            }
+            other => panic!("expected SourcedNote, got {other:?}"),
+        }
     }
 }

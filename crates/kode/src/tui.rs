@@ -14,9 +14,10 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use futures::StreamExt;
+use kode_context::git::{NumstatRow, RepoState};
 use kode_core::CancellationToken;
 use kode_core::config::{KodeConfig, PermissionMode};
-use kode_core::event::{EventBus, KodeEvent, TaskStep};
+use kode_core::event::{EventBus, KodeEvent, NoteSource, TaskStep};
 use kode_tools::permission::PermissionHandler;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -93,6 +94,12 @@ pub enum Gutter {
     VerifySkip,
     /// A progress/degradation note.
     Note,
+    /// A knowledge-derived note attributed to zindeks.
+    Zindeks,
+    /// A knowledge-derived note attributed to ingat.
+    Ingat,
+    /// A knowledge-derived note attributed to git.
+    Git,
     /// An agent-level error.
     Error,
     /// Echoed user input.
@@ -186,10 +193,12 @@ pub struct LedgerState {
     pub objective: String,
     pub steps: Vec<(TaskStep, bool)>,
     pub verify_steps: Vec<(String, StepStatusLite)>,
-    pub last_change: Option<String>,
+    /// Real per-file `git diff --numstat` rows for the CURRENT CHANGE
+    /// section — refreshed by the same lazy git poll that drives the
+    /// breadcrumb's dirty indicator (see `spawn_git_poll`/`apply_repo_state`),
+    /// not by counting tool calls.
+    pub numstat: Vec<NumstatRow>,
     pub why: Vec<(WhySource, String)>,
-    apply_patch_calls: u32,
-    write_file_calls: u32,
 }
 
 impl Default for LedgerState {
@@ -203,10 +212,8 @@ impl Default for LedgerState {
                 (TaskStep::Verify, false),
             ],
             verify_steps: Vec::new(),
-            last_change: None,
+            numstat: Vec::new(),
             why: Vec::new(),
-            apply_patch_calls: 0,
-            write_file_calls: 0,
         }
     }
 }
@@ -217,25 +224,6 @@ impl LedgerState {
             objective,
             ..Default::default()
         }
-    }
-
-    /// Records a successful `apply_patch`/`write_file` tool finish and
-    /// recomputes `last_change`'s counter summary (e.g. `"apply_patch ×2 ·
-    /// write_file ×1"`). No-op for any other tool name.
-    fn record_change(&mut self, tool_name: &str) {
-        match tool_name {
-            "apply_patch" => self.apply_patch_calls += 1,
-            "write_file" => self.write_file_calls += 1,
-            _ => return,
-        }
-        let mut parts = Vec::new();
-        if self.apply_patch_calls > 0 {
-            parts.push(format!("apply_patch ×{}", self.apply_patch_calls));
-        }
-        if self.write_file_calls > 0 {
-            parts.push(format!("write_file ×{}", self.write_file_calls));
-        }
-        self.last_change = Some(parts.join(" · "));
     }
 }
 
@@ -299,6 +287,10 @@ pub struct AppState {
     /// Current git branch (`git branch --show-current`), best-effort, read
     /// once at startup. `None` when not a git repo / git unavailable.
     pub branch: Option<String>,
+    /// Working-tree dirty flag from the lazy git poll (TUI start + after
+    /// each task completes — see `spawn_git_poll`). Drives the breadcrumb's
+    /// dim `*` suffix on the branch segment.
+    pub dirty: bool,
     /// When the current run started, for the elapsed-time spinner label.
     pub run_started: Option<Instant>,
     /// Name of the tool currently running, if any (drives the spinner
@@ -366,6 +358,7 @@ impl AppState {
             knowledge_band_open: true,
             repo_dir: String::new(),
             branch: None,
+            dirty: false,
             run_started: None,
             current_tool: None,
             tool_started: None,
@@ -520,6 +513,25 @@ fn ledger_objective(task: &str) -> String {
     truncate_chars(first_line, 70)
 }
 
+/// Applies a lazily-polled `RepoState` (see `spawn_git_poll`) to `state`:
+/// the breadcrumb's dirty flag and the Ledger's CURRENT CHANGE numstat
+/// rows. Pure — no I/O, called from the `git_rx` arm of the event loop.
+fn apply_repo_state(state: &mut AppState, repo: RepoState) {
+    state.dirty = repo.dirty;
+    state.ledger.numstat = repo.numstat;
+}
+
+/// The Ledger's Change-step inline caption: `"{n} files changed"` when the
+/// git poll found diff rows, else `None` (no invented caption before the
+/// first poll resolves or on a clean tree).
+fn numstat_caption(numstat: &[NumstatRow]) -> Option<String> {
+    if numstat.is_empty() {
+        None
+    } else {
+        Some(format!("{} files changed", numstat.len()))
+    }
+}
+
 /// First whitespace-separated token of a `/resume` picker row (the session
 /// id) — rows are formatted `"<id>  <first-task>  · <N> turns"`.
 fn session_id_from_row(row: &str) -> String {
@@ -619,8 +631,6 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
                     Gutter::ToolFail,
                     format!("{name} failed"),
                 ));
-            } else {
-                state.ledger.record_change(&name);
             }
             state.current_tool = None;
             state.tool_started = None;
@@ -652,6 +662,14 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             state
                 .transcript
                 .push(TranscriptLine::new(Gutter::Note, text));
+        }
+        KodeEvent::SourcedNote { text, source } => {
+            let gutter = match source {
+                NoteSource::Zindeks => Gutter::Zindeks,
+                NoteSource::Ingat => Gutter::Ingat,
+                NoteSource::Git => Gutter::Git,
+            };
+            state.transcript.push(TranscriptLine::new(gutter, text));
         }
         KodeEvent::TaskFinished {
             iterations,
@@ -1256,6 +1274,18 @@ fn detect_branch(cwd: &Path) -> Option<String> {
     }
 }
 
+/// Spawns a non-blocking `git status`/`git diff --numstat` poll
+/// (`kode_context::git::repo_state`), sending the result back over `tx`.
+/// Called lazily — TUI start and after each task completes — never on a
+/// fixed interval, per the dirty-indicator/CURRENT CHANGE design.
+fn spawn_git_poll(cwd: std::path::PathBuf, tx: mpsc::UnboundedSender<RepoState>) {
+    tokio::spawn(async move {
+        if let Some(repo) = kode_context::git::repo_state(&cwd).await {
+            let _ = tx.send(repo);
+        }
+    });
+}
+
 /// Launches the interactive TUI. Runs until the user quits (Ctrl-C/'q' while
 /// idle) or the process is otherwise terminated. `continue_` resumes the
 /// latest session: transcript replayed, history armed for the model.
@@ -1311,6 +1341,9 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
         Arc::new(TuiPermission::new(perm_tx, state.auto_flag.clone()));
 
     let (picker_tx, mut picker_rx) = mpsc::unbounded_channel::<PickerLoaded>();
+
+    let (git_tx, mut git_rx) = mpsc::unbounded_channel::<RepoState>();
+    spawn_git_poll(cwd.to_path_buf(), git_tx.clone());
 
     let events = EventBus::new(256);
     let mut event_rx = events.subscribe();
@@ -1461,6 +1494,10 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                 &config.model.model,
                                 tool_calls,
                             );
+                            // Refresh the dirty flag + CURRENT CHANGE rows now
+                            // that the task's edits (if any) have landed —
+                            // same lazy poll as TUI start, no fixed interval.
+                            spawn_git_poll(cwd.to_path_buf(), git_tx.clone());
                         } else if is_agent_error {
                             state.pending_task = None;
                         }
@@ -1485,6 +1522,12 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                     state.picker.items = loaded.items;
                     state.picker.note = loaded.error;
                     state.picker.selected = 0;
+                }
+            }
+
+            repo = git_rx.recv() => {
+                if let Some(repo) = repo {
+                    apply_repo_state(&mut state, repo);
                 }
             }
 
@@ -1919,6 +1962,13 @@ fn gutter_prefix(gutter: &Gutter) -> (&'static str, Color) {
         Gutter::VerifyFail => ("V ", theme::ERR),
         Gutter::VerifySkip => ("V ", theme::DIM),
         Gutter::Note => ("· ", theme::DIM),
+        // Per DESIGN.md's decision log: the transcript gutter's Z/I glyphs
+        // stay their source colors (cyan/amber), but G renders dim — same
+        // literal spec as the item that introduced this gutter, distinct
+        // from the Knowledge Band's git-green `theme::G`.
+        Gutter::Zindeks => ("Z ", theme::Z),
+        Gutter::Ingat => ("I ", theme::I),
+        Gutter::Git => ("G ", theme::DIM),
         Gutter::Error => ("× ", theme::ERR),
         Gutter::User => ("› ", theme::MUTED),
     }
@@ -1950,7 +2000,14 @@ fn transcript_line_to_ratatui(line: &TranscriptLine) -> Line<'static> {
     // unbolded.
     if matches!(
         line.gutter,
-        Gutter::Tool | Gutter::ToolFail | Gutter::Verify | Gutter::VerifyFail | Gutter::VerifySkip
+        Gutter::Tool
+            | Gutter::ToolFail
+            | Gutter::Verify
+            | Gutter::VerifyFail
+            | Gutter::VerifySkip
+            | Gutter::Zindeks
+            | Gutter::Ingat
+            | Gutter::Git
     ) {
         prefix_style = prefix_style.add_modifier(Modifier::BOLD);
     }
@@ -2009,11 +2066,15 @@ fn breadcrumb_line(state: &AppState) -> Line<'static> {
     };
     let mut spans = vec![
         Span::styled(" kode", Style::default().fg(theme::DIM)),
-        Span::raw(format!(
-            "  {} · {branch} · {}/{model} · effort:{effort}",
-            state.repo_dir, state.status.provider
-        )),
+        Span::raw(format!("  {} · {branch}", state.repo_dir)),
     ];
+    if state.dirty {
+        spans.push(Span::styled("*", Style::default().fg(theme::DIM)));
+    }
+    spans.push(Span::raw(format!(
+        " · {}/{model} · effort:{effort}",
+        state.status.provider
+    )));
     if !model_set {
         spans.push(Span::styled(" — /model", Style::default().fg(theme::DIM)));
     }
@@ -2051,6 +2112,18 @@ fn breadcrumb_line(state: &AppState) -> Line<'static> {
 /// Only the leading source glyph is bold+colored; the fact text itself
 /// renders in its normal weight (glyph-only bold, per `DESIGN.md`). Sources
 /// with empty vecs render nothing.
+/// Splits a trailing `" ┄ 0.87"` confidence suffix (appended by
+/// `pipeline::ingat_lines`) off an ingat knowledge line, so it can render
+/// dim and separate from the amber/italic ingat text — never baked into
+/// the same color, per DESIGN.md ("color = provenance, never decoration").
+/// `(line, None)` when no such suffix is present.
+fn split_ingat_confidence(line: &str) -> (&str, Option<&str>) {
+    match line.rfind(" \u{2504} ") {
+        Some(idx) => (&line[..idx], Some(&line[idx + " \u{2504} ".len()..])),
+        None => (line, None),
+    }
+}
+
 fn knowledge_band_lines(ks: &KnowledgeState) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
 
@@ -2073,6 +2146,7 @@ fn knowledge_band_lines(ks: &KnowledgeState) -> Vec<Line<'static>> {
     }
 
     if let Some(first) = ks.ingat.first() {
+        let (text, confidence) = split_ingat_confidence(first);
         let mut spans = vec![
             Span::raw(" KNOWS  "),
             Span::styled(
@@ -2080,10 +2154,16 @@ fn knowledge_band_lines(ks: &KnowledgeState) -> Vec<Line<'static>> {
                 Style::default().fg(theme::I).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("\u{201c}{first}\u{201d}"),
+                format!("\u{201c}{text}\u{201d}"),
                 Style::default().fg(theme::I).add_modifier(Modifier::ITALIC),
             ),
         ];
+        if let Some(score) = confidence {
+            spans.push(Span::styled(
+                format!(" \u{2504} {score}"),
+                Style::default().fg(theme::DIM),
+            ));
+        }
         if ks.ingat.len() > 1 {
             spans.push(Span::styled(
                 format!(" +{} more", ks.ingat.len() - 1),
@@ -2114,26 +2194,44 @@ fn knowledge_band_lines(ks: &KnowledgeState) -> Vec<Line<'static>> {
     lines
 }
 
+/// One `aperture_lines` row: (source glyph, optional lead-in label, text,
+/// text style, optional dim confidence suffix — ingat only).
+type ApertureRow = (
+    &'static str,
+    Option<&'static str>,
+    String,
+    Style,
+    Option<String>,
+);
+
 /// Builds the Knowledge Aperture's content lines (not including the
 /// trailing rule): a bold header, a request tree of up to the first 2
 /// zindeks facts + first ingat memory + first git line (tree connectors
 /// `─┬─`/`├─`/`└─`, last present row gets `└─`), then a context summary
 /// row. Rows are skipped for empty sources — never a decorative fake.
 fn aperture_lines(ks: &KnowledgeState) -> Vec<Line<'static>> {
-    let mut rows: Vec<(&'static str, Option<&'static str>, String, Style)> = Vec::new();
+    let mut rows: Vec<ApertureRow> = Vec::new();
     for z in ks.zindeks.iter().take(2) {
-        rows.push(("Z", None, z.clone(), Style::default().fg(theme::Z)));
+        rows.push(("Z", None, z.clone(), Style::default().fg(theme::Z), None));
     }
     if let Some(entry) = ks.ingat.first() {
+        let (text, confidence) = split_ingat_confidence(entry);
         rows.push((
             "I",
             Some("recalled: "),
-            format!("\u{201c}{entry}\u{201d}"),
+            format!("\u{201c}{text}\u{201d}"),
             Style::default().fg(theme::I).add_modifier(Modifier::ITALIC),
+            confidence.map(|s| s.to_string()),
         ));
     }
     if let Some(git_line) = ks.git.first() {
-        rows.push(("G", None, git_line.clone(), Style::default().fg(theme::G)));
+        rows.push((
+            "G",
+            None,
+            git_line.clone(),
+            Style::default().fg(theme::G),
+            None,
+        ));
     }
 
     let mut lines = vec![Line::from(Span::styled(
@@ -2144,7 +2242,7 @@ fn aperture_lines(ks: &KnowledgeState) -> Vec<Line<'static>> {
     ))];
 
     let last = rows.len().saturating_sub(1);
-    for (idx, (src, label, text, style)) in rows.into_iter().enumerate() {
+    for (idx, (src, label, text, style, confidence)) in rows.into_iter().enumerate() {
         let (lead, connector) = if idx == 0 {
             (" request ", "─┬─ ")
         } else if idx == last {
@@ -2161,6 +2259,12 @@ fn aperture_lines(ks: &KnowledgeState) -> Vec<Line<'static>> {
             row_spans.push(Span::styled(label, Style::default().fg(theme::MUTED)));
         }
         row_spans.push(Span::styled(text, style));
+        if let Some(score) = confidence {
+            row_spans.push(Span::styled(
+                format!(" \u{2504} {score}"),
+                Style::default().fg(theme::DIM),
+            ));
+        }
         lines.push(Line::from(row_spans));
     }
 
@@ -2449,7 +2553,7 @@ fn draw_ledger(f: &mut ratatui::Frame, area: ratatui::layout::Rect, ledger: &Led
         };
 
         let caption = match step {
-            TaskStep::Change => ledger.last_change.clone(),
+            TaskStep::Change => numstat_caption(&ledger.numstat),
             TaskStep::Verify if !ledger.verify_steps.is_empty() => Some(
                 ledger
                     .verify_steps
@@ -2492,13 +2596,33 @@ fn draw_ledger(f: &mut ratatui::Frame, area: ratatui::layout::Rect, ledger: &Led
             .fg(theme::MUTED)
             .add_modifier(Modifier::BOLD),
     )));
-    lines.push(match &ledger.last_change {
-        Some(change) => Line::from(Span::raw(format!("   {change}"))),
-        None => Line::from(Span::styled(
+    if ledger.numstat.is_empty() {
+        lines.push(Line::from(Span::styled(
             "   no edits yet",
             Style::default().fg(theme::DIM),
-        )),
-    });
+        )));
+    } else {
+        const MAX_ROWS: usize = 3;
+        for row in ledger.numstat.iter().take(MAX_ROWS) {
+            // Diff isn't a Z/I/G provenance source, so per DESIGN.md ("color
+            // = provenance, never decoration") the whole row stays dim/plain
+            // — only the `+`/`-` glyphs (already in the vocabulary) carry
+            // meaning, not color.
+            lines.push(Line::from(vec![
+                Span::raw(format!("   {}  ", row.path)),
+                Span::styled(
+                    format!("+{} -{}", row.added, row.deleted),
+                    Style::default().fg(theme::DIM),
+                ),
+            ]));
+        }
+        if ledger.numstat.len() > MAX_ROWS {
+            lines.push(Line::from(Span::styled(
+                format!("   +{} more", ledger.numstat.len() - MAX_ROWS),
+                Style::default().fg(theme::DIM),
+            )));
+        }
+    }
 
     if !ledger.why.is_empty() {
         lines.push(Line::default());
@@ -3004,8 +3128,18 @@ mod tests {
         assert_eq!(gutter_prefix(&Gutter::ToolFail).0, "T▸");
         assert_eq!(gutter_prefix(&Gutter::Verify).0, "V ");
         assert_eq!(gutter_prefix(&Gutter::Note).0, "· ");
+        assert_eq!(gutter_prefix(&Gutter::Zindeks).0, "Z ");
+        assert_eq!(gutter_prefix(&Gutter::Ingat).0, "I ");
+        assert_eq!(gutter_prefix(&Gutter::Git).0, "G ");
         assert_eq!(gutter_prefix(&Gutter::Error).0, "× ");
         assert_eq!(gutter_prefix(&Gutter::User).0, "› ");
+    }
+
+    #[test]
+    fn gutter_prefix_zindeks_ingat_git_use_distinct_colors() {
+        assert_eq!(gutter_prefix(&Gutter::Zindeks).1, theme::Z);
+        assert_eq!(gutter_prefix(&Gutter::Ingat).1, theme::I);
+        assert_eq!(gutter_prefix(&Gutter::Git).1, theme::DIM);
     }
 
     // -- slash commands -----------------------------------------------
@@ -3565,19 +3699,14 @@ mod tests {
         assert_eq!(s.ledger.objective, "second task");
     }
 
-    // -- last_change counter accumulation ------------------------------------
+    // -- ledger numstat / dirty poll -----------------------------------------
 
     #[test]
-    fn tool_finished_apply_patch_and_write_file_accumulate_last_change() {
+    fn tool_finished_never_touches_ledger_numstat() {
+        // CURRENT CHANGE rows come solely from the lazy git poll
+        // (`apply_repo_state`), not from counting tool calls — ToolFinished
+        // (success, failure, apply_patch, or otherwise) is a no-op for it.
         let mut s = state();
-        apply_event(
-            &mut s,
-            KodeEvent::ToolFinished {
-                name: "apply_patch".into(),
-                ok: true,
-            },
-        );
-        assert_eq!(s.ledger.last_change, Some("apply_patch ×1".to_string()));
         apply_event(
             &mut s,
             KodeEvent::ToolFinished {
@@ -3592,23 +3721,6 @@ mod tests {
                 ok: true,
             },
         );
-        assert_eq!(
-            s.ledger.last_change,
-            Some("apply_patch ×2 · write_file ×1".to_string())
-        );
-    }
-
-    #[test]
-    fn tool_finished_other_tool_or_failure_does_not_touch_last_change() {
-        let mut s = state();
-        apply_event(
-            &mut s,
-            KodeEvent::ToolFinished {
-                name: "read_file".into(),
-                ok: true,
-            },
-        );
-        assert_eq!(s.ledger.last_change, None);
         apply_event(
             &mut s,
             KodeEvent::ToolFinished {
@@ -3616,7 +3728,105 @@ mod tests {
                 ok: false,
             },
         );
-        assert_eq!(s.ledger.last_change, None);
+        assert!(s.ledger.numstat.is_empty());
+    }
+
+    #[test]
+    fn apply_repo_state_sets_dirty_and_ledger_numstat() {
+        let mut s = state();
+        assert!(!s.dirty);
+        assert!(s.ledger.numstat.is_empty());
+
+        apply_repo_state(
+            &mut s,
+            RepoState {
+                dirty: true,
+                numstat: vec![NumstatRow {
+                    path: "src/foo.rs".to_string(),
+                    added: 3,
+                    deleted: 1,
+                }],
+            },
+        );
+
+        assert!(s.dirty);
+        assert_eq!(s.ledger.numstat.len(), 1);
+        assert_eq!(s.ledger.numstat[0].path, "src/foo.rs");
+    }
+
+    #[test]
+    fn numstat_caption_none_when_empty_some_with_file_count() {
+        assert_eq!(numstat_caption(&[]), None);
+        let rows = vec![
+            NumstatRow {
+                path: "a.rs".to_string(),
+                added: 1,
+                deleted: 0,
+            },
+            NumstatRow {
+                path: "b.rs".to_string(),
+                added: 0,
+                deleted: 2,
+            },
+        ];
+        assert_eq!(numstat_caption(&rows), Some("2 files changed".to_string()));
+    }
+
+    #[test]
+    fn split_ingat_confidence_extracts_dim_suffix() {
+        assert_eq!(
+            split_ingat_confidence("always prefix with rtk \u{2504} 0.87"),
+            ("always prefix with rtk", Some("0.87"))
+        );
+        assert_eq!(
+            split_ingat_confidence("always prefix with rtk"),
+            ("always prefix with rtk", None)
+        );
+    }
+
+    #[test]
+    fn breadcrumb_line_shows_dim_asterisk_when_dirty() {
+        let mut s = state();
+        s.branch = Some("main".to_string());
+        s.dirty = true;
+        let text = line_text(&breadcrumb_line(&s));
+        assert!(text.contains("main*"));
+    }
+
+    #[test]
+    fn breadcrumb_line_no_asterisk_when_clean() {
+        let mut s = state();
+        s.branch = Some("main".to_string());
+        s.dirty = false;
+        let text = line_text(&breadcrumb_line(&s));
+        assert!(!text.contains("main*"));
+        assert!(text.contains("main "));
+    }
+
+    #[test]
+    fn sourced_note_pushes_matching_gutter() {
+        let mut s = state();
+        apply_event(
+            &mut s,
+            KodeEvent::SourcedNote {
+                text: "zindeks index refreshed".into(),
+                source: NoteSource::Zindeks,
+            },
+        );
+        apply_event(
+            &mut s,
+            KodeEvent::SourcedNote {
+                text: "engineering memory unavailable".into(),
+                source: NoteSource::Ingat,
+            },
+        );
+        assert_eq!(
+            s.transcript,
+            vec![
+                TranscriptLine::new(Gutter::Zindeks, "zindeks index refreshed"),
+                TranscriptLine::new(Gutter::Ingat, "engineering memory unavailable"),
+            ]
+        );
     }
 
     // -- ledger objective / why derivation -----------------------------------
