@@ -98,6 +98,17 @@ Note: the TOML key is `default`, not `default_mode` (the Rust field is renamed v
 default = "ask"
 ```
 
+## `[ui]`
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `reduced_motion` | bool | `false` | When `true`, kills the TUI's motion set: spinner glyph animation (static frame instead), the knowledge-band evidence-row dim→normal fade, and the Ledger active-marker pulse. Streaming coalescing (buffering model output before it hits the transcript) stays active regardless — it's buffering, not motion. |
+
+```toml
+[ui]
+reduced_motion = false
+```
+
 ## `[mcp.servers.<name>]`
 
 User-defined external MCP servers, distinct from the first-class `zindeks`/`ingat` integrations above. Each server is keyed by an arbitrary name under `[mcp.servers]`; its tools register into the tool runtime as `{server}__{tool}`.
@@ -148,6 +159,9 @@ default = "ask"
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-everything"]
 enabled = true
+
+[ui]
+reduced_motion = false
 ```
 
 Every section is optional. Any key you omit falls back to the default listed above; `kode` writes back only the keys it changes (for example `/model` or `/effort` in the TUI), preserving everything else already in the file, including unknown keys from a future version.

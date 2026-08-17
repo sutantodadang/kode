@@ -69,6 +69,10 @@ fn default_permission_mode() -> PermissionMode {
     PermissionMode::Ask
 }
 
+fn default_reduced_motion() -> bool {
+    false
+}
+
 /// Top-level Kode configuration, loaded from `.kode/config.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -79,6 +83,7 @@ pub struct KodeConfig {
     pub agent: AgentConfig,
     pub permissions: PermissionsConfig,
     pub mcp: McpConfig,
+    pub ui: UiConfig,
 }
 
 impl KodeConfig {
@@ -320,6 +325,26 @@ pub enum PermissionMode {
     Deny,
 }
 
+/// TUI motion preferences. Per `DESIGN.md`'s Motion section: `[ui]
+/// reduced_motion = true` kills spinner glyph animation, the knowledge-band
+/// evidence-row dim→normal fade, and the Ledger active-marker pulse.
+/// Streaming coalescing (buffering deltas before they hit the transcript)
+/// stays active regardless — it's buffering, not motion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    #[serde(default = "default_reduced_motion")]
+    pub reduced_motion: bool,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            reduced_motion: default_reduced_motion(),
+        }
+    }
+}
+
 /// Configuration for user-defined external MCP (Model Context Protocol)
 /// servers, distinct from the first-class `[zindeks]`/`[ingat]` integrations.
 /// Each entry's tools register into the tool runtime as `{server}__{tool}`.
@@ -397,6 +422,37 @@ mod tests {
         assert_eq!(cfg.agent.history_budget_tokens, 6000);
         assert_eq!(cfg.permissions.default_mode, PermissionMode::Ask);
         assert!(cfg.mcp.servers.is_empty());
+        assert!(!cfg.ui.reduced_motion);
+    }
+
+    #[test]
+    fn ui_reduced_motion_toml_roundtrip() {
+        let dir = temp_project_dir();
+        let kode_dir = dir.join(".kode");
+        std::fs::create_dir_all(&kode_dir).unwrap();
+        std::fs::write(
+            kode_dir.join("config.toml"),
+            "[ui]\nreduced_motion = true\n",
+        )
+        .unwrap();
+
+        let cfg = KodeConfig::load(&dir).unwrap();
+        assert!(cfg.ui.reduced_motion);
+    }
+
+    #[test]
+    fn ui_reduced_motion_defaults_false_when_section_absent() {
+        let dir = temp_project_dir();
+        let kode_dir = dir.join(".kode");
+        std::fs::create_dir_all(&kode_dir).unwrap();
+        std::fs::write(
+            kode_dir.join("config.toml"),
+            "[agent]\nmax_iterations = 5\n",
+        )
+        .unwrap();
+
+        let cfg = KodeConfig::load(&dir).unwrap();
+        assert!(!cfg.ui.reduced_motion);
     }
 
     #[test]

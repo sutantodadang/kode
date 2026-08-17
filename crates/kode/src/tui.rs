@@ -155,6 +155,13 @@ pub struct KnowledgeState {
     pub git: Vec<String>,
     pub context_tokens: usize,
     pub budget_tokens: usize,
+    /// `render_tick` (see `AppState::render_tick`) at which the current
+    /// `zindeks.first()` fact first appeared — carried over unchanged
+    /// across `Knowledge` events while that fact stays the same, reset
+    /// when it changes. Drives the knowledge-band dim→normal fade.
+    pub zindeks_since_tick: Option<u64>,
+    /// Same as `zindeks_since_tick`, for `ingat.first()`.
+    pub ingat_since_tick: Option<u64>,
 }
 
 /// Lightweight mirror of `kode_verify::StepStatus`, minus the skip reason
@@ -340,6 +347,22 @@ pub struct AppState {
     pub session_id: Option<String>,
     /// Task text of the in-flight run; consumed when TaskFinished arrives.
     pub pending_task: Option<String>,
+    /// `[ui].reduced_motion` from config. When true: spinner glyph is
+    /// static, knowledge-band evidence rows skip the dim→normal fade, and
+    /// the Ledger active marker doesn't pulse. Streaming coalescing stays
+    /// active regardless — it's buffering, not motion.
+    pub reduced_motion: bool,
+    /// Monotonic counter bumped once per ~100ms UI tick (see `run`'s
+    /// `aperture_tick`), used only to timestamp when a knowledge-band
+    /// evidence row first appeared, for the dim→normal fade.
+    pub render_tick: u64,
+    /// Buffered `ModelToken` deltas not yet flushed into `current_stream`
+    /// (and therefore not yet visible). Flushed on a word/whitespace
+    /// boundary or a 120ms timer — see `should_flush_stream_buffer`.
+    stream_pending: String,
+    /// When the current `stream_pending` buffering window started; `None`
+    /// while the buffer is empty / just flushed.
+    stream_last_flush: Option<Instant>,
 }
 
 impl AppState {
@@ -377,6 +400,10 @@ impl AppState {
             history: Vec::new(),
             session_id: None,
             pending_task: None,
+            reduced_motion: false,
+            render_tick: 0,
+            stream_pending: String::new(),
+            stream_last_flush: None,
         }
     }
 
@@ -399,6 +426,8 @@ impl AppState {
         self.tool_started = None;
         self.response_buf.clear();
         self.md_in_code_block = false;
+        self.stream_pending.clear();
+        self.stream_last_flush = None;
         self.pending_task = Some(task.to_string());
     }
 }
@@ -554,6 +583,18 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// is flushed into the transcript before non-token events are processed, so
 /// the transcript always reads as a sequence of complete lines.
 pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
+    // Any non-token event ends the current streaming window: drain
+    // whatever's still buffered (not yet flushed to the visible stream)
+    // into `current_stream` unconditionally, so no trailing text is lost
+    // when a tool call/finish/etc. interrupts mid-word.
+    if !matches!(ev, KodeEvent::ModelToken { .. }) {
+        if !state.stream_pending.is_empty() {
+            let pending = std::mem::take(&mut state.stream_pending);
+            state.current_stream.push_str(&pending);
+        }
+        state.stream_last_flush = None;
+    }
+
     if !matches!(ev, KodeEvent::ModelToken { .. }) && !state.current_stream.is_empty() {
         let text = std::mem::take(&mut state.current_stream);
         state.response_buf.push_str(&text);
@@ -596,9 +637,26 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             state.current_tool = None;
         }
         KodeEvent::ModelToken { text } => {
-            state.current_stream.push_str(&text);
+            // Coalesce: buffer deltas and only flush into the visible
+            // `current_stream` on a word/whitespace boundary or once the
+            // 120ms window elapses — avoids a character-typewriter effect
+            // and keeps the transcript the single moving region while a
+            // stream is producing (spinner freezes — see `spinner_glyph`).
+            if state.stream_pending.is_empty() {
+                state.stream_last_flush = Some(Instant::now());
+            }
+            state.stream_pending.push_str(&text);
             if let Some(ap) = &mut state.aperture {
                 ap.trigger_seen = true;
+            }
+            let elapsed = state
+                .stream_last_flush
+                .map(|t| t.elapsed())
+                .unwrap_or(Duration::ZERO);
+            if should_flush_stream_buffer(&state.stream_pending, elapsed) {
+                let pending = std::mem::take(&mut state.stream_pending);
+                state.current_stream.push_str(&pending);
+                state.stream_last_flush = None;
             }
         }
         KodeEvent::ToolRequested { .. } => {}
@@ -698,12 +756,35 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             context_tokens,
             budget_tokens,
         } => {
+            let prev = state.knowledge.as_ref();
+            let zindeks_since_tick = match zindeks.first() {
+                Some(f)
+                    if prev.and_then(|k| k.zindeks.first()).map(String::as_str)
+                        == Some(f.as_str()) =>
+                {
+                    prev.and_then(|k| k.zindeks_since_tick)
+                }
+                Some(_) => Some(state.render_tick),
+                None => None,
+            };
+            let ingat_since_tick = match ingat.first() {
+                Some(f)
+                    if prev.and_then(|k| k.ingat.first()).map(String::as_str)
+                        == Some(f.as_str()) =>
+                {
+                    prev.and_then(|k| k.ingat_since_tick)
+                }
+                Some(_) => Some(state.render_tick),
+                None => None,
+            };
             let ks = KnowledgeState {
                 zindeks,
                 ingat,
                 git,
                 context_tokens,
                 budget_tokens,
+                zindeks_since_tick,
+                ingat_since_tick,
             };
             state.ledger.why = ledger_why_from(&ks);
             // The Aperture is a code-intelligence moment — it opens only
@@ -1311,6 +1392,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
     state.branch = detect_branch(cwd);
     state.zindeks_enabled = config.zindeks.enabled;
     state.ingat_enabled = config.ingat.enabled;
+    state.reduced_motion = config.ui.reduced_motion;
 
     if let Some(hint) = startup_hint(
         &config.model.provider,
@@ -1532,6 +1614,10 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
             }
 
             _ = aperture_tick.tick() => {
+                // Also the render-tick clock for the knowledge-band
+                // dim→normal fade (item 3) — a new evidence row is dim for
+                // its first 2 of these ~100ms ticks.
+                state.render_tick = state.render_tick.wrapping_add(1);
                 if let Some(ap) = &state.aperture
                     && aperture_should_collapse(ap.received_at, Instant::now(), ap.trigger_seen)
                 {
@@ -1940,6 +2026,60 @@ fn spinner_frame(elapsed_ms: u128) -> char {
     SPINNER_FRAMES[idx]
 }
 
+/// The spinner glyph to actually render: cycles through `SPINNER_FRAMES` at
+/// 4 Hz normally, but holds a single static frame when `reduced_motion` is
+/// on (`[ui] reduced_motion`, item 1) or a token stream is actively
+/// producing (`streaming`, item 2 — the transcript is the one moving
+/// region while tokens flow; the spinner resumes once no tokens are in
+/// flight).
+fn spinner_glyph(elapsed_ms: u128, reduced_motion: bool, streaming: bool) -> char {
+    if reduced_motion || streaming {
+        SPINNER_FRAMES[2]
+    } else {
+        spinner_frame(elapsed_ms)
+    }
+}
+
+/// Whether buffered stream deltas should flush into the visible transcript
+/// now: true on a word/whitespace boundary (the buffer ends in whitespace)
+/// or once `elapsed_since_window_start` reaches the 120ms coalescing
+/// window — whichever comes first. An empty buffer never flushes. Pure so
+/// the coalescing policy (item 2) is unit-testable without a real clock.
+fn should_flush_stream_buffer(buf: &str, elapsed_since_window_start: Duration) -> bool {
+    if buf.is_empty() {
+        return false;
+    }
+    buf.ends_with(char::is_whitespace) || elapsed_since_window_start >= Duration::from_millis(120)
+}
+
+/// Whether a knowledge-band evidence row inserted at `since_tick` should
+/// still render dim at `current_tick`: true for its first 2 render ticks,
+/// normal from the 3rd (`DESIGN.md`: "New Z/I evidence steps dim→normal
+/// over 3 frames"). A row with no recorded insertion tick, or when
+/// `reduced_motion` is on, always renders normal. Pure so the fade policy
+/// (item 3) is unit-testable without driving the real tick loop.
+fn evidence_row_dim(current_tick: u64, since_tick: Option<u64>, reduced_motion: bool) -> bool {
+    if reduced_motion {
+        return false;
+    }
+    match since_tick {
+        Some(t) => current_tick.saturating_sub(t) < 2,
+        None => false,
+    }
+}
+
+/// The Ledger's active-step marker glyph: alternates `●`/`◉` at 4 Hz
+/// (250ms period) while a task is running; static `●` when idle or
+/// `reduced_motion` is on. Per `DESIGN.md`: active-step marker `●/◉` at
+/// 4 Hz (item 4).
+fn ledger_pulse_glyph(elapsed_ms: u128, running: bool, reduced_motion: bool) -> char {
+    if running && !reduced_motion && !(elapsed_ms / 250).is_multiple_of(2) {
+        '◉'
+    } else {
+        '●'
+    }
+}
+
 /// Aperture's contraction decision: it never collapses before a
 /// `ToolStarted`/`ModelToken` trigger has been seen, and — per `DESIGN.md`
 /// motion rules — never earlier than 900ms after it appeared, so it's
@@ -2124,17 +2264,29 @@ fn split_ingat_confidence(line: &str) -> (&str, Option<&str>) {
     }
 }
 
-fn knowledge_band_lines(ks: &KnowledgeState) -> Vec<Line<'static>> {
+fn knowledge_band_lines(
+    ks: &KnowledgeState,
+    current_tick: u64,
+    reduced_motion: bool,
+) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
 
     if let Some(first) = ks.zindeks.first() {
+        let dim = evidence_row_dim(current_tick, ks.zindeks_since_tick, reduced_motion);
+        let glyph_style = if dim {
+            Style::default().fg(theme::DIM).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::Z).add_modifier(Modifier::BOLD)
+        };
+        let text_style = if dim {
+            Style::default().fg(theme::DIM)
+        } else {
+            Style::default()
+        };
         let mut spans = vec![
             Span::raw(" KNOWS  "),
-            Span::styled(
-                "Z ",
-                Style::default().fg(theme::Z).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(first.clone()),
+            Span::styled("Z ", glyph_style),
+            Span::styled(first.clone(), text_style),
         ];
         if ks.zindeks.len() > 1 {
             spans.push(Span::styled(
@@ -2147,16 +2299,21 @@ fn knowledge_band_lines(ks: &KnowledgeState) -> Vec<Line<'static>> {
 
     if let Some(first) = ks.ingat.first() {
         let (text, confidence) = split_ingat_confidence(first);
+        let dim = evidence_row_dim(current_tick, ks.ingat_since_tick, reduced_motion);
+        let glyph_style = if dim {
+            Style::default().fg(theme::DIM).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::I).add_modifier(Modifier::BOLD)
+        };
+        let text_style = if dim {
+            Style::default().fg(theme::DIM)
+        } else {
+            Style::default().fg(theme::I).add_modifier(Modifier::ITALIC)
+        };
         let mut spans = vec![
             Span::raw(" KNOWS  "),
-            Span::styled(
-                "I ",
-                Style::default().fg(theme::I).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("\u{201c}{text}\u{201d}"),
-                Style::default().fg(theme::I).add_modifier(Modifier::ITALIC),
-            ),
+            Span::styled("I ", glyph_style),
+            Span::styled(format!("\u{201c}{text}\u{201d}"), text_style),
         ];
         if let Some(score) = confidence {
             spans.push(Span::styled(
@@ -2306,7 +2463,10 @@ fn draw(f: &mut ratatui::Frame, state: &AppState) {
     } else if let Some(ap) = &state.aperture {
         Some(aperture_lines(&ap.knowledge))
     } else if knowledge_band_visible(state) {
-        state.knowledge.as_ref().map(knowledge_band_lines)
+        state
+            .knowledge
+            .as_ref()
+            .map(|ks| knowledge_band_lines(ks, state.render_tick, state.reduced_motion))
     } else {
         None
     };
@@ -2343,8 +2503,21 @@ fn draw(f: &mut ratatui::Frame, state: &AppState) {
         idx += 1;
     }
 
+    let elapsed_ms = state
+        .run_started
+        .map(|t| t.elapsed())
+        .unwrap_or_default()
+        .as_millis();
+
     if state.ledger_open {
-        draw_ledger(f, areas[idx], &state.ledger);
+        draw_ledger(
+            f,
+            areas[idx],
+            &state.ledger,
+            state.running,
+            elapsed_ms,
+            state.reduced_motion,
+        );
     } else {
         let mut text_lines: Vec<Line> = if show_empty_state(&state.transcript, state.running) {
             let mut lines = empty_state_lines(state);
@@ -2365,7 +2538,8 @@ fn draw(f: &mut ratatui::Frame, state: &AppState) {
         }
         if state.running {
             let elapsed = state.run_started.map(|t| t.elapsed()).unwrap_or_default();
-            let frame = spinner_frame(elapsed.as_millis());
+            let streaming = !state.current_stream.is_empty() || !state.stream_pending.is_empty();
+            let frame = spinner_glyph(elapsed.as_millis(), state.reduced_motion, streaming);
             let secs = elapsed.as_secs_f64();
             let label = match &state.current_tool {
                 Some(tool) => {
@@ -2516,10 +2690,18 @@ fn task_step_label(step: TaskStep) -> &'static str {
 }
 
 /// Renders the Ledger view (Ctrl+L): OBJECTIVE, the 4 numbered steps
-/// (`✓` done / `●` active / `○` pending — no borders, DIM rule spacing
-/// only), CURRENT CHANGE, and WHY. Every row traces to a real event; no
-/// invented captions.
-fn draw_ledger(f: &mut ratatui::Frame, area: ratatui::layout::Rect, ledger: &LedgerState) {
+/// (`✓` done / `●`/`◉` active pulse / `○` pending — no borders, DIM rule
+/// spacing only), CURRENT CHANGE, and WHY. Every row traces to a real
+/// event; no invented captions. `running`/`elapsed_ms`/`reduced_motion`
+/// drive the active marker's 4 Hz pulse (item 4).
+fn draw_ledger(
+    f: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    ledger: &LedgerState,
+    running: bool,
+    elapsed_ms: u128,
+    reduced_motion: bool,
+) {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     lines.push(Line::from(vec![
@@ -2542,8 +2724,14 @@ fn draw_ledger(f: &mut ratatui::Frame, area: ratatui::layout::Rect, ledger: &Led
         let (glyph, glyph_style) = if *done {
             ("✓", Style::default().fg(theme::OK))
         } else if first_undone == Some(i) {
+            let g: &'static str = if ledger_pulse_glyph(elapsed_ms, running, reduced_motion) == '◉'
+            {
+                "◉"
+            } else {
+                "●"
+            };
             (
-                "●",
+                g,
                 Style::default()
                     .fg(theme::MUTED)
                     .add_modifier(Modifier::BOLD),
@@ -2742,12 +2930,27 @@ mod tests {
     }
 
     #[test]
-    fn model_token_accumulates_into_current_stream() {
+    fn model_token_buffers_short_chunks_until_boundary() {
         let mut s = state();
         apply_event(&mut s, KodeEvent::ModelToken { text: "hel".into() });
         apply_event(&mut s, KodeEvent::ModelToken { text: "lo".into() });
-        assert_eq!(s.current_stream, "hello");
+        // "hello" has no word/whitespace boundary yet and is well under
+        // the 120ms coalescing window — buffered, not yet visible.
+        assert_eq!(s.current_stream, "");
         assert!(s.transcript.is_empty());
+
+        apply_event(&mut s, KodeEvent::ModelToken { text: " ".into() });
+        // Trailing whitespace is a boundary — flush now.
+        assert_eq!(s.current_stream, "hello ");
+
+        apply_event(
+            &mut s,
+            KodeEvent::ModelToken {
+                text: "world".into(),
+            },
+        );
+        // New chunk buffers again until the next boundary/flush.
+        assert_eq!(s.current_stream, "hello ");
     }
 
     #[test]
@@ -2951,12 +3154,145 @@ mod tests {
             git: vec!["3 files changed".to_string()],
             context_tokens: 100,
             budget_tokens: 16_000,
+            ..Default::default()
         };
-        let lines = knowledge_band_lines(&ks);
+        let lines = knowledge_band_lines(&ks, 5, false);
         assert_eq!(lines.len(), 3);
         assert!(line_text(&lines[0]).contains("+1 more"));
         assert!(line_text(&lines[1]).contains("+1 more"));
         assert!(!line_text(&lines[2]).contains("more"));
+    }
+
+    #[test]
+    fn knowledge_event_tracks_zindeks_row_insertion_tick_and_preserves_when_unchanged() {
+        let mut s = state();
+        s.render_tick = 3;
+        apply_event(
+            &mut s,
+            KodeEvent::Knowledge {
+                zindeks: vec!["src/foo.rs".to_string()],
+                ingat: vec![],
+                git: vec![],
+                context_tokens: 100,
+                budget_tokens: 1000,
+            },
+        );
+        assert_eq!(s.knowledge.as_ref().unwrap().zindeks_since_tick, Some(3));
+
+        s.render_tick = 4;
+        apply_event(
+            &mut s,
+            KodeEvent::Knowledge {
+                zindeks: vec!["src/foo.rs".to_string()],
+                ingat: vec![],
+                git: vec![],
+                context_tokens: 100,
+                budget_tokens: 1000,
+            },
+        );
+        // Same first fact — insertion tick preserved, not bumped.
+        assert_eq!(s.knowledge.as_ref().unwrap().zindeks_since_tick, Some(3));
+
+        s.render_tick = 9;
+        apply_event(
+            &mut s,
+            KodeEvent::Knowledge {
+                zindeks: vec!["src/bar.rs".to_string()],
+                ingat: vec![],
+                git: vec![],
+                context_tokens: 100,
+                budget_tokens: 1000,
+            },
+        );
+        // New fact — insertion tick resets to the current render_tick.
+        assert_eq!(s.knowledge.as_ref().unwrap().zindeks_since_tick, Some(9));
+    }
+
+    #[test]
+    fn evidence_row_dim_true_within_first_two_ticks() {
+        assert!(evidence_row_dim(0, Some(0), false));
+        assert!(evidence_row_dim(1, Some(0), false));
+    }
+
+    #[test]
+    fn evidence_row_dim_false_from_third_tick() {
+        assert!(!evidence_row_dim(2, Some(0), false));
+    }
+
+    #[test]
+    fn evidence_row_dim_false_when_reduced_motion() {
+        assert!(!evidence_row_dim(0, Some(0), true));
+    }
+
+    #[test]
+    fn evidence_row_dim_false_when_no_insertion_tick() {
+        assert!(!evidence_row_dim(5, None, false));
+    }
+
+    #[test]
+    fn should_flush_stream_buffer_true_on_whitespace_boundary() {
+        assert!(should_flush_stream_buffer(
+            "hello ",
+            Duration::from_millis(0)
+        ));
+    }
+
+    #[test]
+    fn should_flush_stream_buffer_true_after_120ms_even_mid_word() {
+        assert!(should_flush_stream_buffer(
+            "hel",
+            Duration::from_millis(120)
+        ));
+    }
+
+    #[test]
+    fn should_flush_stream_buffer_false_when_mid_word_and_recent() {
+        assert!(!should_flush_stream_buffer(
+            "hel",
+            Duration::from_millis(50)
+        ));
+    }
+
+    #[test]
+    fn should_flush_stream_buffer_false_when_empty() {
+        assert!(!should_flush_stream_buffer("", Duration::from_millis(999)));
+    }
+
+    #[test]
+    fn spinner_glyph_animates_normally() {
+        assert_eq!(spinner_glyph(0, false, false), spinner_frame(0));
+        assert_eq!(spinner_glyph(250, false, false), spinner_frame(250));
+    }
+
+    #[test]
+    fn spinner_glyph_static_when_reduced_motion() {
+        assert_eq!(spinner_glyph(250, true, false), SPINNER_FRAMES[2]);
+        assert_eq!(spinner_glyph(500, true, false), SPINNER_FRAMES[2]);
+    }
+
+    #[test]
+    fn spinner_glyph_static_while_streaming() {
+        assert_eq!(spinner_glyph(250, false, true), SPINNER_FRAMES[2]);
+        assert_eq!(spinner_glyph(500, false, true), SPINNER_FRAMES[2]);
+    }
+
+    #[test]
+    fn ledger_pulse_glyph_static_when_idle() {
+        assert_eq!(ledger_pulse_glyph(250, false, false), '●');
+        assert_eq!(ledger_pulse_glyph(500, false, false), '●');
+    }
+
+    #[test]
+    fn ledger_pulse_glyph_static_when_reduced_motion() {
+        assert_eq!(ledger_pulse_glyph(250, true, true), '●');
+    }
+
+    #[test]
+    fn ledger_pulse_glyph_alternates_at_4hz_while_running() {
+        assert_eq!(ledger_pulse_glyph(0, true, false), '●');
+        assert_eq!(ledger_pulse_glyph(250, true, false), '◉');
+        assert_eq!(ledger_pulse_glyph(500, true, false), '●');
+        assert_eq!(ledger_pulse_glyph(750, true, false), '◉');
     }
 
     #[test]
@@ -4081,6 +4417,7 @@ mod tests {
             git: vec![],
             context_tokens: 100,
             budget_tokens: 16_000,
+            ..Default::default()
         };
         assert_eq!(
             input_suffix(Some(&ks)),
