@@ -8,7 +8,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind,
+    KeyModifiers, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -24,7 +27,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::pipeline;
@@ -1331,7 +1336,7 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
     }
 }
 
@@ -1374,7 +1379,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
     let mut config = KodeConfig::load(cwd).unwrap_or_default();
 
     enable_raw_mode()?;
-    execute!(std::io::stdout(), EnterAlternateScreen)?;
+    execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     let _guard = TerminalGuard;
 
     let backend = CrosstermBackend::new(std::io::stdout());
@@ -1434,7 +1439,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
     let mut current_cancel: Option<CancellationToken> = None;
     let mut aperture_tick = tokio::time::interval(Duration::from_millis(100));
 
-    terminal.draw(|f| draw(f, &state))?;
+    terminal.draw(|f| draw(f, &mut state))?;
 
     'outer: loop {
         tokio::select! {
@@ -1554,6 +1559,11 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                             }
                         }
                     }
+                    Some(Ok(Event::Mouse(mouse))) => {
+                        if !state.picker.open {
+                            handle_mouse(&mut state, mouse.kind);
+                        }
+                    }
                     Some(Ok(_)) => {}
                     Some(Err(_)) | None => break 'outer,
                 }
@@ -1626,7 +1636,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
             }
         }
 
-        terminal.draw(|f| draw(f, &state))?;
+        terminal.draw(|f| draw(f, &mut state))?;
     }
 
     if let Some(child) = current_cancel {
@@ -1745,6 +1755,37 @@ fn handle_key(
         _ => {}
     }
     false
+}
+
+/// Maps a mouse wheel event to a transcript scroll delta in lines: `-3` for
+/// wheel-up, `+3` for wheel-down. Every other mouse event kind (clicks,
+/// drags, moves) maps to `0` — this app has no click handling, terminal-
+/// native text selection is superseded by the `/copy` command instead.
+fn wheel_delta(kind: MouseEventKind) -> i32 {
+    match kind {
+        MouseEventKind::ScrollUp => -3,
+        MouseEventKind::ScrollDown => 3,
+        _ => 0,
+    }
+}
+
+/// Handles a mouse event, wheel-only: scrolls the transcript by
+/// `wheel_delta`'s 3-line step through the same unclamped-here,
+/// clamped-at-render path as `handle_key`'s arrow keys, and the same
+/// follow-mode semantics — wheel-up breaks follow (mirrors `KeyCode::Up`),
+/// wheel-down leaves it alone (mirrors `KeyCode::Down`). Non-wheel kinds
+/// are no-ops.
+fn handle_mouse(state: &mut AppState, kind: MouseEventKind) {
+    match wheel_delta(kind) {
+        0 => {}
+        d if d < 0 => {
+            state.scroll = state.scroll.saturating_sub(d.unsigned_abs() as u16);
+            state.follow = false;
+        }
+        d => {
+            state.scroll = state.scroll.saturating_add(d as u16);
+        }
+    }
 }
 
 /// Toggles auto mode (Shift+Tab): flips both the UI-visible `auto_mode`
@@ -2456,7 +2497,98 @@ fn draw_knowledge_band(
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn draw(f: &mut ratatui::Frame, state: &AppState) {
+/// Clamps a scroll offset to `[0, total_lines.saturating_sub(viewport_height)]`
+/// — the largest offset that still keeps rendered content filling the
+/// viewport. Content that fits within the viewport (or a zero-height
+/// viewport) always clamps to `0`. Pure and `u16`-safe: never panics on
+/// overflow/underflow at the type's edges.
+fn clamp_scroll(scroll: u16, total_lines: u16, viewport_height: u16) -> u16 {
+    let max_scroll = total_lines.saturating_sub(viewport_height);
+    scroll.min(max_scroll)
+}
+
+/// Decides whether the transcript scrollbar should render and, if so, the
+/// `(content_length, position)` pair for its `ScrollbarState`. Returns
+/// `None` when `total_lines` fits within `viewport_height` — the scrollbar
+/// auto-hides rather than drawing an inert full-length thumb.
+fn scrollbar_state(total_lines: u16, viewport_height: u16, scroll: u16) -> Option<(u16, u16)> {
+    if total_lines <= viewport_height {
+        return None;
+    }
+    Some((
+        total_lines,
+        clamp_scroll(scroll, total_lines, viewport_height),
+    ))
+}
+
+/// Caps a `usize` line count to `u16::MAX` before it feeds `AppState::scroll`
+/// or ratatui's `(u16, u16)` scroll offset.
+fn lines_as_u16(count: usize) -> u16 {
+    count.min(u16::MAX as usize) as u16
+}
+
+/// Approximates ratatui's `Wrap { trim: false }` word-wrapper for one
+/// logical line, returning how many rendered rows `content` takes at
+/// `width` columns. `Paragraph::line_count` (the exact version) is gated
+/// behind ratatui's unstable `rendered-line-info` feature, which this
+/// workspace doesn't enable, so this stands in for it. Uses `char` count as
+/// a display-width proxy — the transcript's approved glyph vocabulary
+/// (DESIGN.md) is narrow/single-width, so this tracks real wrapping closely
+/// without a unicode-width dependency.
+fn word_wrap_rows(content: &str, width: usize) -> usize {
+    if width == 0 {
+        return 0;
+    }
+    if content.is_empty() {
+        return 1;
+    }
+
+    let mut rows = 1usize;
+    let mut col = 0usize; // columns used on the row currently being built
+
+    for word in content.split(' ') {
+        let len = word.chars().count();
+        let gap = if col == 0 { 0 } else { 1 }; // a space before the word, unless starting a row
+
+        if len > width {
+            // A single word wider than the viewport: fill out the current
+            // row, then take as many full-width rows as it needs.
+            if col > 0 {
+                rows += 1;
+            }
+            let mut remaining = len;
+            while remaining > width {
+                rows += 1;
+                remaining -= width;
+            }
+            col = remaining;
+        } else if col + gap + len <= width {
+            col += gap + len;
+        } else {
+            rows += 1;
+            col = len;
+        }
+    }
+    rows
+}
+
+/// Sums `word_wrap_rows` across every line of `lines` at `width` columns —
+/// the fallback stand-in for `Paragraph::line_count(width)`.
+fn total_wrapped_rows(lines: &[Line<'static>], width: u16) -> usize {
+    if width == 0 {
+        return 0;
+    }
+    let width = width as usize;
+    lines
+        .iter()
+        .map(|line| {
+            let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            word_wrap_rows(&content, width)
+        })
+        .sum()
+}
+
+fn draw(f: &mut ratatui::Frame, state: &mut AppState) {
     let band_lines = if state.ledger_open {
         // The Ledger view replaces the band + transcript area entirely.
         None
@@ -2556,11 +2688,58 @@ fn draw(f: &mut ratatui::Frame, state: &AppState) {
                 Style::default().fg(theme::T),
             )));
         }
+        let transcript_area = areas[idx];
+
+        // Decide, at the full transcript width, whether a scrollbar column
+        // needs reserving. If it does, the text area narrows by one column
+        // — re-measure at that narrower width so wrap/clamp/scrollbar math
+        // all agree with what's actually rendered (narrowing can only add
+        // wrapped lines, never remove the overflow, so this never flaps).
+        let total_lines_full = lines_as_u16(total_wrapped_rows(&text_lines, transcript_area.width));
+        let scrollbar_needed = total_lines_full > transcript_area.height;
+        let (text_area, scrollbar_area) = if scrollbar_needed && transcript_area.width > 1 {
+            let cols = Layout::horizontal([Constraint::Min(1), Constraint::Length(1)])
+                .split(transcript_area);
+            (cols[0], Some(cols[1]))
+        } else {
+            (transcript_area, None)
+        };
+        let total_lines = if scrollbar_area.is_some() {
+            lines_as_u16(total_wrapped_rows(&text_lines, text_area.width))
+        } else {
+            total_lines_full
+        };
+        let viewport_height = text_area.height;
+
+        // Following pins to the bottom every frame so new content stays in
+        // view; otherwise the user's position is clamped to stay in range.
+        state.scroll = if state.follow {
+            total_lines.saturating_sub(viewport_height)
+        } else {
+            clamp_scroll(state.scroll, total_lines, viewport_height)
+        };
+
         let transcript = Paragraph::new(text_lines)
             .wrap(Wrap { trim: false })
-            .scroll((state.scroll, 0))
-            .block(Block::default().borders(Borders::NONE));
-        f.render_widget(transcript, areas[idx]);
+            .block(Block::default().borders(Borders::NONE))
+            .scroll((state.scroll, 0));
+        f.render_widget(transcript, text_area);
+
+        if let Some(area) = scrollbar_area
+            && let Some((content_len, position)) =
+                scrollbar_state(total_lines, viewport_height, state.scroll)
+        {
+            let mut sb_state =
+                ScrollbarState::new(content_len as usize).position(position as usize);
+            let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some("│"))
+                .thumb_symbol("│")
+                .track_style(Style::default().fg(theme::DIM))
+                .thumb_style(Style::default());
+            f.render_stateful_widget(bar, area, &mut sb_state);
+        }
     }
     idx += 1;
 
@@ -3384,6 +3563,89 @@ mod tests {
         assert!(!s.follow);
         handle_key(&mut s, KeyCode::PageDown, KeyModifiers::NONE, &None);
         assert_eq!(s.scroll, 14);
+    }
+
+    #[test]
+    fn wheel_delta_maps_scroll_kinds_only() {
+        assert_eq!(wheel_delta(MouseEventKind::ScrollUp), -3);
+        assert_eq!(wheel_delta(MouseEventKind::ScrollDown), 3);
+        assert_eq!(wheel_delta(MouseEventKind::Moved), 0);
+        assert_eq!(
+            wheel_delta(MouseEventKind::Down(crossterm::event::MouseButton::Left)),
+            0
+        );
+    }
+
+    #[test]
+    fn handle_mouse_scroll_updates_position_and_follow() {
+        let mut s = state();
+        s.scroll = 5;
+        handle_mouse(&mut s, MouseEventKind::ScrollUp);
+        assert_eq!(s.scroll, 2);
+        assert!(!s.follow);
+        handle_mouse(&mut s, MouseEventKind::ScrollDown);
+        assert_eq!(s.scroll, 5);
+    }
+
+    #[test]
+    fn handle_mouse_scroll_up_clamps_at_zero() {
+        let mut s = state();
+        s.scroll = 1;
+        handle_mouse(&mut s, MouseEventKind::ScrollUp);
+        assert_eq!(s.scroll, 0);
+    }
+
+    #[test]
+    fn handle_mouse_ignores_non_wheel_events() {
+        let mut s = state();
+        s.scroll = 5;
+        handle_mouse(
+            &mut s,
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        );
+        assert_eq!(s.scroll, 5);
+    }
+
+    #[test]
+    fn clamp_scroll_content_fits_clamps_to_zero() {
+        assert_eq!(clamp_scroll(0, 5, 10), 0);
+        assert_eq!(clamp_scroll(3, 5, 10), 0);
+    }
+
+    #[test]
+    fn clamp_scroll_overflow_keeps_in_range_position() {
+        // total=100, viewport=10 -> max_scroll=90; a mid-range position is
+        // untouched by clamping.
+        assert_eq!(clamp_scroll(50, 100, 10), 50);
+    }
+
+    #[test]
+    fn clamp_scroll_past_end_clamps_to_max() {
+        assert_eq!(clamp_scroll(1000, 100, 10), 90);
+    }
+
+    #[test]
+    fn clamp_scroll_u16_edges() {
+        // viewport taller than content: saturating_sub avoids underflow.
+        assert_eq!(clamp_scroll(u16::MAX, 5, 20), 0);
+        // total_lines and scroll both at the u16 ceiling.
+        assert_eq!(clamp_scroll(u16::MAX, u16::MAX, 0), u16::MAX);
+        // zero everywhere.
+        assert_eq!(clamp_scroll(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn scrollbar_state_hidden_when_content_fits() {
+        assert_eq!(scrollbar_state(5, 10, 0), None);
+        assert_eq!(scrollbar_state(10, 10, 0), None);
+    }
+
+    #[test]
+    fn scrollbar_state_visible_reports_length_and_clamped_position() {
+        assert_eq!(scrollbar_state(100, 10, 50), Some((100, 50)));
+        // scroll past the end still reports the clamped position, not the
+        // raw (out of range) one.
+        assert_eq!(scrollbar_state(100, 10, 1000), Some((100, 90)));
     }
 
     #[test]

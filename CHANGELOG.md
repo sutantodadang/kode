@@ -18,6 +18,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `[ui] reduced_motion` config to disable all TUI animation.
 - Stream coalescing (word-boundary or 120ms flush) with a frozen spinner
   while tokens stream; evidence-row fade-in; ledger active-marker pulse.
+- Transcript scrollbar (auto-hides when content fits) with proper scroll
+  clamping, and mouse wheel scrolling (3 lines per notch). Terminal text
+  selection is superseded by `/copy` while mouse capture is on.
 
 ## [0.1.0] - 2026-08-17
 
