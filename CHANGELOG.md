@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- One-command install: `scripts/install.sh` (`curl | sh`, Linux/macOS) and
+  `scripts/install.ps1` (`irm | iex`, Windows) resolve the latest (or a
+  pinned) GitHub release, verify the sha256 checksum, and install `kode` to
+  `~/.kode/bin` / `%LOCALAPPDATA%\kode\bin` with no `sudo`/admin required.
 - `kode update`: self-update from the latest GitHub release with consent
   prompt, sha256 verification, and in-place binary swap.
 - Transcript provenance gutter: knowledge-derived lines show `Z` (zindeks),
