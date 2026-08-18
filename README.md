@@ -63,6 +63,7 @@ kode --continue               # resume your last session
 | [Auth providers](docs/howto-auth-providers.md) | Setting up codex and opencode-family auth |
 | [Resume sessions](docs/howto-resume-sessions.md) | How session persistence and resume work |
 | [Custom commands](docs/howto-custom-commands.md) | Writing your own `/name` slash commands |
+| [Team memory](docs/howto-team-memory.md) | Sharing engineering memory with your team via git |
 | [CLI reference](docs/reference-cli.md) | Full command and flag reference |
 | [Config reference](docs/reference-config.md) | Configuration file and options |
 | [Architecture](docs/explanation-architecture.md) | How the crates and engines fit together |

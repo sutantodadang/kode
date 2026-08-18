@@ -8,6 +8,7 @@ use kode_tools::{RequiredPermission, Tool, ToolContext, ToolOutput};
 use crate::EngineeringMemory;
 use crate::policy::{self, PolicyDecision};
 use crate::types::{MemoryContext, MemoryKind, NewMemory, Provenance};
+use crate::wire::{self, WireEntry};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,6 +23,11 @@ struct Args {
     files: Vec<String>,
     #[serde(default)]
     symbols: Vec<String>,
+    /// Explicit opt-in to share this memory with the team via the
+    /// git-backed `.kode/memory/team.jsonl` file, in addition to the normal
+    /// (personal) Ingat write. Defaults to `false` — never inferred.
+    #[serde(default)]
+    team: bool,
 }
 
 /// A tool exposed to the model that lets it write durable engineering
@@ -58,7 +64,10 @@ impl Tool for RememberTool {
         "Store a DURABLE engineering fact you have verified — a project rule, \
          convention, architecture decision, known issue, build fact, rejected \
          approach, user preference, or historical solution. Do not use this for \
-         guesses, hypotheses, or anything you are not confident about."
+         guesses, hypotheses, or anything you are not confident about. Set \
+         `team: true` to also share it with the whole team via the git-backed \
+         `.kode/memory/team.jsonl` file (visible to everyone with repo access) — \
+         only do this when the user explicitly asked to share it."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -71,7 +80,11 @@ impl Tool for RememberTool {
                 "kind": { "type": "string", "enum": kinds },
                 "tags": { "type": "array", "items": { "type": "string" } },
                 "files": { "type": "array", "items": { "type": "string" } },
-                "symbols": { "type": "array", "items": { "type": "string" } }
+                "symbols": { "type": "array", "items": { "type": "string" } },
+                "team": {
+                    "type": "boolean",
+                    "description": "Share with the whole team (git-backed team.jsonl), not just this machine. Defaults to false."
+                }
             },
             "required": ["summary", "kind"]
         })
@@ -84,7 +97,7 @@ impl Tool for RememberTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> kode_tools::error::Result<ToolOutput> {
         let args: Args = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
             tool: self.name().to_string(),
@@ -128,6 +141,7 @@ impl Tool for RememberTool {
                 symbols: args.symbols,
                 ..Default::default()
             },
+            team: args.team,
         };
 
         let id = self
@@ -136,9 +150,16 @@ impl Tool for RememberTool {
             .await
             .map_err(|e| ToolError::Failed(e.to_string()))?;
 
-        Ok(ToolOutput {
-            content: format!("remembered ({}): {id}", new_memory.kind.as_kebab()),
-        })
+        let mut content = format!("remembered ({}): {id}", new_memory.kind.as_kebab());
+        if new_memory.team {
+            let entry = WireEntry::new(&new_memory, None);
+            let path = wire::team_file_path(&ctx.workspace_root);
+            wire::append_entry(&path, &entry)
+                .map_err(|e| ToolError::Failed(format!("team memory write failed: {e}")))?;
+            content.push_str(&format!(" (shared: {})", path.display()));
+        }
+
+        Ok(ToolOutput { content })
     }
 }
 
@@ -151,6 +172,25 @@ mod tests {
     fn ctx() -> ToolContext {
         ToolContext {
             workspace_root: std::env::temp_dir(),
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    /// A fresh, unique workspace root for tests that write files (the
+    /// shared `ctx()` root above is fine for tests that only exercise
+    /// `MockEngineeringMemory`, which never touches disk).
+    fn temp_workspace(label: &str) -> ToolContext {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "kode-memory-tool-test-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        ToolContext {
+            workspace_root: dir,
             cancel: CancellationToken::new(),
         }
     }
@@ -236,5 +276,58 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, ToolError::InvalidArgs { .. }));
+    }
+
+    #[tokio::test]
+    async fn team_true_defaults_to_false_when_omitted() {
+        let mock = Arc::new(MockEngineeringMemory::default());
+        let tool = RememberTool::new(mock.clone(), None);
+
+        tool.execute(
+            serde_json::json!({
+                "summary": "We use cargo-nextest for all test runs",
+                "kind": "project-rule",
+            }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+
+        let recorded = mock.remembered_snapshot().await;
+        assert!(!recorded[0].team);
+    }
+
+    #[tokio::test]
+    async fn team_true_writes_to_ingat_and_appends_team_jsonl() {
+        let mock = Arc::new(MockEngineeringMemory::default());
+        let tool = RememberTool::new(mock.clone(), Some("kode".to_string()));
+        let ctx = temp_workspace("team-dual-write");
+
+        let out = tool
+            .execute(
+                serde_json::json!({
+                    "summary": "always squash-merge feature branches",
+                    "kind": "convention",
+                    "team": true,
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(out.content.contains("shared:"));
+
+        let recorded = mock.remembered_snapshot().await;
+        assert_eq!(recorded.len(), 1);
+        assert!(recorded[0].team);
+
+        let path = crate::wire::team_file_path(&ctx.workspace_root);
+        let (entries, corrupt) = crate::wire::read_entries(&path);
+        assert_eq!(corrupt, 0);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "always squash-merge feature branches");
+        assert_eq!(entries[0].kind, "convention");
+
+        let _ = std::fs::remove_dir_all(&ctx.workspace_root);
     }
 }

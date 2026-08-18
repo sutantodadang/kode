@@ -12,5 +12,7 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
+sha2 = { workspace = true }
+ulid = { workspace = true }
 kode-core = { workspace = true }
 kode-tools = { path = "../kode-tools" }

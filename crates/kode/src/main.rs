@@ -8,6 +8,7 @@ mod remember;
 mod session;
 mod setup;
 mod status;
+mod team_memory;
 mod tui;
 mod update;
 mod verify;
@@ -91,7 +92,23 @@ enum Command {
         /// Tag to attach; may be repeated.
         #[arg(long = "tag")]
         tags: Vec<String>,
+        /// Also share this memory with the team via the git-backed
+        /// `.kode/memory/team.jsonl` file (visible to everyone with repo
+        /// access — committed like any other file).
+        #[arg(long)]
+        team: bool,
     },
+    /// Inspect the git-backed team memory file.
+    Memory {
+        #[command(subcommand)]
+        cmd: MemoryCmd,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum MemoryCmd {
+    /// Show team.jsonl entry/corrupt counts and Ingat import support.
+    Status,
 }
 
 #[derive(clap::Subcommand)]
@@ -188,10 +205,21 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Update { yes }) => {
             update::run(yes).await?;
         }
-        Some(Command::Remember { text, kind, tags }) => {
+        Some(Command::Remember {
+            text,
+            kind,
+            tags,
+            team,
+        }) => {
             let cwd = std::env::current_dir()?;
-            remember::run(&text, &kind, tags, &cwd).await?;
+            remember::run(&text, &kind, tags, team, &cwd).await?;
         }
+        Some(Command::Memory { cmd }) => match cmd {
+            MemoryCmd::Status => {
+                let cwd = std::env::current_dir()?;
+                team_memory::print_status(&cwd);
+            }
+        },
     }
 
     Ok(())

@@ -105,6 +105,11 @@ pub struct NewMemory {
     pub tags: Vec<String>,
     pub provenance: Provenance,
     pub context: MemoryContext,
+    /// Explicit opt-in to share this memory with the team via the
+    /// git-backed `.kode/memory/team.jsonl` file (see `kode remember
+    /// --team` / `RememberTool`'s `team` arg). Defaults to `false` —
+    /// sharing is always explicit, never inferred from `kind`.
+    pub team: bool,
 }
 
 /// A memory read back via [`crate::EngineeringMemory::search`].

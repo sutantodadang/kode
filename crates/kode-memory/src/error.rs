@@ -10,6 +10,12 @@ pub enum MemoryError {
     Protocol(String),
     #[error("request timed out")]
     Timeout,
+    /// The backend doesn't support the requested operation yet — e.g. an
+    /// Ingat build older than the `/import` endpoint (404). Distinct from
+    /// `Service`/`Protocol` so callers can degrade gracefully instead of
+    /// treating it as a hard failure.
+    #[error("backend does not support this operation: {0}")]
+    Unsupported(String),
 }
 
 pub type Result<T> = std::result::Result<T, MemoryError>;

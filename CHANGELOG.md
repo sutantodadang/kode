@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Team memory (phase 1): `kode remember --team` / `RememberTool`'s `team:
+  true` share a memory via the git-backed `.kode/memory/team.jsonl` wire
+  file, in addition to the normal personal Ingat write. Every session start
+  (TUI and `exec`) imports the file into local Ingat once Ingat's health
+  check passes (`N new team memories` note); an Ingat build without the
+  `/import` endpoint degrades to a "run `kode setup`" note instead of
+  failing. `kode memory status` reports the file's entry/corrupt-line
+  counts. See `docs/howto-team-memory.md`.
 - One-command install: `scripts/install.sh` (`curl | sh`, Linux/macOS) and
   `scripts/install.ps1` (`irm | iex`, Windows) resolve the latest (or a
   pinned) GitHub release, verify the sha256 checksum, and install `kode` to

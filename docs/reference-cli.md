@@ -155,12 +155,22 @@ Save an explicit engineering memory to Ingat.
 |---|---|
 | `--kind <KIND>` | Memory kind. One of: `project-rule` (default), `architecture-decision`, `convention`, `known-issue`, `build-knowledge`, `rejected-approach`, `user-preference`, `historical-solution`. |
 | `--tag <TAG>` | Tag to attach; repeat the flag to attach multiple tags. |
+| `--team` | Also share this memory with the team by appending it to the git-backed `.kode/memory/team.jsonl` file, in addition to the normal (personal) Ingat write. See [howto-team-memory.md](./howto-team-memory.md). |
 
 Examples:
 
 ```
 kode remember "always run cargo fmt before committing"
 kode remember "chose AGPL over MIT for copyleft protection" --kind architecture-decision --tag licensing
+kode remember "staging deploys go through the release branch, not main" --kind convention --team
+```
+
+## `kode memory status`
+
+Show the git-backed team-memory file's entry count and how many lines failed to parse (corrupt/skipped), for the repo in the current directory. See [howto-team-memory.md](./howto-team-memory.md).
+
+```
+kode memory status
 ```
 
 ## TUI slash commands

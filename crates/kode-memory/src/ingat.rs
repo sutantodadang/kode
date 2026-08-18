@@ -4,9 +4,11 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::EngineeringMemory;
+use crate::ImportCounts;
 use crate::MemoryStats;
 use crate::error::{MemoryError, Result, map_reqwest_error};
 use crate::types::{Memory, MemoryKind, MemoryQuery, NewMemory, Provenance};
+use crate::wire::WireEntry;
 use kode_core::config::IngatConfig;
 
 /// Maximum number of `sym:` tags attached to a stored memory, so a memory
@@ -141,6 +143,7 @@ impl EngineeringMemory for IngatAdapter {
             body,
             tags,
             kind: kind_to_wire(memory.kind),
+            scope: scope_str(memory.team).to_string(),
         };
 
         let resp = self
@@ -167,6 +170,40 @@ impl EngineeringMemory for IngatAdapter {
             version: body.version,
         })
     }
+
+    /// Idempotently upserts wire entries into Ingat's team scope via
+    /// `POST /import` (phase 2 endpoint — see the team-memory design doc).
+    /// An older Ingat build that doesn't have this endpoint yet answers 404,
+    /// which is mapped to [`MemoryError::Unsupported`] so callers can
+    /// degrade gracefully instead of failing the whole import.
+    async fn import_team(&self, entries: &[WireEntry]) -> Result<ImportCounts> {
+        let resp = self
+            .client
+            .post(self.url("/import"))
+            .json(entries)
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(MemoryError::Unsupported(
+                "ingat has no /import endpoint — update it (kode setup)".to_string(),
+            ));
+        }
+
+        let body: ImportResponse = self.parse_response(resp).await?;
+        Ok(ImportCounts {
+            imported: body.imported,
+            skipped: body.skipped,
+        })
+    }
+}
+
+/// `"team"` when the memory was written with `--team`/`team:true`, else
+/// `"personal"` — the default. Mirrors the `scope` column the design doc
+/// adds to Ingat's storage.
+fn scope_str(team: bool) -> &'static str {
+    if team { "team" } else { "personal" }
 }
 
 /// Maps a Kode [`MemoryKind`] onto Ingat's `ContextKind` wire enum.
@@ -259,6 +296,8 @@ struct IngestContextRequest {
     body: String,
     tags: Vec<String>,
     kind: ContextKind,
+    /// `"team"` or `"personal"` — see [`scope_str`].
+    scope: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -331,6 +370,13 @@ struct HealthResponse {
 struct ErrorResponse {
     error: String,
     code: String,
+}
+
+/// Response body of `POST /import` — see the team-memory design doc.
+#[derive(Debug, Deserialize)]
+struct ImportResponse {
+    imported: u64,
+    skipped: u64,
 }
 
 #[cfg(test)]
@@ -469,6 +515,7 @@ mod tests {
                 files: vec!["src/lib.rs".to_string()],
                 symbols: vec!["Foo::bar".to_string()],
             },
+            team: false,
         };
 
         let id = adapter.remember(&memory).await.unwrap();
@@ -483,6 +530,7 @@ mod tests {
         assert_eq!(body["project"], "kode");
         assert_eq!(body["file_path"], "src/lib.rs");
         assert_eq!(body["kind"], serde_json::json!({"Other": "project-rule"}));
+        assert_eq!(body["scope"], "personal");
 
         let tags: Vec<&str> = body["tags"]
             .as_array()
@@ -512,6 +560,7 @@ mod tests {
             tags: vec![],
             provenance: Provenance::VerifiedTest,
             context: crate::types::MemoryContext::default(),
+            team: false,
         };
 
         adapter.remember(&memory).await.unwrap();
@@ -522,6 +571,73 @@ mod tests {
         // empty body falls back to summary
         assert_eq!(body["body"], "fixed flaky test");
         assert_eq!(body["project"], "unknown");
+    }
+
+    #[tokio::test]
+    async fn remember_team_true_sends_team_scope() {
+        let response = r#"{"id":"mem-4","project":"kode","summary":"s","kind":{"Other":"convention"},"tags":["kode"],"created_at":"2026-01-01T00:00:00Z"}"#;
+        let (base, handle) = one_shot_server(200, "OK", response.to_string()).await;
+        let adapter = IngatAdapter::new(&cfg(base));
+
+        let memory = NewMemory {
+            kind: MemoryKind::Convention,
+            summary: "share this with the team".to_string(),
+            body: String::new(),
+            tags: vec![],
+            provenance: Provenance::ExplicitUser,
+            context: crate::types::MemoryContext::default(),
+            team: true,
+        };
+
+        adapter.remember(&memory).await.unwrap();
+
+        let req = handle.await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&req.body).unwrap();
+        assert_eq!(body["scope"], "team");
+    }
+
+    fn wire_entry(id: &str) -> WireEntry {
+        WireEntry::new(
+            &NewMemory {
+                kind: MemoryKind::Convention,
+                summary: format!("entry {id}"),
+                body: String::new(),
+                tags: vec![],
+                provenance: Provenance::ExplicitUser,
+                context: crate::types::MemoryContext::default(),
+                team: true,
+            },
+            Some("alice".to_string()),
+        )
+    }
+
+    #[tokio::test]
+    async fn import_team_happy_path_parses_counts() {
+        let response = r#"{"imported":2,"skipped":1}"#;
+        let (base, handle) = one_shot_server(200, "OK", response.to_string()).await;
+        let adapter = IngatAdapter::new(&cfg(base));
+
+        let entries = vec![wire_entry("a"), wire_entry("b")];
+        let counts = adapter.import_team(&entries).await.unwrap();
+
+        assert_eq!(counts.imported, 2);
+        assert_eq!(counts.skipped, 1);
+
+        let req = handle.await.unwrap();
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.path, "/import");
+        let sent: Vec<WireEntry> = serde_json::from_str(&req.body).unwrap();
+        assert_eq!(sent, entries);
+    }
+
+    #[tokio::test]
+    async fn import_team_404_maps_to_unsupported() {
+        let (base, handle) = one_shot_server(404, "Not Found", String::new()).await;
+        let adapter = IngatAdapter::new(&cfg(base));
+
+        let err = adapter.import_team(&[wire_entry("a")]).await.unwrap_err();
+        assert!(matches!(err, MemoryError::Unsupported(_)), "got {err:?}");
+        handle.await.unwrap();
     }
 
     #[tokio::test]

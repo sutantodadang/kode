@@ -17,6 +17,7 @@ use kode_context::git::RepoState;
 use kode_core::CancellationToken;
 use kode_core::config::{KodeConfig, PermissionMode};
 use kode_core::event::{EventBus, KodeEvent};
+use kode_memory::EngineeringMemory;
 use kode_tools::permission::PermissionHandler;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -28,6 +29,7 @@ use super::events::apply_event;
 use super::state::*;
 use crate::custom_commands;
 use crate::pipeline;
+use crate::team_memory;
 
 /// Sends permission requests from tool execution to the UI loop, then awaits
 /// the user's y/n answer over a one-shot channel. `auto` is shared with the
@@ -193,6 +195,21 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
     state.zindeks_enabled = config.zindeks.enabled;
     state.ingat_enabled = config.ingat.enabled;
     state.reduced_motion = config.ui.reduced_motion;
+
+    if config.ingat.enabled {
+        let adapter = kode_memory::IngatAdapter::new(&config.ingat);
+        if tokio::time::timeout(Duration::from_secs(3), adapter.health())
+            .await
+            .is_ok_and(|r| r.is_ok())
+        {
+            let summary = team_memory::import_on_start(&adapter, cwd).await;
+            if let Some(text) = summary.note() {
+                state
+                    .transcript
+                    .push(TranscriptLine::new(Gutter::Ingat, text));
+            }
+        }
+    }
 
     if let Some(hint) = startup_hint(
         &config.model.provider,
