@@ -5,7 +5,7 @@ use std::time::Duration;
 use kode_agent::Agent;
 use kode_context::{CompiledContext, ContextCompiler, ContextRequest, ContextSource};
 use kode_core::CancellationToken;
-use kode_core::config::{IngatConfig, KodeConfig};
+use kode_core::config::{AgentConfig, IngatConfig, KodeConfig, PermissionMode};
 use kode_core::event::{EventBus, KodeEvent, NoteSource, TaskStep};
 use kode_intel::{CodeIntelligence, ZindeksAdapter};
 use kode_memory::{EngineeringMemory, IngatAdapter, RememberTool};
@@ -13,6 +13,13 @@ use kode_model::{OpenAiModel, OpenAiOptions};
 use kode_tools::ToolContext;
 use kode_tools::permission::PermissionHandler;
 use kode_tools::registry::{ToolRegistry, ToolRuntime};
+
+/// Appended to the task text for the plan-mode turn (see
+/// [`run_plan_phase`]). The turn runs under an empty tool registry, so this
+/// also tells the model plainly that it has nothing to call.
+const PLAN_INSTRUCTION: &str = "Before making any changes, write a concise numbered plan for \
+accomplishing this task: the concrete steps you would take and which files you would touch. \
+Do not write code. You have no tools available for this turn — just describe the plan, then stop.";
 
 /// Set once this process has made its one autostart attempt for the Ingat
 /// service (successful or not). Guards against re-attempting on every task
@@ -24,6 +31,7 @@ static INGAT_AUTOSTART_ATTEMPTED: OnceLock<()> = OnceLock::new();
 /// post-edit verification with a single retry. This is the single code path
 /// shared by `kode exec` (headless) and the TUI — it communicates *only*
 /// through `events`, never via stdout/stderr directly.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_task(
     task: &str,
     cwd: &Path,
@@ -32,6 +40,7 @@ pub async fn run_task(
     handler: Arc<dyn PermissionHandler>,
     cancel: CancellationToken,
     history: &[kode_agent::HistoryTurn],
+    plan_mode: bool,
 ) -> anyhow::Result<()> {
     if config.model.model.is_empty() {
         anyhow::bail!("set model.model in .kode/config.toml");
@@ -194,13 +203,14 @@ pub async fn run_task(
         None
     };
 
-    let tools = ToolRuntime::new(registry, config.permissions.default_mode, handler);
+    let tools = ToolRuntime::new(registry, config.permissions.default_mode, handler.clone());
     let effort = if config.model.effort.is_empty() {
         None
     } else {
         Some(config.model.effort.clone())
     };
-    let agent = Agent::new(model, tools, events.clone(), &config.agent).with_effort(effort);
+    let agent =
+        Agent::new(model.clone(), tools, events.clone(), &config.agent).with_effort(effort.clone());
 
     events.emit(KodeEvent::ContextCompilationStarted);
     let compiler = ContextCompiler::new(intel, memory, config.agent.context_budget_tokens as usize);
@@ -237,9 +247,54 @@ pub async fn run_task(
         });
     }
 
+    // The prompt actually sent to the exec turn below: the original `task`
+    // unless plan mode swaps in the approved-plan-injected version.
+    let mut exec_task = task.to_string();
+
+    if plan_mode {
+        let plan_result = run_plan_phase(
+            model.clone(),
+            &events,
+            handler.clone(),
+            &config.agent,
+            effort.clone(),
+            task,
+            compiled.render().as_deref(),
+            kept_history,
+            history_truncated,
+            &ctx,
+        )
+        .await?;
+
+        match plan_result {
+            PlanOutcome::Rejected { outcome } => {
+                events.emit(KodeEvent::Note {
+                    text: "plan rejected — task cancelled".to_string(),
+                });
+                events.emit(KodeEvent::TaskFinished {
+                    iterations: outcome.iterations,
+                    tool_calls: outcome.tool_calls,
+                    input_tokens: outcome.usage.input_tokens,
+                    output_tokens: outcome.usage.output_tokens,
+                });
+                return Ok(());
+            }
+            PlanOutcome::Approved { effective_task, .. } => {
+                events.emit(KodeEvent::Note {
+                    text: "plan approved — executing".to_string(),
+                });
+                events.emit(KodeEvent::TaskProgress {
+                    step: TaskStep::Plan,
+                    done: true,
+                });
+                exec_task = effective_task;
+            }
+        }
+    }
+
     let outcome1 = agent
         .run_with_context(
-            task,
+            &exec_task,
             compiled.render().as_deref(),
             kept_history,
             history_truncated,
@@ -375,6 +430,64 @@ pub async fn run_task(
     });
 
     Ok(())
+}
+
+/// Outcome of [`run_plan_phase`]: the human's approve/reject answer to
+/// "execute this plan?", carrying the plan turn's own `AgentOutcome` either
+/// way — `run_task` reports it as the `TaskFinished` counters when the plan
+/// is rejected (the exec turn never ran, so it's the only usage there is).
+enum PlanOutcome {
+    Approved {
+        /// The exec-turn prompt: the approved plan text followed by the
+        /// original task, per the "Follow this approved plan:" template.
+        effective_task: String,
+    },
+    Rejected {
+        outcome: kode_agent::AgentOutcome,
+    },
+}
+
+/// Runs the plan-mode turn: a model call under an empty tool registry (no
+/// tools disabled means none are ever offered) that streams a numbered plan
+/// for `task` into the transcript via the normal `ModelToken` event path,
+/// then asks `handler` to approve or reject it via the same
+/// `PermissionHandler::confirm` mechanism used for mutating tool calls.
+/// Reuses the same compiled `context`/`history` the exec turn uses — see the
+/// design note in `run_task`. Factored out of `run_task` (rather than the
+/// model-provider-selection glue around it) so it's directly unit-testable
+/// with `kode_model::MockModel`.
+#[allow(clippy::too_many_arguments)]
+async fn run_plan_phase(
+    model: Arc<dyn kode_model::Model>,
+    events: &EventBus,
+    handler: Arc<dyn PermissionHandler>,
+    agent_cfg: &AgentConfig,
+    effort: Option<String>,
+    task: &str,
+    context: Option<&str>,
+    history: &[kode_agent::HistoryTurn],
+    history_truncated: bool,
+    ctx: &ToolContext,
+) -> anyhow::Result<PlanOutcome> {
+    // Empty registry — no tools are ever offered on this turn, so the
+    // permission mode is moot; `Deny` names that intent explicitly.
+    let tools = ToolRuntime::new(ToolRegistry::new(), PermissionMode::Deny, handler.clone());
+    let plan_agent = Agent::new(model, tools, events.clone(), agent_cfg).with_effort(effort);
+
+    let plan_prompt = format!("{task}\n\n{PLAN_INSTRUCTION}");
+    let outcome = plan_agent
+        .run_with_context(&plan_prompt, context, history, history_truncated, ctx)
+        .await
+        .map_err(|err| anyhow::anyhow!(err))?;
+
+    let approved = handler.confirm("execute this plan?").await;
+    if approved {
+        let plan_text = outcome.final_text.trim().to_string();
+        let effective_task = format!("Follow this approved plan:\n{plan_text}\n\nTask: {task}");
+        Ok(PlanOutcome::Approved { effective_task })
+    } else {
+        Ok(PlanOutcome::Rejected { outcome })
+    }
 }
 
 /// Whether the Ingat autostart flow should run: only when the config opts
@@ -677,6 +790,114 @@ fn emit_verify_steps(events: &EventBus, report: &kode_verify::VerificationReport
             skipped,
             duration_ms: step.duration.as_millis() as u64,
         });
+    }
+}
+
+#[cfg(test)]
+mod plan_phase_tests {
+    use super::*;
+    use kode_model::{FinishReason, Message, MockModel, StreamEvent};
+    use kode_tools::permission::{AutoApprove, AutoDeny};
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "kode-pipeline-plan-test-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn ctx(root: std::path::PathBuf) -> ToolContext {
+        ToolContext {
+            workspace_root: root,
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    fn plan_script(plan_text: &str) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::TextDelta(plan_text.to_string()),
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: None,
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn approved_plan_is_injected_into_effective_task() {
+        let dir = temp_dir("approve");
+        let mock = Arc::new(MockModel::new());
+        mock.push_script(plan_script("1. do the thing\n2. verify it"));
+
+        let outcome = run_plan_phase(
+            mock.clone(),
+            &EventBus::new(64),
+            Arc::new(AutoApprove),
+            &AgentConfig::default(),
+            None,
+            "add a widget",
+            None,
+            &[],
+            false,
+            &ctx(dir),
+        )
+        .await
+        .unwrap();
+
+        match outcome {
+            PlanOutcome::Approved { effective_task } => {
+                assert!(effective_task.starts_with("Follow this approved plan:\n"));
+                assert!(effective_task.contains("1. do the thing\n2. verify it"));
+                assert!(effective_task.ends_with("\n\nTask: add a widget"));
+            }
+            PlanOutcome::Rejected { .. } => panic!("expected Approved"),
+        }
+
+        // The model saw the plan-mode prompt (task + PLAN_INSTRUCTION) with
+        // no tools offered — not the raw task and not the builtin registry.
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].tools.is_empty());
+        let saw_plan_prompt = requests[0].messages.iter().any(|m| {
+            matches!(m, Message::User(t) if t == &format!("add a widget\n\n{PLAN_INSTRUCTION}"))
+        });
+        assert!(saw_plan_prompt, "model did not see the plan-mode prompt");
+    }
+
+    #[tokio::test]
+    async fn rejected_plan_never_triggers_a_second_model_call() {
+        let dir = temp_dir("reject");
+        let mock = Arc::new(MockModel::new());
+        mock.push_script(plan_script("1. do the thing"));
+
+        let outcome = run_plan_phase(
+            mock.clone(),
+            &EventBus::new(64),
+            Arc::new(AutoDeny),
+            &AgentConfig::default(),
+            None,
+            "add a widget",
+            None,
+            &[],
+            false,
+            &ctx(dir),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, PlanOutcome::Rejected { .. }));
+        // Only the plan turn's one request happened — MockModel only had one
+        // script queued, so a second (exec-turn) call would have errored
+        // "mock: no script" instead of `run_plan_phase` returning Ok. This
+        // mirrors `run_task`'s real control flow: the exec-turn
+        // `agent.run_with_context` call only runs in the `Approved` arm.
+        assert_eq!(mock.requests().len(), 1);
     }
 }
 

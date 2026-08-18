@@ -731,6 +731,11 @@ fn parse_slash_command_help() {
 }
 
 #[test]
+fn parse_slash_command_plan() {
+    assert_eq!(parse_slash_command("/plan"), Some(SlashCommand::Plan));
+}
+
+#[test]
 fn parse_slash_command_non_builtin_name_is_custom() {
     // Non-builtin names parse as `Custom` — resolved against discovered
     // commands at handle time, not parse time. An unmatched name still
@@ -1082,7 +1087,25 @@ fn handle_slash_command_help_lists_commands() {
 
     assert!(s.transcript.iter().any(|l| l.text.contains("/model")));
     assert!(s.transcript.iter().any(|l| l.text.contains("/provider")));
+    assert!(s.transcript.iter().any(|l| l.text.contains("/plan")));
     assert!(s.transcript.iter().any(|l| l.text.contains("Ctrl+L")));
+}
+
+#[test]
+fn handle_slash_command_plan_toggles_state() {
+    let dir = temp_project_dir();
+    let mut s = state();
+    let mut cfg = KodeConfig::default();
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    assert!(!s.plan_mode);
+    handle_slash_command(&mut s, &dir, &mut cfg, &tx, SlashCommand::Plan);
+    assert!(s.plan_mode);
+    assert!(s.transcript.iter().any(|l| l.text.contains("plan mode on")));
+
+    handle_slash_command(&mut s, &dir, &mut cfg, &tx, SlashCommand::Plan);
+    assert!(!s.plan_mode);
+    assert!(s.transcript.iter().any(|l| l.text == "plan mode off"));
 }
 
 #[test]
@@ -1281,7 +1304,7 @@ fn start_new_task_resets_decide_flag_for_next_run() {
             name: "read_file".into(),
         },
     );
-    s.start_new_task("second task");
+    s.start_new_task("second task", false);
     let decide = |s: &AppState| {
         s.ledger
             .steps
@@ -1292,6 +1315,25 @@ fn start_new_task_resets_decide_flag_for_next_run() {
     };
     assert!(!decide(&s));
     assert_eq!(s.ledger.objective, "second task");
+}
+
+#[test]
+fn start_new_task_prepends_plan_step_only_when_plan_mode_is_on() {
+    let mut s = state();
+
+    s.start_new_task("no plan", false);
+    assert!(
+        !s.ledger
+            .steps
+            .iter()
+            .any(|(step, _)| *step == TaskStep::Plan)
+    );
+    assert_eq!(s.ledger.steps[0].0, TaskStep::Understand);
+
+    s.start_new_task("with plan", true);
+    assert_eq!(s.ledger.steps[0], (TaskStep::Plan, false));
+    assert_eq!(s.ledger.steps[1].0, TaskStep::Understand);
+    assert_eq!(s.ledger.steps.len(), 5);
 }
 
 // -- ledger numstat / dirty poll -----------------------------------------
@@ -1566,7 +1608,7 @@ fn start_new_task_clears_leftover_aperture() {
         },
     );
     assert!(s.aperture.is_some());
-    s.start_new_task("next task");
+    s.start_new_task("next task", false);
     assert!(s.aperture.is_none());
 }
 
@@ -1744,6 +1786,14 @@ fn breadcrumb_line_shows_auto_badge_only_when_on() {
     assert!(!line_text(&breadcrumb_line(&s)).contains("auto"));
     s.auto_mode = true;
     assert!(line_text(&breadcrumb_line(&s)).contains("· auto"));
+}
+
+#[test]
+fn breadcrumb_line_shows_plan_badge_only_when_on() {
+    let mut s = state();
+    assert!(!line_text(&breadcrumb_line(&s)).contains("plan"));
+    s.plan_mode = true;
+    assert!(line_text(&breadcrumb_line(&s)).contains("· plan"));
 }
 
 #[tokio::test]
@@ -2011,7 +2061,7 @@ fn agent_error_swaps_flushed_prose_into_last_response() {
 fn start_new_task_does_not_clear_prior_last_response() {
     let mut s = state();
     s.last_response = "prior answer".to_string();
-    s.start_new_task("next task");
+    s.start_new_task("next task", false);
     assert_eq!(s.last_response, "prior answer");
 }
 
@@ -2022,7 +2072,7 @@ fn task_finished_appends_turn_to_in_memory_history() {
     let dir = temp_project_dir();
     let mut s = state();
 
-    s.start_new_task("first task");
+    s.start_new_task("first task", false);
     apply_event(
         &mut s,
         KodeEvent::ModelToken {
@@ -2052,7 +2102,7 @@ fn task_finished_appends_turn_to_in_memory_history() {
     assert_eq!(turns[0].task, "first task");
 
     // Second task appends to the same session.
-    s.start_new_task("second task");
+    s.start_new_task("second task", false);
     apply_event(
         &mut s,
         KodeEvent::ModelToken {
@@ -2082,7 +2132,7 @@ fn agent_error_discards_pending_task() {
     let dir = temp_project_dir();
     let mut s = state();
 
-    s.start_new_task("will fail");
+    s.start_new_task("will fail", false);
     apply_event(
         &mut s,
         KodeEvent::AgentError {

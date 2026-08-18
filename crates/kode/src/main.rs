@@ -55,6 +55,10 @@ enum Command {
         /// this task is appended to it.
         #[arg(short = 'c', long = "continue")]
         continue_: bool,
+        /// Plan first: produce a numbered plan and ask for approval (y/N)
+        /// before running the task. Rejecting exits without running it.
+        #[arg(long)]
+        plan: bool,
     },
     /// List available models for the configured provider.
     Models,
@@ -152,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
             model,
             effort,
             continue_,
+            plan,
         }) => {
             if let Some(e) = &effort
                 && !kode_core::config::VALID_EFFORTS.contains(&e.as_str())
@@ -162,7 +167,7 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             let cwd = std::env::current_dir()?;
-            exec::run(&task, &cwd, token, model, effort, continue_).await?;
+            exec::run(&task, &cwd, token, model, effort, continue_, plan).await?;
         }
         Some(Command::Models) => {
             let cwd = std::env::current_dir()?;

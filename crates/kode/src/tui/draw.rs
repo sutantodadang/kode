@@ -425,6 +425,12 @@ pub(crate) fn breadcrumb_line(state: &AppState) -> Line<'static> {
             Style::default().fg(theme::T).add_modifier(Modifier::BOLD),
         ));
     }
+    if state.plan_mode {
+        spans.push(Span::styled(
+            " · plan",
+            Style::default().fg(theme::T).add_modifier(Modifier::BOLD),
+        ));
+    }
     if let Some(ks) = &state.knowledge {
         let bar = meter(ks.context_tokens, ks.budget_tokens, 8);
         let filled = bar.chars().filter(|c| *c == '▓').count();
@@ -1030,6 +1036,7 @@ pub(crate) fn draw_input(f: &mut ratatui::Frame, area: ratatui::layout::Rect, st
 
 pub(crate) fn task_step_label(step: TaskStep) -> &'static str {
     match step {
+        TaskStep::Plan => "PLAN",
         TaskStep::Understand => "UNDERSTAND",
         TaskStep::Decide => "DECIDE",
         TaskStep::Change => "CHANGE",

@@ -1,8 +1,12 @@
 use tokio::sync::broadcast;
 
-/// One step of the Ledger view's fixed 4-step task lifecycle.
+/// One step of the Ledger view's task lifecycle. `Plan` only appears when
+/// plan mode is on — it's prepended ahead of the fixed Understand/Decide/
+/// Change/Verify steps and marked done once the user approves the plan (see
+/// `kode::pipeline::run_plan_phase`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStep {
+    Plan,
     Understand,
     Decide,
     Change,

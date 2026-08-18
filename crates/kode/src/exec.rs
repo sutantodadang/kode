@@ -37,6 +37,7 @@ pub async fn run(
     model_override: Option<String>,
     effort_override: Option<String>,
     continue_session: bool,
+    plan_mode: bool,
 ) -> anyhow::Result<()> {
     let mut config = KodeConfig::load(cwd)?;
     if let Some(model) = model_override {
@@ -165,6 +166,7 @@ pub async fn run(
         Arc::new(StdinPermission),
         cancel,
         &history_turns,
+        plan_mode,
     )
     .await;
 

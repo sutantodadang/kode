@@ -21,6 +21,8 @@ pub enum SlashCommand {
     Copy,
     /// `/resume` — opens the session picker.
     Resume,
+    /// `/plan` — toggles plan mode (session-only; see `AppState::plan_mode`).
+    Plan,
     Help,
     /// `/name [args]` where `name` isn't a builtin. Resolved against
     /// discovered custom commands at handle time (not parse time) — an
@@ -36,8 +38,9 @@ pub enum SlashCommand {
 /// Builtin command names (lowercase, no leading `/`) — matches
 /// [`SLASH_COMMANDS`]. Custom commands never shadow these; discovery
 /// filters them out up front.
-pub const BUILTIN_COMMAND_NAMES: &[&str] =
-    &["model", "effort", "provider", "copy", "resume", "help"];
+pub const BUILTIN_COMMAND_NAMES: &[&str] = &[
+    "model", "effort", "provider", "copy", "resume", "plan", "help",
+];
 
 /// The providers `/provider` accepts, in picker display order.
 pub const VALID_PROVIDERS: &[&str] = &[
@@ -57,6 +60,10 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/provider", "pick provider"),
     ("/copy", "copy last response to clipboard"),
     ("/resume", "resume a previous session"),
+    (
+        "/plan",
+        "toggle plan mode (plan first, then approve to run)",
+    ),
     ("/help", "list commands + shortcuts"),
 ];
 
@@ -110,6 +117,7 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         }),
         "/copy" => SlashCommand::Copy,
         "/resume" => SlashCommand::Resume,
+        "/plan" => SlashCommand::Plan,
         "/help" => SlashCommand::Help,
         other => {
             let name = other.trim_start_matches('/').to_lowercase();
@@ -499,11 +507,22 @@ pub(crate) fn handle_slash_command(
                 };
             }
         }
+        SlashCommand::Plan => {
+            state.plan_mode = !state.plan_mode;
+            let text = if state.plan_mode {
+                "plan mode on — tasks are planned first, then wait for your approval to run"
+            } else {
+                "plan mode off"
+            };
+            state
+                .transcript
+                .push(TranscriptLine::new(Gutter::Note, text));
+        }
         SlashCommand::Help => {
             state.transcript.push(TranscriptLine::new(
                 Gutter::Note,
                 "commands: /model [name], /effort <minimal|low|medium|high|xhigh|max|ultra>, \
-                 /provider [name], /copy, /help · shift+tab toggles auto mode (tools run \
+                 /provider [name], /copy, /plan, /help · shift+tab toggles auto mode (tools run \
                  without asking) · ctrl+y copies the last response · text selection works \
                  natively (no mouse capture) · Ctrl+K toggles the Knowledge Band, Ctrl+L \
                  opens the Ledger, Esc closes the Ledger or cancels the run",

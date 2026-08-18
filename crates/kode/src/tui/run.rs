@@ -119,7 +119,8 @@ pub(crate) fn submit_task(
     handler: &Arc<dyn PermissionHandler>,
     task: String,
 ) -> CancellationToken {
-    state.start_new_task(&task);
+    let plan_mode = state.plan_mode;
+    state.start_new_task(&task, plan_mode);
     state
         .transcript
         .push(TranscriptLine::new(Gutter::User, task.clone()));
@@ -154,6 +155,7 @@ pub(crate) fn submit_task(
             task_handler,
             task_child,
             &task_history,
+            plan_mode,
         )
         .await
         {

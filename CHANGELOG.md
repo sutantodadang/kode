@@ -28,6 +28,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Ingat service autostart: when the memory service is unreachable, Kode
   starts the installed service once and retries (`[ingat] autostart`,
   default true). zindeks already autostarts via its stdio child.
+- Plan mode: `/plan` in the TUI (breadcrumb `PLAN` badge) and `kode exec
+  --plan` produce a numbered plan first (a tools-disabled model turn) and
+  ask for approval before running the task; approving injects the plan into
+  the task prompt, rejecting cancels cleanly with the plan left in the
+  transcript. Session-only — never persisted to config.
 - `anthropic` model provider: streaming Messages API client, API-key auth
   (default, `ANTHROPIC_API_KEY` env fallback) plus OAuth via a Claude
   Pro/Max subscription (EXPERIMENTAL, paste-back PKCE — not an officially

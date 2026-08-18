@@ -174,8 +174,9 @@ pub struct ApertureState {
 }
 
 /// The Ledger view's (Ctrl+L) data — derived entirely from real events, no
-/// invented captions. `steps` is always the fixed 4-step lifecycle in
-/// order (Understand, Decide, Change, Verify).
+/// invented captions. `steps` is the fixed 4-step lifecycle (Understand,
+/// Decide, Change, Verify), with a `Plan` step prepended when the task was
+/// submitted under plan mode (see [`LedgerState::new`]).
 #[derive(Debug, Clone)]
 pub struct LedgerState {
     pub objective: String,
@@ -207,9 +208,18 @@ impl Default for LedgerState {
 }
 
 impl LedgerState {
-    fn new(objective: String) -> Self {
+    /// `plan_mode` prepends `(TaskStep::Plan, false)` ahead of the fixed
+    /// 4-step lifecycle — the Ledger renders it as step 01 and it's marked
+    /// done once the plan is approved (see `pipeline::run_plan_phase`).
+    fn new(objective: String, plan_mode: bool) -> Self {
+        let mut steps = Vec::with_capacity(5);
+        if plan_mode {
+            steps.push((TaskStep::Plan, false));
+        }
+        steps.extend(Self::default().steps);
         Self {
             objective,
+            steps,
             ..Default::default()
         }
     }
@@ -310,6 +320,13 @@ pub struct AppState {
     /// from another task, so a toggle applies to in-flight runs too.
     pub auto_mode: bool,
     pub auto_flag: Arc<AtomicBool>,
+    /// Plan mode (`/plan`): when on, a submitted task first produces a
+    /// numbered plan (a tools-disabled model turn) and asks for approval
+    /// before the real task runs. Session-only — never persisted to config.
+    /// Read once per submission in `submit_task`, unlike `auto_mode` which
+    /// also has a shared atomic for mid-run reads from the permission
+    /// handler — plan mode is only ever consulted at submission time.
+    pub plan_mode: bool,
     /// The most recently *completed* agent message's full text — what
     /// Ctrl+Y/`/copy` copy to the clipboard. Empty until the first message
     /// finishes.
@@ -374,6 +391,7 @@ impl AppState {
             ingat_enabled: true,
             auto_mode: false,
             auto_flag: Arc::new(AtomicBool::new(false)),
+            plan_mode: false,
             last_response: String::new(),
             response_buf: String::new(),
             md_in_code_block: false,
@@ -397,11 +415,12 @@ impl AppState {
     }
 
     /// Resets per-run state for a freshly submitted task: the Ledger
-    /// (objective + steps), the Decide-derivation flag, and any leftover
-    /// Aperture from a prior run. Pure — the caller still owns emitting the
-    /// actual task to the pipeline.
-    pub fn start_new_task(&mut self, task: &str) {
-        self.ledger = LedgerState::new(ledger_objective(task));
+    /// (objective + steps, with a leading Plan step when `plan_mode` is on),
+    /// the Decide-derivation flag, and any leftover Aperture from a prior
+    /// run. Pure — the caller still owns emitting the actual task to the
+    /// pipeline.
+    pub fn start_new_task(&mut self, task: &str, plan_mode: bool) {
+        self.ledger = LedgerState::new(ledger_objective(task), plan_mode);
         self.decide_marked_this_run = false;
         self.aperture = None;
         self.tool_started = None;

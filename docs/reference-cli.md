@@ -80,6 +80,7 @@ Run an agentic task against the configured model, non-interactively.
 | `--model <MODEL>` | Override the configured model for this run only. |
 | `--effort <EFFORT>` | Override reasoning effort for this run only. One of: `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`. |
 | `-c`, `--continue` | Send prior session turns as history and append this task to that session, instead of starting fresh. |
+| `--plan` | Plan first: the model produces a numbered plan (no tools) and Kode asks `execute this plan? [y/N]` before running the task. Answering `N` exits without running it. |
 
 Examples:
 
@@ -87,6 +88,7 @@ Examples:
 kode exec "add a doc comment to the config loader"
 kode exec --model gpt-5.6-sol --effort high "refactor the auth module for testability"
 kode exec -c "now add tests for that refactor"
+kode exec --plan "add pagination to the search endpoint"
 ```
 
 `TASK` may also be a custom slash command (`/name [args]`) — see [howto-custom-commands.md](./howto-custom-commands.md). It's expanded from its `.md` template before the task runs; an unrecognized `/name` fails with an error listing the commands discovered in `.kode/commands/` and `~/.kode/commands/`.
