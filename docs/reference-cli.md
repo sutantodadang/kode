@@ -35,14 +35,15 @@ kode --continue
 
 ## `kode auth`
 
-Manage Kode's own credential store for `codex` and opencode-family providers (`opencode-go`, `opencode`, `kilo`, `lmstudio`). Credentials are stored under `~/.kode/auth/`, never read from another tool's auth files.
+Manage Kode's own credential store for `codex`, `anthropic`, and opencode-family providers (`opencode-go`, `opencode`, `kilo`, `lmstudio`). Credentials are stored under `~/.kode/auth/`, never read from another tool's auth files.
 
 ### `kode auth login <provider>`
 
-Log in to a provider. `codex` uses OAuth+PKCE via your browser; the opencode-family providers prompt you to paste an API key.
+Log in to a provider. `codex` uses OAuth+PKCE via your browser; the opencode-family providers prompt you to paste an API key; `anthropic` lets you choose between an API key (default) and OAuth via a Claude Pro/Max subscription (EXPERIMENTAL — see [howto-auth-providers.md](./howto-auth-providers.md)).
 
 ```
 kode auth login codex
+kode auth login anthropic
 kode auth login opencode
 ```
 

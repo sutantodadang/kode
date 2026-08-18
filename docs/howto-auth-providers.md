@@ -14,6 +14,19 @@ What happens: Kode starts a local PKCE flow, opens your default browser to the C
 
 On success, Kode prints the live model list fetched from the backend right away, for example `gpt-5.6-sol`. This list is fetched fresh, not hardcoded: if the backend adds a model, `kode models` and this login output reflect it immediately.
 
+## Log in to Anthropic
+
+```
+kode auth login anthropic
+```
+
+You're prompted to choose:
+
+1. **API key** (default, recommended) — paste a key from [console.anthropic.com](https://console.anthropic.com). Written to `~/.kode/auth/anthropic.json` as `{"type":"api","key":"..."}`. `ANTHROPIC_API_KEY` in the environment also works without running login at all — Kode falls back to it when no auth file exists.
+2. **OAuth via a Claude Pro/Max subscription** — ⚠️ **EXPERIMENTAL**. This is not an officially supported third-party auth flow; Anthropic could change or block it without notice. Kode opens your browser to approve, then you paste back a `code#state` value it prints. The resulting access/refresh tokens are written to `~/.kode/auth/anthropic.json` and refreshed automatically on later runs.
+
+Prefer the API key path unless you specifically need to use subscription credits instead of pay-as-you-go billing.
+
 ## Log in to an opencode-family provider
 
 opencode-go, opencode, kilo, and lmstudio authenticate by pasting an API key:

@@ -18,15 +18,24 @@ const CODEX_AUTHORIZE_BASE: &str = "https://auth.openai.com/oauth/authorize";
 const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 
+const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const ANTHROPIC_AUTHORIZE_BASE: &str = "https://claude.ai/oauth/authorize";
+const ANTHROPIC_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
+const ANTHROPIC_REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
+const ANTHROPIC_REDIRECT_URI_ENCODED: &str =
+    "https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback";
+
 const OPENCODE_PROVIDERS: [&str; 4] = ["opencode-go", "opencode", "kilo", "lmstudio"];
+
+const SUPPORTED_PROVIDERS_MSG: &str =
+    "supported: codex, anthropic, opencode-go, opencode, kilo, lmstudio";
 
 pub async fn login(provider: &str) -> anyhow::Result<()> {
     match provider {
         "codex" => login_codex().await,
+        "anthropic" => login_anthropic().await,
         p if OPENCODE_PROVIDERS.contains(&p) => login_opencode_key(p).await,
-        other => anyhow::bail!(
-            "unsupported provider '{other}' (supported: codex, opencode-go, opencode, kilo, lmstudio)"
-        ),
+        other => anyhow::bail!("unsupported provider '{other}' ({SUPPORTED_PROVIDERS_MSG})"),
     }
 }
 
@@ -64,6 +73,19 @@ pub async fn status() -> anyhow::Result<()> {
         }
     }
 
+    if let Ok(path) = anthropic_auth_path()
+        && path.exists()
+    {
+        printed = true;
+        match kode_model::anthropic::load(&path) {
+            Ok(kode_model::AnthropicAuth::ApiKey(_)) => println!("anthropic: logged in (api key)"),
+            Ok(kode_model::AnthropicAuth::OAuth { .. }) => {
+                println!("anthropic: logged in (oauth)")
+            }
+            Err(_) => println!("anthropic: not logged in"),
+        }
+    }
+
     if !printed {
         println!("no credentials stored \u{2014} run: kode auth login <provider>");
     }
@@ -90,9 +112,16 @@ pub async fn logout(provider: &str) -> anyhow::Result<()> {
                 println!("nothing to remove");
             }
         }
-        other => anyhow::bail!(
-            "unsupported provider '{other}' (supported: codex, opencode-go, opencode, kilo, lmstudio)"
-        ),
+        "anthropic" => {
+            let path = anthropic_auth_path()?;
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+                println!("anthropic: logged out");
+            } else {
+                println!("nothing to remove");
+            }
+        }
+        other => anyhow::bail!("unsupported provider '{other}' ({SUPPORTED_PROVIDERS_MSG})"),
     }
     Ok(())
 }
@@ -326,6 +355,155 @@ fn write_secret_file(path: &Path, contents: &str) -> anyhow::Result<()> {
     }
 }
 
+// --- anthropic (api key or oauth via Claude subscription) -------------------
+
+async fn login_anthropic() -> anyhow::Result<()> {
+    println!("choose auth method:");
+    println!("  1) API key (create one at https://console.anthropic.com)");
+    println!("  2) OAuth via Claude Pro/Max subscription [EXPERIMENTAL]");
+    print!("> ");
+    {
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+    }
+    let choice = read_stdin_line().await?;
+    match choice.trim() {
+        "2" => login_anthropic_oauth().await,
+        _ => login_anthropic_api_key().await,
+    }
+}
+
+async fn login_anthropic_api_key() -> anyhow::Result<()> {
+    println!("create an api key at https://console.anthropic.com and paste it:");
+    let key = read_stdin_line().await?;
+    let key = key.trim().to_string();
+    if key.is_empty() {
+        anyhow::bail!("no key entered");
+    }
+    if key.len() < 8 {
+        anyhow::bail!("key looks too short \u{2014} paste the full key");
+    }
+
+    let path = anthropic_auth_path()?;
+    write_anthropic_api_key(&path, &key)?;
+    println!("anthropic: key saved");
+    print_available_models("anthropic").await;
+    Ok(())
+}
+
+/// OAuth via a Claude Pro/Max subscription, PKCE with a paste-back code
+/// (no localhost callback server). EXPERIMENTAL: not an officially
+/// supported third-party auth flow and may break without notice.
+async fn login_anthropic_oauth() -> anyhow::Result<()> {
+    println!(
+        "[EXPERIMENTAL] OAuth via Claude subscription is not an officially supported third-party flow \u{2014} it may break."
+    );
+    let verifier = random_hex(64);
+    let challenge = base64url_nopad(&sha256(verifier.as_bytes()));
+    let url = build_anthropic_authorize_url(&challenge, &verifier);
+
+    open_browser(&url);
+
+    println!("after approving, paste the code shown (format: code#state):");
+    let pasted = read_stdin_line().await?;
+    let pasted = pasted.trim();
+    let (code, state) = pasted
+        .split_once('#')
+        .ok_or_else(|| anyhow::anyhow!("expected format code#state"))?;
+    if state != verifier {
+        anyhow::bail!("state mismatch \u{2014} try logging in again");
+    }
+
+    let (access_token, refresh_token, expires_in) =
+        exchange_anthropic_code(code, state, &verifier).await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let expires_at = now + expires_in;
+
+    let path = anthropic_auth_path()?;
+    write_anthropic_oauth(&path, &access_token, &refresh_token, expires_at)?;
+    println!("anthropic: logged in (oauth)");
+    print_available_models("anthropic").await;
+    Ok(())
+}
+
+/// Builds the anthropic OAuth authorize URL with the given PKCE challenge.
+/// `state` is the PKCE verifier itself (not a separate CSRF token) \u{2014}
+/// the user pastes both `code` and `state` back from the browser.
+fn build_anthropic_authorize_url(challenge: &str, state: &str) -> String {
+    format!(
+        "{ANTHROPIC_AUTHORIZE_BASE}?code=true&client_id={ANTHROPIC_CLIENT_ID}&response_type=code&redirect_uri={ANTHROPIC_REDIRECT_URI_ENCODED}&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference&code_challenge={challenge}&code_challenge_method=S256&state={state}"
+    )
+}
+
+async fn exchange_anthropic_code(
+    code: &str,
+    state: &str,
+    verifier: &str,
+) -> anyhow::Result<(String, String, u64)> {
+    #[derive(serde::Deserialize)]
+    struct TokenResponse {
+        access_token: String,
+        refresh_token: String,
+        expires_in: u64,
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+    let body = serde_json::json!({
+        "grant_type": "authorization_code",
+        "code": code,
+        "state": state,
+        "client_id": ANTHROPIC_CLIENT_ID,
+        "redirect_uri": ANTHROPIC_REDIRECT_URI,
+        "code_verifier": verifier,
+    });
+    let resp = client.post(ANTHROPIC_TOKEN_URL).json(&body).send().await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let snippet: String = text.chars().take(500).collect();
+        anyhow::bail!("token exchange failed ({status}): {snippet}");
+    }
+    let wire: TokenResponse = resp.json().await?;
+    Ok((wire.access_token, wire.refresh_token, wire.expires_in))
+}
+
+fn write_anthropic_api_key(path: &Path, key: &str) -> anyhow::Result<()> {
+    let value = serde_json::json!({"type": "api", "key": key});
+    let pretty = serde_json::to_string_pretty(&value)?;
+    write_secret_file(path, &pretty)
+}
+
+fn write_anthropic_oauth(
+    path: &Path,
+    access_token: &str,
+    refresh_token: &str,
+    expires_at: u64,
+) -> anyhow::Result<()> {
+    let value = serde_json::json!({
+        "type": "oauth",
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "expires_at": expires_at,
+    });
+    let pretty = serde_json::to_string_pretty(&value)?;
+    write_secret_file(path, &pretty)
+}
+
+/// Reads one line from stdin off the async runtime thread (blocking I/O).
+async fn read_stdin_line() -> anyhow::Result<String> {
+    tokio::task::spawn_blocking(|| {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).map(|_| line)
+    })
+    .await?
+    .map_err(anyhow::Error::from)
+}
+
 // --- opencode-family api-key login ------------------------------------------
 
 async fn login_opencode_key(provider: &str) -> anyhow::Result<()> {
@@ -420,6 +598,11 @@ fn codex_auth_path() -> anyhow::Result<PathBuf> {
 
 fn opencode_auth_path() -> anyhow::Result<PathBuf> {
     kode_model::opencode::default_auth_path()
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve home directory for kode auth store"))
+}
+
+fn anthropic_auth_path() -> anyhow::Result<PathBuf> {
+    kode_model::anthropic::default_auth_path()
         .ok_or_else(|| anyhow::anyhow!("cannot resolve home directory for kode auth store"))
 }
 
@@ -776,5 +959,52 @@ mod tests {
     #[test]
     fn render_model_lines_empty_input_is_empty() {
         assert!(render_model_lines(&[]).is_empty());
+    }
+
+    #[test]
+    fn build_anthropic_authorize_url_contains_required_params() {
+        let url = build_anthropic_authorize_url("chal-abc", "state-xyz");
+        assert!(url.starts_with(ANTHROPIC_AUTHORIZE_BASE));
+        assert!(url.contains("code=true"));
+        assert!(url.contains(&format!("client_id={ANTHROPIC_CLIENT_ID}")));
+        assert!(url.contains("response_type=code"));
+        assert!(url.contains(ANTHROPIC_REDIRECT_URI_ENCODED));
+        assert!(url.contains("code_challenge=chal-abc"));
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains("state=state-xyz"));
+    }
+
+    #[test]
+    fn write_anthropic_api_key_roundtrips_via_kode_model_load() {
+        let dir = temp_dir();
+        let path = dir.join("anthropic.json");
+        write_anthropic_api_key(&path, "sk-ant-test-12345678").unwrap();
+
+        let auth = kode_model::anthropic::load(&path).unwrap();
+        match auth {
+            kode_model::AnthropicAuth::ApiKey(k) => assert_eq!(k, "sk-ant-test-12345678"),
+            other => panic!("expected ApiKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_anthropic_oauth_roundtrips_via_kode_model_load() {
+        let dir = temp_dir();
+        let path = dir.join("anthropic.json");
+        write_anthropic_oauth(&path, "at-123", "rt-456", 999).unwrap();
+
+        let auth = kode_model::anthropic::load(&path).unwrap();
+        match auth {
+            kode_model::AnthropicAuth::OAuth {
+                access_token,
+                refresh_token,
+                expires_at,
+            } => {
+                assert_eq!(access_token, "at-123");
+                assert_eq!(refresh_token, "rt-456");
+                assert_eq!(expires_at, 999);
+            }
+            other => panic!("expected OAuth, got {other:?}"),
+        }
     }
 }

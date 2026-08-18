@@ -1,3 +1,4 @@
+pub mod anthropic;
 pub mod catalog;
 pub mod codex;
 mod error;
@@ -8,6 +9,7 @@ mod sse;
 mod stream;
 mod types;
 
+pub use anthropic::{AnthropicAuth, AnthropicModel};
 pub use codex::{CodexAuth, CodexModel};
 pub use error::{ModelError, Result};
 pub use mock::MockModel;
@@ -24,4 +26,13 @@ pub type ModelStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<Strea
 pub trait Model: Send + Sync {
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream>;
     fn capabilities(&self) -> ModelCapabilities;
+}
+
+/// Test-only support shared across modules. `ENV_LOCK` serializes tests that
+/// mutate process-global environment variables (e.g. `ANTHROPIC_API_KEY`) so
+/// they don't race each other when `cargo test` runs them in parallel
+/// threads within this crate's test binary.
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

@@ -109,6 +109,9 @@ pub async fn run(cwd: &Path) -> anyhow::Result<()> {
                 &opencode_auth_result(&config.model.provider),
             ));
         }
+        "anthropic" => {
+            checks.push(anthropic_check(&anthropic_auth_result()));
+        }
         _ => {}
     }
 
@@ -169,8 +172,9 @@ fn config_check(load: &Result<KodeConfig, String>, exists: bool) -> Check {
     }
 }
 
-const SUPPORTED_PROVIDERS: [&str; 6] = [
+const SUPPORTED_PROVIDERS: [&str; 7] = [
     "openai",
+    "anthropic",
     "codex",
     "opencode-go",
     "opencode",
@@ -274,6 +278,33 @@ fn opencode_check(provider_id: &str, result: &Result<bool, String>) -> Check {
             "opencode auth",
             err.clone(),
             format!("run: kode auth login {provider_id}"),
+        ),
+    }
+}
+
+/// Loads anthropic auth via the default path (falling back to
+/// `ANTHROPIC_API_KEY` when no auth file exists, same as
+/// [`kode_model::anthropic::load`]), collapsing errors to `String` for the
+/// same reason as `codex_auth_result`.
+fn anthropic_auth_result() -> Result<kode_model::AnthropicAuth, String> {
+    let path = kode_model::anthropic::default_auth_path()
+        .ok_or_else(|| "cannot resolve home directory".to_string())?;
+    kode_model::anthropic::load(&path).map_err(|e| e.to_string())
+}
+
+fn anthropic_check(result: &Result<kode_model::AnthropicAuth, String>) -> Check {
+    match result {
+        Ok(kode_model::AnthropicAuth::ApiKey(_)) => {
+            Check::pass("LLM", "anthropic auth", "api key present")
+        }
+        Ok(kode_model::AnthropicAuth::OAuth { .. }) => {
+            Check::pass("LLM", "anthropic auth", "oauth token present")
+        }
+        Err(err) => Check::fail(
+            "LLM",
+            "anthropic auth",
+            err.clone(),
+            "run: kode auth login anthropic (or set ANTHROPIC_API_KEY)",
         ),
     }
 }
@@ -689,7 +720,7 @@ mod tests {
     #[test]
     fn provider_check_other_is_fail() {
         let model = ModelConfig {
-            provider: "anthropic".to_string(),
+            provider: "mystery".to_string(),
             model: "gpt-4".to_string(),
             effort: String::new(),
         };
@@ -697,13 +728,21 @@ mod tests {
         assert_eq!(check.status, CheckStatus::Fail);
         let fix = check.fix.as_deref().unwrap();
         assert!(fix.contains("openai"));
+        assert!(fix.contains("anthropic"));
         assert!(fix.contains("codex"));
         assert!(fix.contains("opencode-go"));
     }
 
     #[test]
     fn provider_check_codex_and_opencode_family_are_pass() {
-        for provider in ["codex", "opencode-go", "opencode", "kilo", "lmstudio"] {
+        for provider in [
+            "anthropic",
+            "codex",
+            "opencode-go",
+            "opencode",
+            "kilo",
+            "lmstudio",
+        ] {
             let model = ModelConfig {
                 provider: provider.to_string(),
                 model: "m".to_string(),
@@ -763,6 +802,37 @@ mod tests {
         let check = opencode_check("kilo", &Ok(false));
         assert_eq!(check.status, CheckStatus::Fail);
         assert_eq!(check.fix.as_deref(), Some("run: kode auth login kilo"));
+    }
+
+    #[test]
+    fn anthropic_check_api_key_is_pass() {
+        let check = anthropic_check(&Ok(kode_model::AnthropicAuth::ApiKey(
+            "sk-ant-test".to_string(),
+        )));
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert_eq!(check.detail, "api key present");
+    }
+
+    #[test]
+    fn anthropic_check_oauth_is_pass() {
+        let check = anthropic_check(&Ok(kode_model::AnthropicAuth::OAuth {
+            access_token: "at".to_string(),
+            refresh_token: "rt".to_string(),
+            expires_at: 123,
+        }));
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert_eq!(check.detail, "oauth token present");
+    }
+
+    #[test]
+    fn anthropic_check_err_is_fail() {
+        let check = anthropic_check(&Err("boom".to_string()));
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert_eq!(check.detail, "boom");
+        assert_eq!(
+            check.fix.as_deref(),
+            Some("run: kode auth login anthropic (or set ANTHROPIC_API_KEY)")
+        );
     }
 
     #[test]

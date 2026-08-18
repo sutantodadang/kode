@@ -27,6 +27,7 @@ pub enum SlashCommand {
 /// The providers `/provider` accepts, in picker display order.
 pub const VALID_PROVIDERS: &[&str] = &[
     "openai",
+    "anthropic",
     "codex",
     "opencode-go",
     "opencode",
@@ -90,15 +91,16 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
 
 /// Auth-state annotation appended to a provider's name in the `/provider`
 /// picker. `" ✓ logged in"` when credentials for that provider are on disk
-/// (or in the environment for `openai`); `" (local)"` always for `lmstudio`
-/// (no login needed — it's a local server); `""` otherwise. Pure — callers
-/// gather `codex_auth`/`opencode_keys`/`env_key` from disk/env once per
-/// picker open.
+/// (or in the environment for `openai`/`anthropic`); `" (local)"` always for
+/// `lmstudio` (no login needed — it's a local server); `""` otherwise. Pure —
+/// callers gather `codex_auth`/`opencode_keys`/`env_key`/`anthropic_auth`
+/// from disk/env once per picker open.
 pub fn provider_auth_state(
     provider: &str,
     codex_auth: bool,
     opencode_keys: &[String],
     env_key: bool,
+    anthropic_auth: bool,
 ) -> &'static str {
     match provider {
         "codex" => {
@@ -117,6 +119,13 @@ pub fn provider_auth_state(
         }
         "openai" => {
             if env_key {
+                " ✓ logged in"
+            } else {
+                ""
+            }
+        }
+        "anthropic" => {
+            if anthropic_auth {
                 " ✓ logged in"
             } else {
                 ""
@@ -181,6 +190,19 @@ pub(crate) fn opencode_key_ids() -> Vec<String> {
 /// provider actually uses.
 pub(crate) fn openai_env_key_present() -> bool {
     std::env::var("OPENAI_API_KEY").is_ok() || std::env::var("KODE_API_KEY").is_ok()
+}
+
+/// True when anthropic credentials are available: either Kode's own auth
+/// store (`~/.kode/auth/anthropic.json`, api key or oauth) exists, or
+/// `ANTHROPIC_API_KEY` is set in the environment.
+pub(crate) fn anthropic_auth_present() -> bool {
+    let file_present = kode_model::anthropic::default_auth_path()
+        .map(|p| p.exists())
+        .unwrap_or(false);
+    file_present
+        || std::env::var("ANTHROPIC_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
 }
 
 /// Validates a reasoning-effort value against
@@ -316,12 +338,13 @@ pub(crate) fn open_provider_picker(state: &mut AppState) {
     let codex_auth = codex_auth_exists();
     let opencode_keys = opencode_key_ids();
     let env_key = openai_env_key_present();
+    let anthropic_auth = anthropic_auth_present();
     state.picker.items = VALID_PROVIDERS
         .iter()
         .map(|p| {
             format!(
                 "{p}{}",
-                provider_auth_state(p, codex_auth, &opencode_keys, env_key)
+                provider_auth_state(p, codex_auth, &opencode_keys, env_key, anthropic_auth)
             )
         })
         .collect();

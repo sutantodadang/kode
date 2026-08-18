@@ -92,8 +92,17 @@ pub async fn run_task(
             .map_err(|e| anyhow::anyhow!("{e}"))?;
             Arc::new(opencode_model) as Arc<dyn kode_model::Model>
         }
+        "anthropic" => {
+            let auth_path = kode_model::anthropic::default_auth_path().ok_or_else(|| {
+                anyhow::anyhow!("cannot resolve home directory for anthropic auth")
+            })?;
+            let anthropic_model =
+                kode_model::AnthropicModel::new(auth_path, config.model.model.clone())
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Arc::new(anthropic_model) as Arc<dyn kode_model::Model>
+        }
         other => anyhow::bail!(
-            "provider {other} not supported yet (supported: openai, codex, opencode-go, opencode, kilo, lmstudio)"
+            "provider {other} not supported yet (supported: openai, anthropic, codex, opencode-go, opencode, kilo, lmstudio)"
         ),
     };
 

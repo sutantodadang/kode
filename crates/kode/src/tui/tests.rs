@@ -714,43 +714,61 @@ fn parse_slash_command_provider_with_arg() {
 #[test]
 fn provider_auth_state_codex_logged_in() {
     assert_eq!(
-        provider_auth_state("codex", true, &[], false),
+        provider_auth_state("codex", true, &[], false, false),
         " ✓ logged in"
     );
 }
 
 #[test]
 fn provider_auth_state_codex_not_logged_in() {
-    assert_eq!(provider_auth_state("codex", false, &[], false), "");
+    assert_eq!(provider_auth_state("codex", false, &[], false, false), "");
 }
 
 #[test]
 fn provider_auth_state_opencode_family_matches_key() {
     let keys = vec!["opencode-go".to_string()];
     assert_eq!(
-        provider_auth_state("opencode-go", false, &keys, false),
+        provider_auth_state("opencode-go", false, &keys, false, false),
         " ✓ logged in"
     );
-    assert_eq!(provider_auth_state("opencode", false, &keys, false), "");
-    assert_eq!(provider_auth_state("kilo", false, &keys, false), "");
+    assert_eq!(
+        provider_auth_state("opencode", false, &keys, false, false),
+        ""
+    );
+    assert_eq!(provider_auth_state("kilo", false, &keys, false, false), "");
 }
 
 #[test]
 fn provider_auth_state_openai_uses_env_key() {
     assert_eq!(
-        provider_auth_state("openai", false, &[], true),
+        provider_auth_state("openai", false, &[], true, false),
         " ✓ logged in"
     );
-    assert_eq!(provider_auth_state("openai", false, &[], false), "");
+    assert_eq!(provider_auth_state("openai", false, &[], false, false), "");
+}
+
+#[test]
+fn provider_auth_state_anthropic_uses_auth_present() {
+    assert_eq!(
+        provider_auth_state("anthropic", false, &[], false, true),
+        " ✓ logged in"
+    );
+    assert_eq!(
+        provider_auth_state("anthropic", false, &[], false, false),
+        ""
+    );
 }
 
 #[test]
 fn provider_auth_state_lmstudio_always_local() {
     assert_eq!(
-        provider_auth_state("lmstudio", false, &[], false),
+        provider_auth_state("lmstudio", false, &[], false, false),
         " (local)"
     );
-    assert_eq!(provider_auth_state("lmstudio", true, &[], true), " (local)");
+    assert_eq!(
+        provider_auth_state("lmstudio", true, &[], true, true),
+        " (local)"
+    );
 }
 
 // -- startup hint (pure fn) ---------------------------------------------

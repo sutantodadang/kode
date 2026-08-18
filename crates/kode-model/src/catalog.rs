@@ -14,6 +14,17 @@ const MODELS_DEV_URL: &str = "https://models.dev/api.json";
 const LMSTUDIO_URL: &str = "http://127.0.0.1:1234/v1/models";
 const OPENAI_MODELS_URL: &str = "https://api.openai.com/v1/models";
 const CODEX_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
+const ANTHROPIC_MODELS_URL: &str = "https://api.anthropic.com/v1/models";
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// Static candidates used when no Anthropic API key is available (OAuth-only
+/// auth) or the live `/v1/models` fetch fails.
+const ANTHROPIC_FALLBACK_MODELS: &[&str] = &[
+    "claude-fable-5",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-haiku-4-5-20251001",
+];
 
 /// Codex CLI release version reported as `client_version` when listing
 /// models. The ChatGPT backend filters its response by this value — an
@@ -47,8 +58,85 @@ pub async fn list_models(
         "opencode-go" | "opencode" | "kilo" => fetch_models_dev(provider).await,
         "lmstudio" => fetch_lmstudio().await,
         "openai" => fetch_openai(api_key_env).await,
+        "anthropic" => Ok(fetch_anthropic_models().await.unwrap_or_else(|_| {
+            ANTHROPIC_FALLBACK_MODELS
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        })),
         other => Err(format!("no model catalog for provider '{other}'")),
     }
+}
+
+/// Resolves an Anthropic API key: `ANTHROPIC_API_KEY` from the environment,
+/// else an `"api"`-type key from Kode's own anthropic auth store. Returns
+/// `None` for OAuth-only auth (or no auth at all) — callers fall back to
+/// [`ANTHROPIC_FALLBACK_MODELS`] in that case.
+fn anthropic_api_key() -> Option<String> {
+    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY")
+        && !key.is_empty()
+    {
+        return Some(key);
+    }
+    let path = crate::anthropic::default_auth_path()?;
+    let content = std::fs::read_to_string(&path).ok()?;
+    let value: Value = serde_json::from_str(&content).ok()?;
+    if value.get("type").and_then(|t| t.as_str()) != Some("api") {
+        return None;
+    }
+    value
+        .get("key")
+        .and_then(|k| k.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Fetches the live Anthropic model list from `GET /v1/models`. Requires an
+/// API key (env or Kode's own auth store) — OAuth-only auth has no
+/// equivalent endpoint, so callers fall back to
+/// [`ANTHROPIC_FALLBACK_MODELS`] when this errors.
+async fn fetch_anthropic_models() -> Result<Vec<String>, String> {
+    let key = anthropic_api_key().ok_or_else(|| "no anthropic api key found".to_string())?;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(ANTHROPIC_MODELS_URL)
+        .header("x-api-key", key)
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .timeout(FETCH_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| format!("anthropic models fetch failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("anthropic models returned {}", resp.status()));
+    }
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("anthropic models read failed: {e}"))?;
+    let ids = parse_anthropic_models(&text)?;
+    if ids.is_empty() {
+        return Err("anthropic models list empty".to_string());
+    }
+    Ok(ids)
+}
+
+/// Extracts model ids (in response order) from an Anthropic
+/// `{"data":[{"id":...},...]}` `/v1/models` response body.
+fn parse_anthropic_models(json: &str) -> Result<Vec<String>, String> {
+    let value: Value =
+        serde_json::from_str(json).map_err(|e| format!("invalid anthropic models JSON: {e}"))?;
+    let data = value
+        .get("data")
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| "missing 'data' array in anthropic models response".to_string())?;
+    let ids: Vec<String> = data
+        .iter()
+        .filter_map(|item| {
+            item.get("id")
+                .and_then(|i| i.as_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+    Ok(ids)
 }
 
 /// Fetches the account's live codex model list from the ChatGPT backend.
@@ -327,5 +415,52 @@ mod tests {
     fn parse_codex_models_invalid_json_errors() {
         let err = parse_codex_models("not json").unwrap_err();
         assert!(err.contains("codex models"));
+    }
+
+    #[test]
+    fn parse_anthropic_models_extracts_ids_in_order() {
+        let json = r#"{"data": [{"id": "claude-opus-5"}, {"id": "claude-sonnet-5"}]}"#;
+        let ids = parse_anthropic_models(json).unwrap();
+        assert_eq!(
+            ids,
+            vec!["claude-opus-5".to_string(), "claude-sonnet-5".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_anthropic_models_missing_data_errors() {
+        let err = parse_anthropic_models("{}").unwrap_err();
+        assert!(err.contains("data"));
+    }
+
+    #[test]
+    fn anthropic_fallback_models_used_when_no_key() {
+        let ids: Vec<String> = ANTHROPIC_FALLBACK_MODELS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(ids.contains(&"claude-sonnet-5".to_string()));
+        assert!(ids.contains(&"claude-opus-5".to_string()));
+        assert!(ids.contains(&"claude-fable-5".to_string()));
+        assert!(ids.contains(&"claude-haiku-4-5-20251001".to_string()));
+    }
+
+    #[tokio::test]
+    async fn list_models_anthropic_falls_back_without_key() {
+        {
+            let _guard = crate::test_support::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            // SAFETY: test-only; ensures a clean slate for this assertion,
+            // serialized via ENV_LOCK. Released before the `.await` below —
+            // clippy (rightly) flags a std Mutex guard held across an await.
+            unsafe {
+                std::env::remove_var("ANTHROPIC_API_KEY");
+            }
+        }
+        let ids = list_models("anthropic", None).await.unwrap();
+        // Never errors for "anthropic" — falls back to the static list when
+        // no key/network is available.
+        assert!(!ids.is_empty());
     }
 }

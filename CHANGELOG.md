@@ -24,6 +24,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Ingat service autostart: when the memory service is unreachable, Kode
   starts the installed service once and retries (`[ingat] autostart`,
   default true). zindeks already autostarts via its stdio child.
+- `anthropic` model provider: streaming Messages API client, API-key auth
+  (default, `ANTHROPIC_API_KEY` env fallback) plus OAuth via a Claude
+  Pro/Max subscription (EXPERIMENTAL, paste-back PKCE — not an officially
+  supported third-party flow). Wired into `kode auth login|status|logout
+  anthropic`, the task pipeline, the TUI `/provider` picker, the model
+  catalog, and `kode doctor`.
 
 ### Fixed
 
