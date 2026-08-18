@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 
 use super::run::perform_copy;
 use super::state::*;
+use crate::custom_commands;
 
 /// A parsed `/`-prefixed slash command.
 #[derive(Debug, Clone, PartialEq)]
@@ -21,8 +22,22 @@ pub enum SlashCommand {
     /// `/resume` — opens the session picker.
     Resume,
     Help,
+    /// `/name [args]` where `name` isn't a builtin. Resolved against
+    /// discovered custom commands at handle time (not parse time) — an
+    /// unmatched name falls back to the same "unknown command" transcript
+    /// line `Unknown` produces.
+    Custom {
+        name: String,
+        args: String,
+    },
     Unknown(String),
 }
+
+/// Builtin command names (lowercase, no leading `/`) — matches
+/// [`SLASH_COMMANDS`]. Custom commands never shadow these; discovery
+/// filters them out up front.
+pub const BUILTIN_COMMAND_NAMES: &[&str] =
+    &["model", "effort", "provider", "copy", "resume", "help"];
 
 /// The providers `/provider` accepts, in picker display order.
 pub const VALID_PROVIDERS: &[&str] = &[
@@ -47,16 +62,27 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
 
 /// Hint-menu rows for the current input. Non-empty only while the input is a
 /// bare `/`-prefixed token with no whitespace (once arguments start, the menu
-/// hides). Bare `/` lists every command; `/mo` narrows by prefix.
-pub fn slash_hint_items(input: &str) -> Vec<(&'static str, &'static str)> {
+/// hides). Bare `/` lists every command; `/mo` narrows by prefix. Builtins
+/// come first (in [`SLASH_COMMANDS`] order), then discovered custom
+/// commands sorted by name — `custom` is gathered by the caller via
+/// [`custom_commands::discover`] so this stays a pure, filesystem-free
+/// function.
+pub fn slash_hint_items(
+    input: &str,
+    custom: &[custom_commands::CustomCommand],
+) -> Vec<(String, String)> {
     if !input.starts_with('/') || input.contains(char::is_whitespace) {
         return Vec::new();
     }
-    SLASH_COMMANDS
+    let builtins = SLASH_COMMANDS
         .iter()
-        .copied()
         .filter(|(name, _)| name.starts_with(input))
-        .collect()
+        .map(|(name, desc)| (name.to_string(), desc.to_string()));
+    let customs = custom
+        .iter()
+        .map(|c| (format!("/{}", c.name), c.description.clone()))
+        .filter(|(name, _)| name.starts_with(input));
+    builtins.chain(customs).collect()
 }
 
 /// Parses `input` as a slash command. Returns `None` when `input` doesn't
@@ -85,7 +111,17 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "/copy" => SlashCommand::Copy,
         "/resume" => SlashCommand::Resume,
         "/help" => SlashCommand::Help,
-        other => SlashCommand::Unknown(other.to_string()),
+        other => {
+            let name = other.trim_start_matches('/').to_lowercase();
+            if name.is_empty() {
+                SlashCommand::Unknown(other.to_string())
+            } else {
+                SlashCommand::Custom {
+                    name,
+                    args: rest.to_string(),
+                }
+            }
+        }
     })
 }
 
@@ -377,13 +413,21 @@ pub(crate) fn apply_provider_selection(
 /// argument opens the picker (async catalog fetch via `picker_tx`); every
 /// other successful set persists immediately to
 /// `<cwd>/.kode/config.toml` via [`KodeConfig::update_model_selection`].
+///
+/// Returns `Some(expanded_prompt)` only for `SlashCommand::Custom` once
+/// resolved against a discovered `.kode/commands`/`~/.kode/commands`
+/// template — the caller (`tui::run`) submits it as an ordinary task
+/// through the exact same path a typed non-slash prompt takes. Every other
+/// variant returns `None`; its side effects (state/config mutation,
+/// transcript notes, picker opens) are applied in place.
 pub(crate) fn handle_slash_command(
     state: &mut AppState,
     cwd: &Path,
     config: &mut KodeConfig,
     picker_tx: &mpsc::UnboundedSender<PickerLoaded>,
     cmd: SlashCommand,
-) {
+) -> Option<String> {
+    let mut submit = None;
     match cmd {
         SlashCommand::Model(None) => {
             open_picker(state, config.model.provider.clone(), picker_tx);
@@ -465,6 +509,24 @@ pub(crate) fn handle_slash_command(
                  opens the Ledger, Esc closes the Ledger or cancels the run",
             ));
         }
+        SlashCommand::Custom { name, args } => {
+            let matched = custom_commands::discover(cwd, BUILTIN_COMMAND_NAMES)
+                .into_iter()
+                .find(|c| c.name == name);
+            match matched {
+                Some(found) => match custom_commands::expand(&found.path, &args) {
+                    Ok(expanded) => submit = Some(expanded),
+                    Err(e) => state.transcript.push(TranscriptLine::new(
+                        Gutter::Error,
+                        format!("custom command '/{name}' failed to expand: {e}"),
+                    )),
+                },
+                None => state.transcript.push(TranscriptLine::new(
+                    Gutter::Note,
+                    format!("unknown command: /{name}"),
+                )),
+            }
+        }
         SlashCommand::Unknown(cmd) => {
             state.transcript.push(TranscriptLine::new(
                 Gutter::Note,
@@ -472,4 +534,5 @@ pub(crate) fn handle_slash_command(
             ));
         }
     }
+    submit
 }

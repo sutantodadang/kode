@@ -8,6 +8,7 @@ use kode_core::event::{EventBus, KodeEvent};
 use kode_tools::permission::PermissionHandler;
 use tokio::sync::broadcast::error::RecvError;
 
+use crate::custom_commands;
 use crate::pipeline;
 use crate::session;
 
@@ -44,6 +45,14 @@ pub async fn run(
     if let Some(effort) = effort_override {
         config.model.effort = effort;
     }
+
+    let expanded_task;
+    let task: &str = if task.trim_start().starts_with('/') {
+        expanded_task = resolve_custom_task(task, cwd)?;
+        &expanded_task
+    } else {
+        task
+    };
 
     let session_id = if continue_session {
         session::latest(cwd)
@@ -190,6 +199,38 @@ fn lagged_note(n: u64) -> String {
     format!("◆ event stream lagged — {n} events dropped")
 }
 
+/// Resolves a `/`-prefixed TASK into its expanded custom-command prompt by
+/// looking it up against commands discovered under `.kode/commands` and
+/// `~/.kode/commands`. Errors (never panics) when the name doesn't match
+/// any discovered command — listing the available ones — or when the
+/// matched template file can't be read.
+fn resolve_custom_task(task: &str, cwd: &Path) -> anyhow::Result<String> {
+    let trimmed = task.trim();
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let cmd = parts.next().unwrap_or("");
+    let args = parts.next().unwrap_or("").trim();
+    let name = cmd.trim_start_matches('/').to_lowercase();
+
+    let commands = custom_commands::discover(cwd, &[]);
+    match commands.iter().find(|c| c.name == name) {
+        Some(found) => Ok(custom_commands::expand(&found.path, args)?),
+        None => {
+            let available = commands
+                .iter()
+                .map(|c| format!("/{}", c.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if available.is_empty() {
+                anyhow::bail!(
+                    "unknown command '/{name}' (no custom commands found in .kode/commands or ~/.kode/commands)"
+                );
+            } else {
+                anyhow::bail!("unknown command '/{name}' (available: {available})");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +238,48 @@ mod tests {
     #[test]
     fn lagged_note_reports_dropped_count() {
         assert_eq!(lagged_note(7), "◆ event stream lagged — 7 events dropped");
+    }
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "kode-exec-test-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn resolve_custom_task_expands_matched_command() {
+        let dir = temp_dir("match");
+        let cmds = dir.join(".kode").join("commands");
+        std::fs::create_dir_all(&cmds).unwrap();
+        std::fs::write(cmds.join("review.md"), "Review: $ARGUMENTS").unwrap();
+
+        let expanded = resolve_custom_task("/review the diff", &dir).unwrap();
+        assert_eq!(expanded, "Review: the diff");
+    }
+
+    #[test]
+    fn resolve_custom_task_unknown_name_lists_available() {
+        let dir = temp_dir("unknown");
+        let cmds = dir.join(".kode").join("commands");
+        std::fs::create_dir_all(&cmds).unwrap();
+        std::fs::write(cmds.join("review.md"), "Review: $ARGUMENTS").unwrap();
+
+        let err = resolve_custom_task("/nope", &dir).unwrap_err();
+        assert!(err.to_string().contains("unknown command '/nope'"));
+        assert!(err.to_string().contains("/review"));
+    }
+
+    #[test]
+    fn resolve_custom_task_unknown_name_no_commands_found() {
+        let dir = temp_dir("empty");
+        let err = resolve_custom_task("/nope", &dir).unwrap_err();
+        assert!(err.to_string().contains("no custom commands found"));
     }
 }

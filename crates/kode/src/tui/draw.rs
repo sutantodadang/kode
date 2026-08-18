@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use ratatui::layout::{Constraint, Layout};
@@ -9,10 +10,11 @@ use ratatui::widgets::{
 
 use kode_core::event::TaskStep;
 
-use super::commands::{picker_filtered_items, slash_hint_items};
+use super::commands::{BUILTIN_COMMAND_NAMES, picker_filtered_items, slash_hint_items};
 use super::markdown;
 use super::state::*;
 use super::theme;
+use crate::custom_commands;
 
 /// Renders an 8-cell (by default) meter string: `▓` for filled cells,
 /// `░` for empty ones. `budget == 0` yields an all-empty meter (no
@@ -750,7 +752,7 @@ pub(crate) fn total_wrapped_rows(lines: &[Line<'static>], width: u16) -> usize {
         .sum()
 }
 
-pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState) {
+pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
     let band_lines = if state.ledger_open {
         // The Ledger view replaces the band + transcript area entirely.
         None
@@ -776,8 +778,13 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState) {
     if has_pending {
         constraints.push(Constraint::Length(3));
     }
-    let hint_items = if !state.picker.open && state.pending.is_empty() && !state.ledger_open {
-        slash_hint_items(&state.input)
+    let hint_items = if !state.picker.open
+        && state.pending.is_empty()
+        && !state.ledger_open
+        && state.input.starts_with('/')
+    {
+        let custom = custom_commands::discover(cwd, BUILTIN_COMMAND_NAMES);
+        slash_hint_items(&state.input, &custom)
     } else {
         Vec::new()
     };
@@ -944,10 +951,7 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState) {
 
 /// Hint-menu lines: highlighted row gets a `›` marker and bold name; others
 /// indent. Descriptions render muted. No borders — DESIGN.md overlay rules.
-pub(crate) fn slash_hint_lines(
-    items: &[(&'static str, &'static str)],
-    selected: usize,
-) -> Vec<Line<'static>> {
+pub(crate) fn slash_hint_lines(items: &[(String, String)], selected: usize) -> Vec<Line<'static>> {
     let name_w = items
         .iter()
         .map(|(n, _)| n.chars().count())

@@ -1,4 +1,5 @@
 mod auth;
+mod custom_commands;
 mod doctor;
 mod exec;
 mod models;

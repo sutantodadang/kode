@@ -89,6 +89,12 @@ kode exec --model gpt-5.6-sol --effort high "refactor the auth module for testab
 kode exec -c "now add tests for that refactor"
 ```
 
+`TASK` may also be a custom slash command (`/name [args]`) — see [howto-custom-commands.md](./howto-custom-commands.md). It's expanded from its `.md` template before the task runs; an unrecognized `/name` fails with an error listing the commands discovered in `.kode/commands/` and `~/.kode/commands/`.
+
+```
+kode exec "/review the auth module"
+```
+
 ## `kode models`
 
 List available models for the currently configured provider, fetched live from the backend where supported.
@@ -167,6 +173,7 @@ Available inside the interactive `kode` TUI, with a live hint menu as you type `
 | `/copy` | Copy the last response or selection. |
 | `/resume` | Open a picker over sessions in `.kode/sessions/` and resume one. |
 | `/help` | Show available commands. |
+| `/name [args]` | Custom command — expands the `.kode/commands/name.md` or `~/.kode/commands/name.md` template and submits it as a task. See [howto-custom-commands.md](./howto-custom-commands.md). |
 
 The breadcrumb at the top of the TUI shows the current provider/model/effort and a context meter (`ctx X/Yk`), which tracks the knowledge-context budget (`[agent] context_budget_tokens`), not the model's context window.
 
@@ -175,4 +182,5 @@ The breadcrumb at the top of the TUI shows the current provider/model/effort and
 - [tutorial-getting-started.md](./tutorial-getting-started.md): commands in a real walkthrough
 - [reference-config.md](./reference-config.md): config keys behind these flags
 - [howto-auth-providers.md](./howto-auth-providers.md): `auth` subcommand in depth
+- [howto-custom-commands.md](./howto-custom-commands.md): user-defined slash commands
 - [../README.md](../README.md)

@@ -26,6 +26,7 @@ use super::commands::*;
 use super::draw::{aperture_should_collapse, draw};
 use super::events::apply_event;
 use super::state::*;
+use crate::custom_commands;
 use crate::pipeline;
 
 /// Sends permission requests from tool execution to the UI loop, then awaits
@@ -103,6 +104,67 @@ pub(crate) fn spawn_git_poll(cwd: std::path::PathBuf, tx: mpsc::UnboundedSender<
     });
 }
 
+/// Starts `task` running through the pipeline: resets per-run state, pushes
+/// the user transcript line, and spawns the task future. Shared by the
+/// plain-text Enter path and expanded custom-slash-command prompts so both
+/// go through the exact same pipeline invocation — returns the child
+/// cancellation token to track as `current_cancel`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn submit_task(
+    state: &mut AppState,
+    cwd: &Path,
+    config: &KodeConfig,
+    cancel: &CancellationToken,
+    events: &EventBus,
+    handler: &Arc<dyn PermissionHandler>,
+    task: String,
+) -> CancellationToken {
+    state.start_new_task(&task);
+    state
+        .transcript
+        .push(TranscriptLine::new(Gutter::User, task.clone()));
+    let child = cancel.child_token();
+    state.running = true;
+    state.status.state = RunState::Thinking;
+
+    let task_events = events.clone();
+    let task_cwd = cwd.to_path_buf();
+    let mut task_config = config.clone();
+    if state.auto_mode {
+        // Belt and braces alongside TuiPermission's `auto` flag: skip the
+        // Ask path entirely for runs started while auto mode is on.
+        task_config.permissions.default_mode = PermissionMode::Allow;
+    }
+    let task_handler = handler.clone();
+    let task_history: Vec<kode_agent::HistoryTurn> = state
+        .history
+        .iter()
+        .map(|t| kode_agent::HistoryTurn {
+            task: t.task.clone(),
+            response: t.response.clone(),
+        })
+        .collect();
+    let task_child = child.clone();
+    tokio::spawn(async move {
+        if let Err(err) = pipeline::run_task(
+            &task,
+            &task_cwd,
+            &task_config,
+            task_events.clone(),
+            task_handler,
+            task_child,
+            &task_history,
+        )
+        .await
+        {
+            task_events.emit(KodeEvent::AgentError {
+                message: err.to_string(),
+            });
+        }
+    });
+    child
+}
+
 /// Launches the interactive TUI. Runs until the user quits (Ctrl-C/'q' while
 /// idle) or the process is otherwise terminated. `continue_` resumes the
 /// latest session: transcript replayed, history armed for the model.
@@ -170,7 +232,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
     let mut current_cancel: Option<CancellationToken> = None;
     let mut aperture_tick = tokio::time::interval(Duration::from_millis(100));
 
-    terminal.draw(|f| draw(f, &mut state))?;
+    terminal.draw(|f| draw(f, &mut state, cwd))?;
 
     'outer: loop {
         tokio::select! {
@@ -224,68 +286,34 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                 PickerOutcome::Continue => {}
                             }
                         } else {
-                            if handle_key(&mut state, key.code, key.modifiers, &current_cancel) {
+                            if handle_key(&mut state, cwd, key.code, key.modifiers, &current_cancel) {
                                 break 'outer;
                             }
                             if key.code == KeyCode::Enter && !state.running && !state.input.trim().is_empty() {
                                 let mut input = std::mem::take(&mut state.input);
-                                let hints = slash_hint_items(&input);
+                                let custom = custom_commands::discover(cwd, BUILTIN_COMMAND_NAMES);
+                                let hints = slash_hint_items(&input, &custom);
                                 if !hints.is_empty() {
                                     // Enter on a hint row completes to the highlighted command.
-                                    input = hints[state.slash_selected.min(hints.len() - 1)].0.to_string();
+                                    input = hints[state.slash_selected.min(hints.len() - 1)].0.clone();
                                     state.slash_selected = 0;
                                 }
                                 if let Some(cmd) = parse_slash_command(&input) {
-                                    handle_slash_command(&mut state, cwd, &mut config, &picker_tx, cmd);
+                                    if let Some(expanded) =
+                                        handle_slash_command(&mut state, cwd, &mut config, &picker_tx, cmd)
+                                    {
+                                        current_cancel = Some(submit_task(
+                                            &mut state, cwd, &config, &cancel, &events, &handler, expanded,
+                                        ));
+                                    }
                                 } else if state.status.model.is_empty() {
                                     state.transcript.push(TranscriptLine::new(Gutter::Note, "pick a model first"));
                                     open_picker(&mut state, config.model.provider.clone(), &picker_tx);
                                 } else {
                                     let task = input;
-                                    state.start_new_task(&task);
-                                    state
-                                        .transcript
-                                        .push(TranscriptLine::new(Gutter::User, task.clone()));
-                                    let child = cancel.child_token();
-                                    current_cancel = Some(child.clone());
-                                    state.running = true;
-                                    state.status.state = RunState::Thinking;
-
-                                    let task_events = events.clone();
-                                    let task_cwd = cwd.to_path_buf();
-                                    let mut task_config = config.clone();
-                                    if state.auto_mode {
-                                        // Belt and braces alongside TuiPermission's
-                                        // `auto` flag: skip the Ask path entirely for
-                                        // runs started while auto mode is on.
-                                        task_config.permissions.default_mode = PermissionMode::Allow;
-                                    }
-                                    let task_handler = handler.clone();
-                                    let task_history: Vec<kode_agent::HistoryTurn> = state
-                                        .history
-                                        .iter()
-                                        .map(|t| kode_agent::HistoryTurn {
-                                            task: t.task.clone(),
-                                            response: t.response.clone(),
-                                        })
-                                        .collect();
-                                    tokio::spawn(async move {
-                                        if let Err(err) = pipeline::run_task(
-                                            &task,
-                                            &task_cwd,
-                                            &task_config,
-                                            task_events.clone(),
-                                            task_handler,
-                                            child,
-                                            &task_history,
-                                        )
-                                        .await
-                                        {
-                                            task_events.emit(KodeEvent::AgentError {
-                                                message: err.to_string(),
-                                            });
-                                        }
-                                    });
+                                    current_cancel = Some(submit_task(
+                                        &mut state, cwd, &config, &cancel, &events, &handler, task,
+                                    ));
                                 }
                             }
                         }
@@ -367,7 +395,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
             }
         }
 
-        terminal.draw(|f| draw(f, &mut state))?;
+        terminal.draw(|f| draw(f, &mut state, cwd))?;
     }
 
     if let Some(child) = current_cancel {
@@ -381,6 +409,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
 /// Handles one key press. Returns `true` if the app should quit.
 pub(crate) fn handle_key(
     state: &mut AppState,
+    cwd: &Path,
     code: KeyCode,
     modifiers: KeyModifiers,
     current_cancel: &Option<CancellationToken>,
@@ -415,11 +444,16 @@ pub(crate) fn handle_key(
         return false;
     }
 
-    let hint_count = if state.pending.is_empty() && !state.picker.open {
-        slash_hint_items(&state.input).len()
-    } else {
-        0
-    };
+    // Gate the discovery scan on `/`-prefixed input — cheap for normal
+    // typing, and `slash_hint_items` would return empty for anything else
+    // anyway.
+    let hint_count =
+        if state.pending.is_empty() && !state.picker.open && state.input.starts_with('/') {
+            let custom = custom_commands::discover(cwd, BUILTIN_COMMAND_NAMES);
+            slash_hint_items(&state.input, &custom).len()
+        } else {
+            0
+        };
 
     match code {
         KeyCode::Esc => {
@@ -448,8 +482,9 @@ pub(crate) fn handle_key(
             }
         }
         KeyCode::Tab if hint_count > 0 => {
-            let items = slash_hint_items(&state.input);
-            let (name, _) = items[state.slash_selected.min(items.len() - 1)];
+            let custom = custom_commands::discover(cwd, BUILTIN_COMMAND_NAMES);
+            let items = slash_hint_items(&state.input, &custom);
+            let (name, _) = items[state.slash_selected.min(items.len() - 1)].clone();
             state.input = format!("{name} ");
             state.slash_selected = 0;
         }

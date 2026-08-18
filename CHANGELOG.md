@@ -30,6 +30,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   supported third-party flow). Wired into `kode auth login|status|logout
   anthropic`, the task pipeline, the TUI `/provider` picker, the model
   catalog, and `kode doctor`.
+- User-defined custom slash commands: markdown prompt templates discovered
+  from `.kode/commands/*.md` (repo) and `~/.kode/commands/*.md`
+  (user-global), expanded (with `$ARGUMENTS` substitution) into task
+  prompts in both the TUI and `kode exec`. See
+  [howto-custom-commands.md](./docs/howto-custom-commands.md).
 
 ### Fixed
 

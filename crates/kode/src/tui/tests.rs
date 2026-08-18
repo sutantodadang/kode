@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::custom_commands;
 use crossterm::event::{KeyCode, KeyModifiers, MouseEventKind};
 use kode_context::git::{NumstatRow, RepoState};
 use kode_core::config::KodeConfig;
@@ -412,7 +413,13 @@ async fn handle_key_y_resolves_pending_permission() {
         summary: "allow?".into(),
         responder: tx,
     });
-    let quit = handle_key(&mut s, KeyCode::Char('y'), KeyModifiers::NONE, &None);
+    let quit = handle_key(
+        &mut s,
+        std::path::Path::new("."),
+        KeyCode::Char('y'),
+        KeyModifiers::NONE,
+        &None,
+    );
     assert!(!quit);
     assert!(s.pending.is_empty());
     assert!(rx.await.unwrap());
@@ -426,7 +433,13 @@ async fn handle_key_n_resolves_pending_permission_as_false() {
         summary: "allow?".into(),
         responder: tx,
     });
-    let quit = handle_key(&mut s, KeyCode::Char('n'), KeyModifiers::NONE, &None);
+    let quit = handle_key(
+        &mut s,
+        std::path::Path::new("."),
+        KeyCode::Char('n'),
+        KeyModifiers::NONE,
+        &None,
+    );
     assert!(!quit);
     assert!(!rx.await.unwrap());
 }
@@ -436,6 +449,7 @@ fn handle_key_q_quits_when_idle_and_input_empty() {
     let mut s = state();
     assert!(handle_key(
         &mut s,
+        std::path::Path::new("."),
         KeyCode::Char('q'),
         KeyModifiers::NONE,
         &None
@@ -448,6 +462,7 @@ fn handle_key_q_types_when_input_nonempty() {
     s.input.push_str("say ");
     assert!(!handle_key(
         &mut s,
+        std::path::Path::new("."),
         KeyCode::Char('q'),
         KeyModifiers::NONE,
         &None
@@ -459,7 +474,13 @@ fn handle_key_q_types_when_input_nonempty() {
 fn handle_key_backspace_edits_input() {
     let mut s = state();
     s.input.push_str("abc");
-    handle_key(&mut s, KeyCode::Backspace, KeyModifiers::NONE, &None);
+    handle_key(
+        &mut s,
+        std::path::Path::new("."),
+        KeyCode::Backspace,
+        KeyModifiers::NONE,
+        &None,
+    );
     assert_eq!(s.input, "ab");
 }
 
@@ -467,10 +488,22 @@ fn handle_key_backspace_edits_input() {
 fn handle_key_scroll_updates_position_and_follow() {
     let mut s = state();
     s.scroll = 5;
-    handle_key(&mut s, KeyCode::Up, KeyModifiers::NONE, &None);
+    handle_key(
+        &mut s,
+        std::path::Path::new("."),
+        KeyCode::Up,
+        KeyModifiers::NONE,
+        &None,
+    );
     assert_eq!(s.scroll, 4);
     assert!(!s.follow);
-    handle_key(&mut s, KeyCode::PageDown, KeyModifiers::NONE, &None);
+    handle_key(
+        &mut s,
+        std::path::Path::new("."),
+        KeyCode::PageDown,
+        KeyModifiers::NONE,
+        &None,
+    );
     assert_eq!(s.scroll, 14);
 }
 
@@ -561,9 +594,21 @@ fn scrollbar_state_visible_reports_length_and_clamped_position() {
 fn handle_key_ctrl_k_toggles_knowledge_band() {
     let mut s = state();
     assert!(s.knowledge_band_open);
-    handle_key(&mut s, KeyCode::Char('k'), KeyModifiers::CONTROL, &None);
+    handle_key(
+        &mut s,
+        std::path::Path::new("."),
+        KeyCode::Char('k'),
+        KeyModifiers::CONTROL,
+        &None,
+    );
     assert!(!s.knowledge_band_open);
-    handle_key(&mut s, KeyCode::Char('k'), KeyModifiers::CONTROL, &None);
+    handle_key(
+        &mut s,
+        std::path::Path::new("."),
+        KeyCode::Char('k'),
+        KeyModifiers::CONTROL,
+        &None,
+    );
     assert!(s.knowledge_band_open);
 }
 
@@ -686,10 +731,36 @@ fn parse_slash_command_help() {
 }
 
 #[test]
-fn parse_slash_command_unknown() {
+fn parse_slash_command_non_builtin_name_is_custom() {
+    // Non-builtin names parse as `Custom` — resolved against discovered
+    // commands at handle time, not parse time. An unmatched name still
+    // ends up producing the same "unknown command" transcript line
+    // `Unknown` used to (see `handle_slash_command_custom_unmatched_...`).
     assert_eq!(
         parse_slash_command("/nonsense arg"),
-        Some(SlashCommand::Unknown("/nonsense".to_string()))
+        Some(SlashCommand::Custom {
+            name: "nonsense".to_string(),
+            args: "arg".to_string(),
+        })
+    );
+}
+
+#[test]
+fn parse_slash_command_custom_name_normalized_lowercase() {
+    assert_eq!(
+        parse_slash_command("/Review some diff"),
+        Some(SlashCommand::Custom {
+            name: "review".to_string(),
+            args: "some diff".to_string(),
+        })
+    );
+}
+
+#[test]
+fn parse_slash_command_bare_slash_is_unknown() {
+    assert_eq!(
+        parse_slash_command("/"),
+        Some(SlashCommand::Unknown("/".to_string()))
     );
 }
 
@@ -1644,12 +1715,24 @@ fn backtab_toggles_auto_mode_and_shared_flag() {
     assert!(!s.auto_mode);
     assert!(!s.auto_flag.load(Ordering::Relaxed));
 
-    handle_key(&mut s, KeyCode::BackTab, KeyModifiers::NONE, &None);
+    handle_key(
+        &mut s,
+        std::path::Path::new("."),
+        KeyCode::BackTab,
+        KeyModifiers::NONE,
+        &None,
+    );
     assert!(s.auto_mode);
     assert!(s.auto_flag.load(Ordering::Relaxed));
     assert!(s.transcript.iter().any(|l| l.text.contains("auto mode on")));
 
-    handle_key(&mut s, KeyCode::BackTab, KeyModifiers::NONE, &None);
+    handle_key(
+        &mut s,
+        std::path::Path::new("."),
+        KeyCode::BackTab,
+        KeyModifiers::NONE,
+        &None,
+    );
     assert!(!s.auto_mode);
     assert!(!s.auto_flag.load(Ordering::Relaxed));
     assert!(s.transcript.iter().any(|l| l.text == "auto mode off"));
@@ -1699,7 +1782,13 @@ fn perform_copy_with_empty_last_response_notes_nothing_to_copy() {
 #[test]
 fn ctrl_y_triggers_copy_path() {
     let mut s = state();
-    handle_key(&mut s, KeyCode::Char('y'), KeyModifiers::CONTROL, &None);
+    handle_key(
+        &mut s,
+        std::path::Path::new("."),
+        KeyCode::Char('y'),
+        KeyModifiers::CONTROL,
+        &None,
+    );
     assert_eq!(s.transcript.len(), 1);
     assert_eq!(s.transcript[0].gutter, Gutter::Note);
 }
@@ -1799,6 +1888,82 @@ fn handle_slash_command_resume_with_sessions_opens_picker() {
     assert_eq!(s.picker.items.len(), 1);
     assert!(s.picker.items[0].starts_with(&id));
     assert!(s.picker.items[0].contains("fix the bug"));
+}
+
+// -- handle_slash_command: custom commands -----------------------------
+
+fn write_custom_command(dir: &std::path::Path, name: &str, content: &str) {
+    let cmds = dir.join(".kode").join("commands");
+    std::fs::create_dir_all(&cmds).unwrap();
+    std::fs::write(cmds.join(format!("{name}.md")), content).unwrap();
+}
+
+#[test]
+fn handle_slash_command_custom_submits_expanded_prompt() {
+    let dir = temp_project_dir();
+    write_custom_command(&dir, "review", "Review carefully: $ARGUMENTS");
+    let mut s = state();
+    let mut cfg = KodeConfig::default();
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    let submitted = handle_slash_command(
+        &mut s,
+        &dir,
+        &mut cfg,
+        &tx,
+        SlashCommand::Custom {
+            name: "review".to_string(),
+            args: "the diff".to_string(),
+        },
+    );
+
+    assert_eq!(submitted, Some("Review carefully: the diff".to_string()));
+}
+
+#[test]
+fn handle_slash_command_custom_unmatched_name_reports_unknown() {
+    let dir = temp_project_dir();
+    let mut s = state();
+    let mut cfg = KodeConfig::default();
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    let submitted = handle_slash_command(
+        &mut s,
+        &dir,
+        &mut cfg,
+        &tx,
+        SlashCommand::Custom {
+            name: "nope".to_string(),
+            args: String::new(),
+        },
+    );
+
+    assert_eq!(submitted, None);
+    assert!(
+        s.transcript
+            .iter()
+            .any(|l| l.text.contains("unknown command: /nope"))
+    );
+}
+
+#[test]
+fn handle_slash_command_builtin_name_never_shadowed_by_custom_file() {
+    // A `.kode/commands/help.md` file exists, but `/help` still parses to
+    // the builtin `SlashCommand::Help` (matched literally before any
+    // custom-command lookup happens), so it keeps producing the builtin
+    // help text rather than being submitted as an expanded task.
+    let dir = temp_project_dir();
+    write_custom_command(&dir, "help", "this should never run");
+    let mut s = state();
+    let mut cfg = KodeConfig::default();
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    assert_eq!(parse_slash_command("/help"), Some(SlashCommand::Help));
+
+    let submitted = handle_slash_command(&mut s, &dir, &mut cfg, &tx, SlashCommand::Help);
+
+    assert_eq!(submitted, None);
+    assert!(s.transcript.iter().any(|l| l.text.contains("/model")));
 }
 
 // -- last_response tracking -----------------------------------------------
@@ -2051,82 +2216,117 @@ fn flushed_bold_line_splits_into_styled_spans() {
 
 #[test]
 fn slash_hint_items_bare_slash_lists_all() {
-    assert_eq!(slash_hint_items("/").len(), SLASH_COMMANDS.len());
+    assert_eq!(slash_hint_items("/", &[]).len(), SLASH_COMMANDS.len());
     assert!(SLASH_COMMANDS.iter().any(|(name, _)| *name == "/resume"));
 }
 
 #[test]
 fn slash_hint_items_prefix_narrows() {
-    let items = slash_hint_items("/mo");
+    let items = slash_hint_items("/mo", &[]);
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].0, "/model");
 }
 
 #[test]
 fn slash_hint_items_non_slash_is_empty() {
-    assert!(slash_hint_items("hello").is_empty());
+    assert!(slash_hint_items("hello", &[]).is_empty());
 }
 
 #[test]
 fn slash_hint_items_hides_once_args_typed() {
-    assert!(slash_hint_items("/model g").is_empty());
+    assert!(slash_hint_items("/model g", &[]).is_empty());
+}
+
+#[test]
+fn slash_hint_items_merges_custom_after_builtins() {
+    let custom = vec![custom_commands::CustomCommand {
+        name: "review".to_string(),
+        description: "review a diff".to_string(),
+        path: std::path::PathBuf::from("review.md"),
+    }];
+    let items = slash_hint_items("/", &custom);
+    assert_eq!(items.len(), SLASH_COMMANDS.len() + 1);
+    assert_eq!(items.last().unwrap().0, "/review");
+    assert_eq!(items.last().unwrap().1, "review a diff");
+}
+
+#[test]
+fn slash_hint_items_custom_filtered_by_prefix() {
+    let custom = vec![custom_commands::CustomCommand {
+        name: "review".to_string(),
+        description: "review a diff".to_string(),
+        path: std::path::PathBuf::from("review.md"),
+    }];
+    let items = slash_hint_items("/rev", &custom);
+    assert_eq!(
+        items,
+        vec![("/review".to_string(), "review a diff".to_string())]
+    );
 }
 
 #[test]
 fn handle_key_down_moves_hint_selection_not_scroll() {
+    let dir = temp_project_dir();
     let mut s = state();
     s.input = "/".to_string();
-    handle_key(&mut s, KeyCode::Down, KeyModifiers::NONE, &None);
+    handle_key(&mut s, &dir, KeyCode::Down, KeyModifiers::NONE, &None);
     assert_eq!(s.slash_selected, 1);
     assert_eq!(s.scroll, 0);
 }
 
 #[test]
 fn handle_key_up_down_clamp_hint_selection() {
+    let dir = temp_project_dir();
     let mut s = state();
     s.input = "/".to_string();
     for _ in 0..SLASH_COMMANDS.len() + 2 {
-        handle_key(&mut s, KeyCode::Down, KeyModifiers::NONE, &None);
+        handle_key(&mut s, &dir, KeyCode::Down, KeyModifiers::NONE, &None);
     }
     assert_eq!(s.slash_selected, SLASH_COMMANDS.len() - 1);
     for _ in 0..SLASH_COMMANDS.len() + 2 {
-        handle_key(&mut s, KeyCode::Up, KeyModifiers::NONE, &None);
+        handle_key(&mut s, &dir, KeyCode::Up, KeyModifiers::NONE, &None);
     }
     assert_eq!(s.slash_selected, 0);
 }
 
 #[test]
 fn handle_key_tab_completes_highlighted_command() {
+    let dir = temp_project_dir();
     let mut s = state();
     s.input = "/".to_string();
-    handle_key(&mut s, KeyCode::Down, KeyModifiers::NONE, &None);
-    handle_key(&mut s, KeyCode::Tab, KeyModifiers::NONE, &None);
+    handle_key(&mut s, &dir, KeyCode::Down, KeyModifiers::NONE, &None);
+    handle_key(&mut s, &dir, KeyCode::Tab, KeyModifiers::NONE, &None);
     assert_eq!(s.input, "/effort ");
     assert_eq!(s.slash_selected, 0);
 }
 
 #[test]
 fn handle_key_typing_resets_hint_selection() {
+    let dir = temp_project_dir();
     let mut s = state();
     s.input = "/".to_string();
     s.slash_selected = 2;
-    handle_key(&mut s, KeyCode::Char('m'), KeyModifiers::NONE, &None);
+    handle_key(&mut s, &dir, KeyCode::Char('m'), KeyModifiers::NONE, &None);
     assert_eq!(s.slash_selected, 0);
     assert_eq!(s.input, "/m");
 }
 
 #[test]
 fn handle_key_esc_clears_input_when_hint_visible() {
+    let dir = temp_project_dir();
     let mut s = state();
     s.input = "/mo".to_string();
-    handle_key(&mut s, KeyCode::Esc, KeyModifiers::NONE, &None);
+    handle_key(&mut s, &dir, KeyCode::Esc, KeyModifiers::NONE, &None);
     assert!(s.input.is_empty());
     assert!(!s.running);
 }
 
 #[test]
 fn slash_hint_lines_marks_selected_row() {
-    let items: Vec<(&'static str, &'static str)> = vec![("/model", "a"), ("/effort", "b")];
+    let items: Vec<(String, String)> = vec![
+        ("/model".to_string(), "a".to_string()),
+        ("/effort".to_string(), "b".to_string()),
+    ];
     let lines = slash_hint_lines(&items, 1);
     assert!(!lines[0].spans[0].content.contains('›'));
     assert!(lines[1].spans[0].content.contains('›'));
