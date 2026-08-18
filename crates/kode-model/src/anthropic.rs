@@ -164,11 +164,37 @@ fn write_oauth(
             status: 0,
             message: format!("cannot create anthropic auth dir: {e}"),
         })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
     }
-    std::fs::write(path, pretty).map_err(|e| ModelError::Api {
+    write_secret_file(path, &pretty).map_err(|e| ModelError::Api {
         status: 0,
         message: format!("cannot write anthropic auth file: {e}"),
     })?;
+    Ok(())
+}
+
+// Credentials must never be world-readable; mirrors write_secret_file in the
+// kode bin's auth.rs (0o600 on Unix, default ACLs on Windows).
+fn write_secret_file(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    file.write_all(contents.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
     Ok(())
 }
 
