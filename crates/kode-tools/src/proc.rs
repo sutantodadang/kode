@@ -50,7 +50,6 @@ pub fn scrub_env(cmd: &mut Command) {
 #[cfg(unix)]
 mod platform {
     use super::*;
-    use std::os::unix::process::CommandExt;
 
     pub struct TreeHandle {
         pid: i32,
