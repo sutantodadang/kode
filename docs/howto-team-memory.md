@@ -8,7 +8,7 @@ Sharing is always explicit. Nothing is shared automatically based on memory kind
 
 ## Enable
 
-There's nothing to turn on. If Ingat is enabled (the default), team memory works as soon as you use `--team`.
+There's nothing to turn on. If Ingat is enabled (the default), team memory works as soon as you use `--team`. Requires Ingat v0.1.6 or newer — on older versions Kode notes "Ingat needs an update" and everything else keeps working; `kode setup` installs the latest release.
 
 ## Share a memory
 
