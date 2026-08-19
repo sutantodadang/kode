@@ -9,7 +9,7 @@ use kode_core::config::{AgentConfig, IngatConfig, KodeConfig, PermissionMode};
 use kode_core::event::{EventBus, KodeEvent, NoteSource, TaskStep};
 use kode_intel::{CodeIntelligence, ZindeksAdapter};
 use kode_memory::{EngineeringMemory, IngatAdapter, RememberTool};
-use kode_model::{OpenAiModel, OpenAiOptions};
+use kode_model::{OpenAiModel, OpenAiOptions, Usage};
 use kode_tools::ToolContext;
 use kode_tools::permission::PermissionHandler;
 use kode_tools::registry::{ToolRegistry, ToolRuntime};
@@ -26,6 +26,46 @@ Do not write code. You have no tools available for this turn — just describe t
 /// within a long-lived `kode` process (e.g. the TUI running many turns).
 static INGAT_AUTOSTART_ATTEMPTED: OnceLock<()> = OnceLock::new();
 
+/// Machine-readable result of a completed pipeline run. UIs may keep using
+/// [`KodeEvent`] for live rendering, while headless callers use this value to
+/// decide whether the task actually succeeded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskOutcome {
+    pub status: TaskStatus,
+    pub mutated: bool,
+    pub verification: VerificationStatus,
+    pub repair_attempted: bool,
+    pub iterations: u32,
+    pub tool_calls: u32,
+    pub usage: Usage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskStatus {
+    Completed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationStatus {
+    NotNeeded,
+    Verified,
+    Failed,
+    NoChecks,
+}
+
+impl TaskOutcome {
+    /// A production-safe success policy: changed files must have passed at
+    /// least one real verification check. Skipped/missing checks never pass.
+    pub fn is_success(&self) -> bool {
+        self.status == TaskStatus::Completed
+            && matches!(
+                self.verification,
+                VerificationStatus::NotNeeded | VerificationStatus::Verified
+            )
+    }
+}
+
 /// Runs one agentic task end-to-end: model/config setup, code intelligence
 /// and engineering memory binding, context compilation, the agent loop, and
 /// post-edit verification with a single retry. This is the single code path
@@ -41,7 +81,7 @@ pub async fn run_task(
     cancel: CancellationToken,
     history: &[kode_agent::HistoryTurn],
     plan_mode: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<TaskOutcome> {
     if config.model.model.is_empty() {
         anyhow::bail!("set model.model in .kode/config.toml");
     }
@@ -277,7 +317,15 @@ pub async fn run_task(
                     input_tokens: outcome.usage.input_tokens,
                     output_tokens: outcome.usage.output_tokens,
                 });
-                return Ok(());
+                return Ok(TaskOutcome {
+                    status: TaskStatus::Cancelled,
+                    mutated: false,
+                    verification: VerificationStatus::NotNeeded,
+                    repair_attempted: false,
+                    iterations: outcome.iterations,
+                    tool_calls: outcome.tool_calls,
+                    usage: outcome.usage,
+                });
             }
             PlanOutcome::Approved { effective_task, .. } => {
                 events.emit(KodeEvent::Note {
@@ -312,6 +360,7 @@ pub async fn run_task(
     // failed). Metrics and the mutated flag must aggregate across both runs
     // — see `combine_outcomes`.
     let mut outcome2: Option<kode_agent::AgentOutcome> = None;
+    let mut verification = VerificationStatus::NotNeeded;
 
     if outcome1.mutated {
         let profile = kode_verify::detect(cwd);
@@ -319,6 +368,7 @@ pub async fn run_task(
         let report = kode_verify::run_verification(cwd, &profile, &ctx.cancel).await;
         emit_verify_steps(&events, &report);
         let verdict = verification_verdict(report.ok, report.ran_any());
+        verification = verification_status(verdict);
         events.emit(KodeEvent::VerificationFinished {
             ok: verdict == Verdict::Verified,
         });
@@ -344,10 +394,41 @@ pub async fn run_task(
                 task
             );
 
+            // Repair must see the workspace produced by the first run, not
+            // the pre-edit snapshot. Refresh code intelligence first (even
+            // when a watcher exists, since it may not have observed the edit
+            // yet), then compile a new git/intel/memory context.
+            if let Some(adapter) = zindeks_adapter.as_ref() {
+                match adapter.ensure_bound().await {
+                    Ok(()) => events.emit(KodeEvent::SourcedNote {
+                        text: "zindeks index refreshed before repair".to_string(),
+                        source: NoteSource::Zindeks,
+                    }),
+                    Err(e) => events.emit(KodeEvent::SourcedNote {
+                        text: format!("zindeks pre-repair refresh failed (non-fatal): {e}"),
+                        source: NoteSource::Zindeks,
+                    }),
+                }
+            }
+            events.emit(KodeEvent::ContextCompilationStarted);
+            let repair_context = compiler
+                .compile(
+                    &ContextRequest {
+                        task: retry_task.clone(),
+                        working_set: vec![],
+                    },
+                    cwd,
+                )
+                .await;
+            events.emit(KodeEvent::ContextCompiled {
+                token_estimate: repair_context.token_estimate(),
+                sections: repair_context.sections.len(),
+            });
+
             let retry_outcome = agent
                 .run_with_context(
                     &retry_task,
-                    compiled.render().as_deref(),
+                    repair_context.render().as_deref(),
                     kept_history,
                     history_truncated,
                     &ctx,
@@ -364,6 +445,7 @@ pub async fn run_task(
                 retry_report = kode_verify::run_verification(cwd, &profile, &ctx.cancel).await;
                 emit_verify_steps(&events, &retry_report);
                 let verdict2 = verification_verdict(retry_report.ok, retry_report.ran_any());
+                verification = verification_status(verdict2);
                 events.emit(KodeEvent::VerificationFinished {
                     ok: verdict2 == Verdict::Verified,
                 });
@@ -429,7 +511,18 @@ pub async fn run_task(
         output_tokens,
     });
 
-    Ok(())
+    Ok(TaskOutcome {
+        status: TaskStatus::Completed,
+        mutated: mutated_any,
+        verification,
+        repair_attempted: outcome2.is_some(),
+        iterations,
+        tool_calls,
+        usage: Usage {
+            input_tokens,
+            output_tokens,
+        },
+    })
 }
 
 /// Outcome of [`run_plan_phase`]: the human's approve/reject answer to
@@ -585,6 +678,14 @@ fn verification_verdict(ok: bool, ran_any: bool) -> Verdict {
         Verdict::Verified
     } else {
         Verdict::Failed
+    }
+}
+
+fn verification_status(verdict: Verdict) -> VerificationStatus {
+    match verdict {
+        Verdict::Verified => VerificationStatus::Verified,
+        Verdict::Failed => VerificationStatus::Failed,
+        Verdict::NoChecks => VerificationStatus::NoChecks,
     }
 }
 

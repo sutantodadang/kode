@@ -5,6 +5,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::error::{Result, ToolError};
+use crate::proc::{scrub_env, spawn_managed};
 use crate::{RequiredPermission, Tool, ToolContext, ToolOutput};
 
 const GIT_TIMEOUT_SECS: u64 = 60;
@@ -16,16 +17,23 @@ async fn run_git(root: &Path, args: &[&str]) -> Result<String> {
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(Stdio::piped());
+    scrub_env(&mut command);
 
-    let child = command.spawn()?;
-    let output = tokio::time::timeout(
+    let managed = spawn_managed(&mut command)?;
+    let (child, mut tree) = managed.into_parts();
+    let output = match tokio::time::timeout(
         Duration::from_secs(GIT_TIMEOUT_SECS),
         child.wait_with_output(),
     )
     .await
-    .map_err(|_| ToolError::Timeout(Duration::from_secs(GIT_TIMEOUT_SECS)))??;
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            tree.kill_tree();
+            return Err(ToolError::Timeout(Duration::from_secs(GIT_TIMEOUT_SECS)));
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();

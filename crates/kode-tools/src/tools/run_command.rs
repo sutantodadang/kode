@@ -5,6 +5,7 @@ use serde::Deserialize;
 
 use crate::error::{Result, ToolError};
 use crate::path::resolve_in_workspace;
+use crate::proc::{scrub_env, spawn_managed};
 use crate::{RequiredPermission, Tool, ToolContext, ToolOutput};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
@@ -77,10 +78,11 @@ impl Tool for RunCommand {
             .current_dir(&cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .stderr(Stdio::piped());
+        scrub_env(&mut command);
 
-        let child = command.spawn()?;
+        let managed = spawn_managed(&mut command)?;
+        let (child, mut tree) = managed.into_parts();
 
         tokio::select! {
             result = child.wait_with_output() => {
@@ -96,9 +98,11 @@ impl Tool for RunCommand {
                 })
             }
             _ = tokio::time::sleep(timeout) => {
+                tree.kill_tree();
                 Err(ToolError::Timeout(timeout))
             }
             _ = ctx.cancel.cancelled() => {
+                tree.kill_tree();
                 Err(ToolError::Cancelled)
             }
         }
@@ -164,5 +168,89 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Timeout(_)));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn credential_env_vars_are_scrubbed() {
+        // The guard is scoped tightly around each env mutation and dropped
+        // before the `.await` below — clippy (rightly) flags a std Mutex
+        // guard held across an await point.
+        {
+            let _guard = crate::test_support::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            // SAFETY: test-only; serialized via ENV_LOCK.
+            unsafe {
+                std::env::set_var("ANTHROPIC_API_KEY", "super-secret");
+            }
+        }
+
+        let tool = RunCommand;
+        let out = tool
+            .execute(
+                serde_json::json!({
+                    "program": "cmd",
+                    "args": ["/C", "echo %ANTHROPIC_API_KEY%"]
+                }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+
+        {
+            let _guard = crate::test_support::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            // SAFETY: test-only; serialized via ENV_LOCK.
+            unsafe {
+                std::env::remove_var("ANTHROPIC_API_KEY");
+            }
+        }
+
+        assert!(!out.content.contains("super-secret"));
+        // Unexpanded on Windows cmd.exe when the var isn't set in the child.
+        assert!(out.content.contains("%ANTHROPIC_API_KEY%"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn credential_env_vars_are_scrubbed() {
+        // See the windows variant above for why the guard is scoped tightly
+        // around each env mutation rather than held across the `.await`.
+        {
+            let _guard = crate::test_support::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            // SAFETY: test-only; serialized via ENV_LOCK.
+            unsafe {
+                std::env::set_var("ANTHROPIC_API_KEY", "super-secret");
+            }
+        }
+
+        let tool = RunCommand;
+        let out = tool
+            .execute(
+                serde_json::json!({
+                    "program": "sh",
+                    "args": ["-c", "echo ${ANTHROPIC_API_KEY:-unset}"]
+                }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+
+        {
+            let _guard = crate::test_support::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            // SAFETY: test-only; serialized via ENV_LOCK.
+            unsafe {
+                std::env::remove_var("ANTHROPIC_API_KEY");
+            }
+        }
+
+        assert!(!out.content.contains("super-secret"));
+        assert!(out.content.contains("unset"));
     }
 }

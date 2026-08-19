@@ -57,6 +57,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - CI on Linux/macOS: Windows-only Ingat setup helpers are now
   `#[cfg(windows)]`-gated instead of tripping `-D dead-code`.
+- `run_command`/git tool subprocesses: timeout, cancellation, and drop now
+  kill the whole process tree (Job Object on Windows, process-group `SIGKILL`
+  on Unix) instead of only the direct child — a timed-out `cargo build` no
+  longer orphans `rustc`. Spawned children also no longer inherit credential
+  environment variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+  `KODE_API_KEY`, and any `*_API_KEY`/`*_TOKEN`/`*_SECRET` variable).
 
 ## [0.1.0] - 2026-08-17
 

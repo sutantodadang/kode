@@ -206,7 +206,22 @@ pub async fn run(
             }
         }
     }
-    result
+    let outcome = result?;
+    if !outcome.is_success() {
+        match outcome.status {
+            pipeline::TaskStatus::Cancelled => anyhow::bail!("task cancelled"),
+            pipeline::TaskStatus::Completed => match outcome.verification {
+                pipeline::VerificationStatus::Failed => {
+                    anyhow::bail!("verification failed after repair")
+                }
+                pipeline::VerificationStatus::NoChecks => {
+                    anyhow::bail!("changes are unverified: no verification checks ran")
+                }
+                _ => anyhow::bail!("task did not complete successfully"),
+            },
+        }
+    }
+    Ok(())
 }
 
 /// Message printed when the event printer falls behind and the broadcast
