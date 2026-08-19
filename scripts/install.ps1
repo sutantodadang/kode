@@ -26,8 +26,11 @@ function Fail($msg) {
 }
 
 # ---- detect arch ----
-$archRaw = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture
-if ($archRaw -ne [System.Runtime.InteropServices.Architecture]::X64) {
+# PROCESSOR_ARCHITEW6432 is set when running a 32-bit PowerShell on a 64-bit
+# OS; env vars work on both Windows PowerShell 5.1 and PowerShell 7+.
+$archRaw = $env:PROCESSOR_ARCHITEW6432
+if (-not $archRaw) { $archRaw = $env:PROCESSOR_ARCHITECTURE }
+if ($archRaw -ne "AMD64") {
     Fail "unsupported architecture: $archRaw (Kode ships an x86_64 Windows binary only)"
 }
 $target = "x86_64-pc-windows-msvc"
@@ -45,9 +48,17 @@ if ($Version) {
     } catch {
         Write-Info "GitHub API lookup failed, falling back to redirect resolution..."
         try {
-            $resp = Invoke-WebRequest -Uri "https://github.com/$Repo/releases/latest" -MaximumRedirection 0 -ErrorAction SilentlyContinue -SkipHttpErrorCheck
-            $location = $resp.Headers.Location
-            if ($location -match "/releases/tag/(v[^/]+)$") {
+            # -SkipHttpErrorCheck is PowerShell 7-only; on 5.1 the 302 comes
+            # through as an exception, so read Location from either shape.
+            $location = $null
+            try {
+                $resp = Invoke-WebRequest -Uri "https://github.com/$Repo/releases/latest" -MaximumRedirection 0 -UseBasicParsing -ErrorAction Stop
+                $location = $resp.Headers.Location
+            } catch {
+                $webResp = $_.Exception.Response
+                if ($webResp) { $location = $webResp.Headers["Location"] }
+            }
+            if ("$location" -match "/releases/tag/(v[^/]+)$") {
                 $tag = $Matches[1]
             }
         } catch {
@@ -56,7 +67,7 @@ if ($Version) {
     }
 
     if (-not $tag) {
-        Fail "could not resolve the latest release tag — pass a version explicitly, e.g. '-Version v0.1.0'"
+        Fail "could not resolve the latest release tag - pass a version explicitly, e.g. '-Version v0.1.0'"
     }
 }
 
@@ -78,17 +89,17 @@ try {
         Fail "failed to download $assetUrl`nCheck that a release exists for $tag and target $target at:`n  https://github.com/$Repo/releases"
     }
 
-    # ---- verify checksum (best effort — skip if sidecar missing) ----
+    # ---- verify checksum (best effort - skip if sidecar missing) ----
     try {
         Invoke-WebRequest -Uri $shaUrl -OutFile $shaPath -UseBasicParsing
         $expected = (Get-Content $shaPath -Raw).Trim().Split(" ")[0].ToLower()
         $actual = (Get-FileHash -Algorithm SHA256 -Path $archivePath).Hash.ToLower()
         if ($expected -ne $actual) {
-            Fail "checksum mismatch for $asset — aborting install"
+            Fail "checksum mismatch for $asset - aborting install"
         }
         Write-Info "checksum verified"
     } catch {
-        Write-Info "no checksum sidecar found for $asset — skipping checksum verification"
+        Write-Info "no checksum sidecar found for $asset - skipping checksum verification"
     }
 
     # ---- extract ----
