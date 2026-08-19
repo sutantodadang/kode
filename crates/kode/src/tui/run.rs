@@ -250,6 +250,11 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
     let mut key_events = EventStream::new();
     let mut current_cancel: Option<CancellationToken> = None;
     let mut aperture_tick = tokio::time::interval(Duration::from_millis(100));
+    // Tracks whether the terminal currently has mouse capture enabled, so
+    // Ctrl+T (`state.select_mode`) is synced to the real terminal mode at
+    // most once per toggle rather than issuing the escape sequence every
+    // frame.
+    let mut mouse_captured = true;
 
     terminal.draw(|f| draw(f, &mut state, cwd))?;
 
@@ -339,7 +344,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                     }
                     Some(Ok(Event::Mouse(mouse))) => {
                         if !state.picker.open {
-                            handle_mouse(&mut state, mouse.kind);
+                            handle_mouse(&mut state, mouse);
                         }
                     }
                     Some(Ok(_)) => {}
@@ -414,6 +419,18 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
             }
         }
 
+        // Sync real terminal mouse capture to `state.select_mode` (Ctrl+T)
+        // whenever they disagree — see `mouse_captured`'s doc comment.
+        if state.select_mode == mouse_captured {
+            if state.select_mode {
+                let _ = execute!(std::io::stdout(), DisableMouseCapture);
+                mouse_captured = false;
+            } else {
+                let _ = execute!(std::io::stdout(), EnableMouseCapture);
+                mouse_captured = true;
+            }
+        }
+
         terminal.draw(|f| draw(f, &mut state, cwd))?;
     }
 
@@ -455,6 +472,19 @@ pub(crate) fn handle_key(
 
     if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('y') {
         perform_copy(state);
+        return false;
+    }
+
+    if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('t') {
+        state.select_mode = !state.select_mode;
+        let text = if state.select_mode {
+            "select mode — mouse released to terminal: drag to select, Ctrl+T to restore wheel scroll"
+        } else {
+            "select mode off — wheel scroll restored"
+        };
+        state
+            .transcript
+            .push(TranscriptLine::new(Gutter::Note, text));
         return false;
     }
 
@@ -543,9 +573,9 @@ pub(crate) fn handle_key(
 }
 
 /// Maps a mouse wheel event to a transcript scroll delta in lines: `-3` for
-/// wheel-up, `+3` for wheel-down. Every other mouse event kind (clicks,
-/// drags, moves) maps to `0` — this app has no click handling, terminal-
-/// native text selection is superseded by the `/copy` command instead.
+/// wheel-up, `+3` for wheel-down. Every other mouse event kind maps to `0`
+/// — `handle_mouse` handles left-click separately (toggles a tool-group
+/// header under the cursor), drags/moves stay no-ops.
 pub(crate) fn wheel_delta(kind: MouseEventKind) -> i32 {
     match kind {
         MouseEventKind::ScrollUp => -3,
@@ -554,21 +584,45 @@ pub(crate) fn wheel_delta(kind: MouseEventKind) -> i32 {
     }
 }
 
-/// Handles a mouse event, wheel-only: scrolls the transcript by
-/// `wheel_delta`'s 3-line step through the same unclamped-here,
-/// clamped-at-render path as `handle_key`'s arrow keys, and the same
-/// follow-mode semantics — wheel-up breaks follow (mirrors `KeyCode::Up`),
-/// wheel-down leaves it alone (mirrors `KeyCode::Down`). Non-wheel kinds
-/// are no-ops.
-pub(crate) fn handle_mouse(state: &mut AppState, kind: MouseEventKind) {
-    match wheel_delta(kind) {
+/// Handles a mouse event: wheel scrolls the transcript by `wheel_delta`'s
+/// 3-line step through the same unclamped-here, clamped-at-render path as
+/// `handle_key`'s arrow keys, with the same follow-mode semantics —
+/// wheel-up breaks follow (mirrors `KeyCode::Up`), wheel-down leaves it
+/// alone (mirrors `KeyCode::Down`). A left-click landing inside the last-
+/// rendered transcript area (`state.transcript_hit`, rebuilt every frame by
+/// `draw()`) toggles the `expanded` flag of the tool-group header under the
+/// cursor, if any — see `hit_test_row`. Everything else is a no-op. Mouse
+/// events only arrive at all while capture is enabled (Ctrl+T/select mode
+/// releases capture to the terminal for native text selection).
+pub(crate) fn handle_mouse(state: &mut AppState, mouse: crossterm::event::MouseEvent) {
+    match wheel_delta(mouse.kind) {
         0 => {}
         d if d < 0 => {
             state.scroll = state.scroll.saturating_sub(d.unsigned_abs() as u16);
             state.follow = false;
+            return;
         }
         d => {
             state.scroll = state.scroll.saturating_add(d as u16);
+            return;
+        }
+    }
+
+    if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+        && let Some(hit) = &state.transcript_hit
+    {
+        let area = hit.area;
+        let inside = mouse.column >= area.x
+            && mouse.column < area.x + area.width
+            && mouse.row >= area.y
+            && mouse.row < area.y + area.height;
+        if inside {
+            let content_row = (mouse.row - area.y) + hit.scroll;
+            if let Some(idx) = super::draw::hit_test_row(&hit.rows, content_row)
+                && let Some(line) = state.transcript.get_mut(idx)
+            {
+                line.expanded = !line.expanded;
+            }
         }
     }
 }

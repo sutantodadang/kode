@@ -88,9 +88,27 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
         }
         KodeEvent::ToolRequested { .. } => {}
         KodeEvent::ToolStarted { name } => {
-            state
-                .transcript
-                .push(TranscriptLine::new(Gutter::Tool, name.clone()));
+            // Stack consecutive tool calls into one collapsible group header
+            // instead of flooding the transcript with a line per call (e.g.
+            // many `read_file` lines in a row) — see `tool_group_summary`.
+            // Only Tool lines directly adjacent group; any other line
+            // (prose, a note, a failure) breaks the run and starts a new
+            // header on the next ToolStarted.
+            match state.transcript.last_mut() {
+                Some(last) if last.gutter == Gutter::Tool => {
+                    if last.tool_children.is_empty() {
+                        let prior = std::mem::take(&mut last.text);
+                        last.tool_children.push(prior);
+                    }
+                    last.tool_children.push(name.clone());
+                    last.text = tool_group_summary(&last.tool_children);
+                }
+                _ => {
+                    state
+                        .transcript
+                        .push(TranscriptLine::new(Gutter::Tool, name.clone()));
+                }
+            }
             state.status.tools_used += 1;
             state.status.state = RunState::Tool;
             state.current_tool = Some(name);
@@ -262,6 +280,21 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
                 entry.1 = done;
             }
         }
+    }
+}
+
+/// Summarizes a tool-group header's stacked child names: `"{name} ×{n}"`
+/// when every child shares one name (the common case — a burst of the same
+/// tool, e.g. many `read_file` calls), else `"{n} tools"`. Pure so the
+/// grouping rule is unit-testable without driving `apply_event`. `children`
+/// is never empty in practice (the caller always pushes before summarizing),
+/// but an empty slice degrades to `"0 tools"` rather than panicking.
+pub(crate) fn tool_group_summary(children: &[String]) -> String {
+    match children.split_first() {
+        Some((first, rest)) if rest.iter().all(|n| n == first) => {
+            format!("{first} \u{d7}{}", children.len())
+        }
+        _ => format!("{} tools", children.len()),
     }
 }
 

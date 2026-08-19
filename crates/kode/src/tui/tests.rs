@@ -122,6 +122,98 @@ fn tool_finished_success_pushes_nothing() {
 }
 
 #[test]
+fn tool_started_consecutive_same_name_groups_with_count() {
+    let mut s = state();
+    apply_event(
+        &mut s,
+        KodeEvent::ToolStarted {
+            name: "read_file".into(),
+        },
+    );
+    apply_event(
+        &mut s,
+        KodeEvent::ToolStarted {
+            name: "read_file".into(),
+        },
+    );
+    assert_eq!(s.transcript.len(), 1);
+    assert_eq!(s.transcript[0].gutter, Gutter::Tool);
+    assert_eq!(s.transcript[0].text, "read_file \u{d7}2");
+    assert_eq!(
+        s.transcript[0].tool_children,
+        vec!["read_file".to_string(), "read_file".to_string()]
+    );
+}
+
+#[test]
+fn tool_started_mixed_names_groups_as_n_tools() {
+    let mut s = state();
+    apply_event(
+        &mut s,
+        KodeEvent::ToolStarted {
+            name: "read_file".into(),
+        },
+    );
+    apply_event(
+        &mut s,
+        KodeEvent::ToolStarted {
+            name: "write_file".into(),
+        },
+    );
+    assert_eq!(s.transcript.len(), 1);
+    assert_eq!(s.transcript[0].text, "2 tools");
+    assert_eq!(
+        s.transcript[0].tool_children,
+        vec!["read_file".to_string(), "write_file".to_string()]
+    );
+}
+
+#[test]
+fn tool_group_broken_by_non_tool_line() {
+    let mut s = state();
+    apply_event(
+        &mut s,
+        KodeEvent::ToolStarted {
+            name: "read_file".into(),
+        },
+    );
+    apply_event(
+        &mut s,
+        KodeEvent::Note {
+            text: "interruption".into(),
+        },
+    );
+    apply_event(
+        &mut s,
+        KodeEvent::ToolStarted {
+            name: "write_file".into(),
+        },
+    );
+    let tool_lines: Vec<_> = s
+        .transcript
+        .iter()
+        .filter(|l| l.gutter == Gutter::Tool)
+        .collect();
+    assert_eq!(tool_lines.len(), 2);
+    assert_eq!(tool_lines[0].text, "read_file");
+    assert!(tool_lines[0].tool_children.is_empty());
+    assert_eq!(tool_lines[1].text, "write_file");
+    assert!(tool_lines[1].tool_children.is_empty());
+}
+
+#[test]
+fn tool_group_summary_single_vs_mixed() {
+    assert_eq!(
+        tool_group_summary(&["read_file".to_string(), "read_file".to_string()]),
+        "read_file \u{d7}2"
+    );
+    assert_eq!(
+        tool_group_summary(&["read_file".to_string(), "write_file".to_string()]),
+        "2 tools"
+    );
+}
+
+#[test]
 fn note_pushes_note_gutter_line() {
     let mut s = state();
     apply_event(
@@ -518,14 +610,25 @@ fn wheel_delta_maps_scroll_kinds_only() {
     );
 }
 
+/// Builds a full `MouseEvent` for the given `kind` at (0, 0) with no
+/// modifiers — the tests below only care about `kind` unless noted.
+fn mouse_event(kind: MouseEventKind) -> crossterm::event::MouseEvent {
+    crossterm::event::MouseEvent {
+        kind,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
 #[test]
 fn handle_mouse_scroll_updates_position_and_follow() {
     let mut s = state();
     s.scroll = 5;
-    handle_mouse(&mut s, MouseEventKind::ScrollUp);
+    handle_mouse(&mut s, mouse_event(MouseEventKind::ScrollUp));
     assert_eq!(s.scroll, 2);
     assert!(!s.follow);
-    handle_mouse(&mut s, MouseEventKind::ScrollDown);
+    handle_mouse(&mut s, mouse_event(MouseEventKind::ScrollDown));
     assert_eq!(s.scroll, 5);
 }
 
@@ -533,7 +636,7 @@ fn handle_mouse_scroll_updates_position_and_follow() {
 fn handle_mouse_scroll_up_clamps_at_zero() {
     let mut s = state();
     s.scroll = 1;
-    handle_mouse(&mut s, MouseEventKind::ScrollUp);
+    handle_mouse(&mut s, mouse_event(MouseEventKind::ScrollUp));
     assert_eq!(s.scroll, 0);
 }
 
@@ -543,9 +646,108 @@ fn handle_mouse_ignores_non_wheel_events() {
     s.scroll = 5;
     handle_mouse(
         &mut s,
-        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        mouse_event(MouseEventKind::Down(crossterm::event::MouseButton::Left)),
     );
     assert_eq!(s.scroll, 5);
+}
+
+#[test]
+fn hit_test_row_maps_wrapped_rows_to_header() {
+    let rows: Vec<(u16, Option<usize>)> = vec![(2, None), (3, Some(5)), (1, None)];
+    assert_eq!(hit_test_row(&rows, 0), None);
+    assert_eq!(hit_test_row(&rows, 1), None);
+    assert_eq!(hit_test_row(&rows, 2), Some(5));
+    assert_eq!(hit_test_row(&rows, 3), Some(5));
+    assert_eq!(hit_test_row(&rows, 4), Some(5));
+    assert_eq!(hit_test_row(&rows, 5), None);
+    // Past the end of the rendered content.
+    assert_eq!(hit_test_row(&rows, 6), None);
+}
+
+#[test]
+fn handle_mouse_left_click_toggles_group_header_under_cursor() {
+    let mut s = state();
+    s.transcript
+        .push(TranscriptLine::new(Gutter::Tool, "read_file \u{d7}2"));
+    s.transcript[0].tool_children = vec!["read_file".to_string(), "read_file".to_string()];
+    assert!(!s.transcript[0].expanded);
+
+    s.transcript_hit = Some(TranscriptHit {
+        area: ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 5,
+        },
+        scroll: 0,
+        rows: vec![(1, Some(0))],
+    });
+
+    handle_mouse(
+        &mut s,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 2,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(s.transcript[0].expanded);
+
+    // Clicking again collapses it back.
+    handle_mouse(
+        &mut s,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 2,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(!s.transcript[0].expanded);
+}
+
+#[test]
+fn line_rows_counts_wrapped_line() {
+    let line = Line::from(ratatui::text::Span::raw("a".repeat(25)));
+    assert_eq!(line_rows(&line, 10), 3);
+    assert_eq!(line_rows(&line, 0), 0);
+}
+
+#[test]
+fn ctrl_t_toggles_select_mode_and_notes() {
+    let mut s = state();
+    assert!(!s.select_mode);
+
+    let quit = handle_key(
+        &mut s,
+        std::path::Path::new("."),
+        KeyCode::Char('t'),
+        KeyModifiers::CONTROL,
+        &None,
+    );
+    assert!(!quit);
+    assert!(s.select_mode);
+    assert!(
+        s.transcript
+            .iter()
+            .any(|l| l.gutter == Gutter::Note && l.text.contains("select mode"))
+    );
+
+    handle_key(
+        &mut s,
+        std::path::Path::new("."),
+        KeyCode::Char('t'),
+        KeyModifiers::CONTROL,
+        &None,
+    );
+    assert!(!s.select_mode);
+    let note_count = s
+        .transcript
+        .iter()
+        .filter(|l| l.gutter == Gutter::Note)
+        .count();
+    assert_eq!(note_count, 2);
 }
 
 #[test]
@@ -1877,6 +2079,7 @@ fn handle_slash_command_help_mentions_new_shortcuts() {
     assert!(s.transcript.iter().any(|l| l.text.contains("shift+tab")));
     assert!(s.transcript.iter().any(|l| l.text.contains("ctrl+y")));
     assert!(s.transcript.iter().any(|l| l.text.contains("/copy")));
+    assert!(s.transcript.iter().any(|l| l.text.contains("Ctrl+T")));
 }
 
 // -- /resume picker ----------------------------------------------------

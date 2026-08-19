@@ -24,7 +24,7 @@ reqwest = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-ratatui = { workspace = true }
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 crossterm = { workspace = true }
 futures = { workspace = true }
 getrandom = { workspace = true }

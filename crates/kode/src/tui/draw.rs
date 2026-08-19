@@ -353,6 +353,14 @@ pub(crate) fn transcript_line_to_ratatui(line: &TranscriptLine) -> Line<'static>
         prefix_style = prefix_style.add_modifier(Modifier::BOLD);
     }
     let mut spans = vec![Span::styled(prefix, prefix_style)];
+    // A collapsible tool-group header (`tool_children` non-empty) gets a
+    // collapse-state glyph ahead of its summary text — `▸` collapsed, `▾`
+    // expanded, both already in DESIGN.md's approved vocabulary (the `T▸`
+    // gutter, the `▸ {tool}` running label).
+    if !line.tool_children.is_empty() {
+        let glyph = if line.expanded { "▾ " } else { "▸ " };
+        spans.push(Span::styled(glyph, Style::default().fg(theme::DIM)));
+    }
 
     match (&line.md_kind, &line.spans) {
         (Some(markdown::MdKind::CodeFence), _) => {
@@ -697,64 +705,54 @@ pub(crate) fn lines_as_u16(count: usize) -> u16 {
     count.min(u16::MAX as usize) as u16
 }
 
-/// Approximates ratatui's `Wrap { trim: false }` word-wrapper for one
-/// logical line, returning how many rendered rows `content` takes at
-/// `width` columns. `Paragraph::line_count` (the exact version) is gated
-/// behind ratatui's unstable `rendered-line-info` feature, which this
-/// workspace doesn't enable, so this stands in for it. Uses `char` count as
-/// a display-width proxy — the transcript's approved glyph vocabulary
-/// (DESIGN.md) is narrow/single-width, so this tracks real wrapping closely
-/// without a unicode-width dependency.
-pub(crate) fn word_wrap_rows(content: &str, width: usize) -> usize {
+/// Maps a clicked content row (0-based, already offset by the transcript's
+/// current scroll — see `TranscriptHit::scroll`) to the transcript index of
+/// the logical line it falls inside, walking `rows`' cumulative wrapped-row
+/// counts. `rows` entries are `(wrapped_row_count, transcript_idx)` in
+/// render order (see `TranscriptHit::rows`); a logical line spanning
+/// multiple wrapped rows maps every one of those rows to the same index.
+/// `None` when `content_row` falls past the end of the rendered content, or
+/// lands on a line with no transcript index (`None` — prose, plain tool
+/// lines, expanded children, the stream line, the spinner label).
+pub(crate) fn hit_test_row(rows: &[(u16, Option<usize>)], content_row: u16) -> Option<usize> {
+    let mut cursor = 0u16;
+    for (count, idx) in rows {
+        if content_row < cursor.saturating_add(*count) {
+            return *idx;
+        }
+        cursor = cursor.saturating_add(*count);
+    }
+    None
+}
+
+/// Exact rendered row count for one logical `line` at `width` columns —
+/// ratatui's own `Paragraph::line_count` (the `unstable-rendered-line-info`
+/// feature, enabled in `crates/kode/Cargo.toml`), run through the identical
+/// `Wrap { trim: false }` the transcript actually renders with. Because this
+/// calls the same wrapper the `Paragraph` widget uses, the clamp/scrollbar
+/// math built on it always agrees with what's on screen — no approximation
+/// drift. `width == 0` yields `0` rows (nothing renders).
+pub(crate) fn line_rows(line: &Line<'static>, width: u16) -> u16 {
     if width == 0 {
         return 0;
     }
-    if content.is_empty() {
-        return 1;
-    }
-
-    let mut rows = 1usize;
-    let mut col = 0usize; // columns used on the row currently being built
-
-    for word in content.split(' ') {
-        let len = word.chars().count();
-        let gap = if col == 0 { 0 } else { 1 }; // a space before the word, unless starting a row
-
-        if len > width {
-            // A single word wider than the viewport: fill out the current
-            // row, then take as many full-width rows as it needs.
-            if col > 0 {
-                rows += 1;
-            }
-            let mut remaining = len;
-            while remaining > width {
-                rows += 1;
-                remaining -= width;
-            }
-            col = remaining;
-        } else if col + gap + len <= width {
-            col += gap + len;
-        } else {
-            rows += 1;
-            col = len;
-        }
-    }
-    rows
+    lines_as_u16(
+        Paragraph::new(vec![line.clone()])
+            .wrap(Wrap { trim: false })
+            .line_count(width),
+    )
 }
 
-/// Sums `word_wrap_rows` across every line of `lines` at `width` columns —
-/// the fallback stand-in for `Paragraph::line_count(width)`.
+/// Sums `line_rows` across every line of `lines` at `width` columns — the
+/// transcript's exact total wrapped-row count, used for scroll clamping and
+/// scrollbar sizing.
 pub(crate) fn total_wrapped_rows(lines: &[Line<'static>], width: u16) -> usize {
     if width == 0 {
         return 0;
     }
-    let width = width as usize;
     lines
         .iter()
-        .map(|line| {
-            let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            word_wrap_rows(&content, width)
-        })
+        .map(|line| line_rows(line, width) as usize)
         .sum()
 }
 
@@ -817,6 +815,9 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
         .as_millis();
 
     if state.ledger_open {
+        // No transcript rendered while the Ledger is open — nothing to
+        // click.
+        state.transcript_hit = None;
         draw_ledger(
             f,
             areas[idx],
@@ -826,22 +827,36 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
             state.reduced_motion,
         );
     } else {
-        let mut text_lines: Vec<Line> = if show_empty_state(&state.transcript, state.running) {
-            let mut lines = empty_state_lines(state);
-            lines.extend(state.transcript.iter().map(transcript_line_to_ratatui));
-            lines
-        } else {
-            state
-                .transcript
-                .iter()
-                .map(transcript_line_to_ratatui)
-                .collect()
-        };
+        // Each entry is one logical (pre-wrap) line paired with the
+        // `state.transcript` index to toggle on click, when it's an
+        // expandable tool-group header (`Some`) — everything else
+        // (prose, plain tool lines, expanded children, the stream line,
+        // the spinner label) is `None`.
+        let mut entries: Vec<(Line<'static>, Option<usize>)> = Vec::new();
+        if show_empty_state(&state.transcript, state.running) {
+            entries.extend(empty_state_lines(state).into_iter().map(|l| (l, None)));
+        }
+        for (i, line) in state.transcript.iter().enumerate() {
+            let is_header = !line.tool_children.is_empty();
+            entries.push((
+                transcript_line_to_ratatui(line),
+                if is_header { Some(i) } else { None },
+            ));
+            if is_header && line.expanded {
+                for child in &line.tool_children {
+                    let child_line = TranscriptLine::new(Gutter::Tool, format!("  {child}"));
+                    entries.push((transcript_line_to_ratatui(&child_line), None));
+                }
+            }
+        }
         if !state.current_stream.is_empty() {
-            text_lines.push(transcript_line_to_ratatui(&TranscriptLine::new(
-                Gutter::Prose,
-                state.current_stream.clone(),
-            )));
+            entries.push((
+                transcript_line_to_ratatui(&TranscriptLine::new(
+                    Gutter::Prose,
+                    state.current_stream.clone(),
+                )),
+                None,
+            ));
         }
         if state.running {
             let elapsed = state.run_started.map(|t| t.elapsed()).unwrap_or_default();
@@ -858,18 +873,20 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
                 }
                 None => format!("{frame} {} · {secs:.1}s", state.status.state.label()),
             };
-            text_lines.push(Line::from(Span::styled(
-                label,
-                Style::default().fg(theme::T),
-            )));
+            entries.push((
+                Line::from(Span::styled(label, Style::default().fg(theme::T))),
+                None,
+            ));
         }
+        let (text_lines, indices): (Vec<Line>, Vec<Option<usize>>) = entries.into_iter().unzip();
         let transcript_area = areas[idx];
 
         // Decide, at the full transcript width, whether a scrollbar column
         // needs reserving. If it does, the text area narrows by one column
-        // — re-measure at that narrower width so wrap/clamp/scrollbar math
-        // all agree with what's actually rendered (narrowing can only add
-        // wrapped lines, never remove the overflow, so this never flaps).
+        // — re-measure at that narrower width so wrap/clamp/scrollbar/hit-
+        // test math all agree with what's actually rendered (narrowing can
+        // only add wrapped lines, never remove the overflow, so this never
+        // flaps).
         let total_lines_full = lines_as_u16(total_wrapped_rows(&text_lines, transcript_area.width));
         let scrollbar_needed = total_lines_full > transcript_area.height;
         let (text_area, scrollbar_area) = if scrollbar_needed && transcript_area.width > 1 {
@@ -893,6 +910,20 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
         } else {
             clamp_scroll(state.scroll, total_lines, viewport_height)
         };
+
+        // Per-line row counts at the width actually rendered, paired with
+        // each line's transcript index (if it's a clickable group header)
+        // — `handle_mouse`'s click hit-test walks this.
+        let rows: Vec<(u16, Option<usize>)> = text_lines
+            .iter()
+            .zip(indices.iter())
+            .map(|(l, idx)| (line_rows(l, text_area.width), *idx))
+            .collect();
+        state.transcript_hit = Some(TranscriptHit {
+            area: text_area,
+            scroll: state.scroll,
+            rows,
+        });
 
         let transcript = Paragraph::new(text_lines)
             .wrap(Wrap { trim: false })

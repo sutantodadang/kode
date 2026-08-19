@@ -97,6 +97,14 @@ pub struct TranscriptLine {
     pub text: String,
     pub md_kind: Option<markdown::MdKind>,
     pub spans: Option<Vec<(String, markdown::MdStyle)>>,
+    /// Names of the tool calls stacked behind this line when it's a
+    /// collapsible tool-group header (see `KodeEvent::ToolStarted`
+    /// grouping in `events.rs`). Empty for every non-header line.
+    pub tool_children: Vec<String>,
+    /// Whether a tool-group header (`tool_children` non-empty) is expanded
+    /// to show its stacked children — toggled by left-clicking the header
+    /// (see `run::handle_mouse`). Ignored when `tool_children` is empty.
+    pub expanded: bool,
 }
 
 impl TranscriptLine {
@@ -106,6 +114,8 @@ impl TranscriptLine {
             text: text.into(),
             md_kind: None,
             spans: None,
+            tool_children: Vec::new(),
+            expanded: false,
         }
     }
 
@@ -122,6 +132,8 @@ impl TranscriptLine {
             text: text.into(),
             md_kind: Some(kind),
             spans: Some(spans),
+            tool_children: Vec::new(),
+            expanded: false,
         }
     }
 }
@@ -361,6 +373,30 @@ pub struct AppState {
     /// When the current `stream_pending` buffering window started; `None`
     /// while the buffer is empty / just flushed.
     pub(crate) stream_last_flush: Option<Instant>,
+    /// User-toggled select mode (Ctrl+T): while true, mouse capture is
+    /// released to the terminal so the user can drag-select/copy text
+    /// natively; wheel scroll and click-to-expand stop working until it's
+    /// toggled back off. Defaults off (mouse capture on, as today).
+    pub select_mode: bool,
+    /// Hit-test geometry for the last-rendered transcript, rebuilt every
+    /// frame in `draw()`. `None` while the Ledger view is showing (no
+    /// transcript to click). Drives left-click-to-expand on tool-group
+    /// headers.
+    pub transcript_hit: Option<TranscriptHit>,
+}
+
+/// Per-frame click hit-test geometry for the transcript area, rebuilt by
+/// `draw()` every render. `rows` walks the expanded (post-collapse) line
+/// list in render order: each entry is `(wrapped_row_count, transcript_idx)`
+/// where `transcript_idx` is `Some(i)` when that logical line is a
+/// clickable tool-group header (`state.transcript[i]`), `None` for
+/// everything else (prose, plain tool lines, expanded children, the stream
+/// line, the spinner label).
+#[derive(Debug, Clone, Default)]
+pub struct TranscriptHit {
+    pub area: ratatui::layout::Rect,
+    pub scroll: u16,
+    pub rows: Vec<(u16, Option<usize>)>,
 }
 
 impl AppState {
@@ -403,6 +439,8 @@ impl AppState {
             render_tick: 0,
             stream_pending: String::new(),
             stream_last_flush: None,
+            select_mode: false,
+            transcript_hit: None,
         }
     }
 
