@@ -427,6 +427,10 @@ mod tests {
 
         managed.kill_tree();
 
+        // Reap the direct child: after SIGKILL it lingers as a zombie until
+        // waited on, and `pgrep -g` reports zombies as live group members.
+        let _ = managed.wait_with_output().await;
+
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         // Query by process *group* id (not a name/command pattern), so this
