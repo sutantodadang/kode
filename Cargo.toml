@@ -3,9 +3,9 @@ resolver = "3"
 members = ["crates/kode-core", "crates/kode", "crates/kode-model", "crates/kode-tools", "crates/kode-agent", "crates/kode-intel", "crates/kode-context", "crates/kode-memory", "crates/kode-verify", "crates/kode-mcp"]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.3"
 edition = "2024"
-license = "MIT"
+license = "AGPL-3.0-only"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "process", "io-util", "net", "time"] }
