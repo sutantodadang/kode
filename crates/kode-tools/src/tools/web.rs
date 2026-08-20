@@ -4,6 +4,7 @@
 //! network; non-http(s) schemes and local/private hosts are refused so the
 //! agent can't be steered into probing the user's LAN or cloud metadata.
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -25,14 +26,17 @@ fn client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(TIMEOUT)
         .user_agent(USER_AGENT)
-        .redirect(reqwest::redirect::Policy::limited(5))
+        // Redirects are followed manually in `get_text` so every hop is
+        // re-validated (scheme, host string, resolved IPs).
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| ToolError::Failed(format!("http client: {e}")))
 }
 
-/// Refuses non-http(s) URLs and hosts that point at the local machine or
-/// private/link-local ranges (string check only — no DNS resolution).
-pub(crate) fn check_url(url: &str) -> Result<()> {
+/// Extracts the lowercase host from an http(s) URL, refusing other schemes
+/// and hosts that name the local machine or private/link-local ranges by
+/// string. `check_url_resolved` adds the DNS-level check.
+pub(crate) fn check_url(url: &str) -> Result<String> {
     let lower = url.trim().to_ascii_lowercase();
     let rest = lower
         .strip_prefix("https://")
@@ -70,20 +74,126 @@ pub(crate) fn check_url(url: &str) -> Result<()> {
             "refusing to fetch local/private host '{host}'"
         )));
     }
+    Ok(host.to_string())
+}
+
+/// True for IPs a fetch must never reach: loopback, unspecified, RFC1918,
+/// link-local/metadata (169.254/16), CGNAT (100.64/10), IPv6 ULA/link-local,
+/// and IPv4-mapped IPv6 forms of the same.
+pub(crate) fn is_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_unspecified()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+                || o[0] == 0
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_ip(IpAddr::V4(v4));
+            }
+            let seg = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
+                || (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+        }
+    }
+}
+
+/// String check plus DNS resolution: every address the host resolves to
+/// must be public. Literal IPs are checked directly.
+// ponytail: resolve-then-connect leaves a DNS-rebinding TOCTOU window; pin
+// the resolved IP via a custom resolver if that ever matters.
+pub(crate) async fn check_url_resolved(url: &str) -> Result<()> {
+    let host = check_url(url)?;
+    let addrs: Vec<IpAddr> = match host.parse::<IpAddr>() {
+        Ok(ip) => vec![ip],
+        Err(_) => tokio::net::lookup_host((host.as_str(), 80))
+            .await
+            .map_err(|e| ToolError::Failed(format!("cannot resolve host '{host}': {e}")))?
+            .map(|sa| sa.ip())
+            .collect(),
+    };
+    if addrs.is_empty() {
+        return Err(ToolError::Failed(format!(
+            "host '{host}' resolved to nothing"
+        )));
+    }
+    if let Some(ip) = addrs.into_iter().find(|ip| is_private_ip(*ip)) {
+        return Err(ToolError::Failed(format!(
+            "refusing to fetch '{host}': resolves to private address {ip}"
+        )));
+    }
     Ok(())
 }
 
+const MAX_REDIRECTS: usize = 5;
+
+/// Resolves `location` against `base` for the common forms: absolute,
+/// scheme-relative (`//host/p`), root-relative (`/p`), and relative (`p`).
+pub(crate) fn resolve_location(base: &str, location: &str) -> String {
+    let loc = location.trim();
+    if loc.starts_with("http://") || loc.starts_with("https://") {
+        return loc.to_string();
+    }
+    let scheme_end = base.find("://").map(|i| i + 3).unwrap_or(0);
+    let (scheme, rest) = base.split_at(scheme_end);
+    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let host = &rest[..host_end];
+    if let Some(stripped) = loc.strip_prefix("//") {
+        return format!("{scheme}{stripped}");
+    }
+    if loc.starts_with('/') {
+        return format!("{scheme}{host}{loc}");
+    }
+    let path = &rest[host_end..];
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let dir = match path.rfind('/') {
+        Some(i) => &path[..=i],
+        None => "/",
+    };
+    format!("{scheme}{host}{dir}{loc}")
+}
+
 async fn get_text(url: &str) -> Result<(String, String)> {
-    check_url(url)?;
-    let resp = client()?
-        .get(url)
-        .header(
-            "Accept",
-            "text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.5",
-        )
-        .send()
-        .await
-        .map_err(|e| ToolError::Failed(format!("fetch failed: {e}")))?;
+    let client = client()?;
+    let mut url = url.trim().to_string();
+    let mut resp;
+    let mut hops = 0;
+    loop {
+        check_url_resolved(&url).await?;
+        resp = client
+            .get(&url)
+            .header(
+                "Accept",
+                "text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.5",
+            )
+            .send()
+            .await
+            .map_err(|e| ToolError::Failed(format!("fetch failed: {e}")))?;
+        if !resp.status().is_redirection() {
+            break;
+        }
+        let Some(location) = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+        else {
+            break;
+        };
+        hops += 1;
+        if hops > MAX_REDIRECTS {
+            return Err(ToolError::Failed(format!(
+                "too many redirects (>{MAX_REDIRECTS})"
+            )));
+        }
+        url = resolve_location(&url, location);
+    }
     let status = resp.status();
     let content_type = resp
         .headers()
@@ -539,6 +649,61 @@ mod tests {
         }
         assert!(check_url("http://172.15.0.1/").is_ok());
         assert!(check_url("http://172.32.0.1/").is_ok());
+    }
+
+    #[test]
+    fn is_private_ip_covers_local_ranges() {
+        for ip in [
+            "127.0.0.1",
+            "0.0.0.0",
+            "10.0.0.1",
+            "172.16.5.5",
+            "192.168.0.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "::1",
+            "::",
+            "fd00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+        ] {
+            assert!(is_private_ip(ip.parse().unwrap()), "{ip} should be private");
+        }
+        for ip in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "172.32.0.1"] {
+            assert!(!is_private_ip(ip.parse().unwrap()), "{ip} should be public");
+        }
+    }
+
+    #[tokio::test]
+    async fn check_url_resolved_blocks_literal_private_ips_and_localhost() {
+        assert!(check_url_resolved("http://127.0.0.1/").await.is_err());
+        assert!(
+            check_url_resolved("http://[::ffff:127.0.0.1]/")
+                .await
+                .is_err()
+        );
+        assert!(check_url_resolved("http://localhost/").await.is_err());
+        assert!(check_url_resolved("http://169.254.169.254/").await.is_err());
+    }
+
+    #[test]
+    fn resolve_location_handles_relative_forms() {
+        let base = "https://example.com/a/b?q=1";
+        assert_eq!(
+            resolve_location(base, "https://other.org/x"),
+            "https://other.org/x"
+        );
+        assert_eq!(
+            resolve_location(base, "//cdn.example.com/y"),
+            "https://cdn.example.com/y"
+        );
+        assert_eq!(resolve_location(base, "/root"), "https://example.com/root");
+        assert_eq!(resolve_location(base, "sib"), "https://example.com/a/sib");
+        assert_eq!(
+            resolve_location("https://example.com", "p"),
+            "https://example.com/p"
+        );
     }
 
     #[test]
