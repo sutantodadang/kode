@@ -59,27 +59,8 @@ impl Tool for ApplyPatch {
         let original = tokio::fs::read_to_string(&resolved).await?;
 
         let replace_all = args.replace_all.unwrap_or(false);
-        let match_count = original.matches(args.old_string.as_str()).count();
-
-        let (updated, replaced) = if replace_all {
-            if match_count == 0 {
-                return Err(ToolError::Failed("old_string not found".to_string()));
-            }
-            (
-                original.replace(&args.old_string, &args.new_string),
-                match_count,
-            )
-        } else {
-            match match_count {
-                0 => return Err(ToolError::Failed("old_string not found".to_string())),
-                1 => (original.replacen(&args.old_string, &args.new_string, 1), 1),
-                n => {
-                    return Err(ToolError::Failed(format!(
-                        "old_string is not unique; {n} matches"
-                    )));
-                }
-            }
-        };
+        let (updated, replaced) =
+            apply_replacement(&original, &args.old_string, &args.new_string, replace_all)?;
 
         tokio::fs::write(&resolved, &updated).await?;
 
@@ -90,6 +71,77 @@ impl Tool for ApplyPatch {
                 resolved.display()
             ),
         })
+    }
+}
+
+/// Replaces `old` with `new` in `original`. Matching is exact first; when
+/// that fails, both sides are compared with `\r\n` normalized to `\n` so a
+/// model-emitted LF snippet still matches a CRLF file (and vice versa). The
+/// file's original line ending is preserved on write.
+pub(crate) fn apply_replacement(
+    original: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> Result<(String, usize)> {
+    let crlf = original.contains("\r\n");
+    let normalize = |s: &str| s.replace("\r\n", "\n");
+
+    let (haystack, needle, replacement) = if original.matches(old).count() > 0 {
+        (original.to_string(), old.to_string(), new.to_string())
+    } else {
+        (normalize(original), normalize(old), normalize(new))
+    };
+
+    let match_count = haystack.matches(needle.as_str()).count();
+    let updated = if replace_all {
+        if match_count == 0 {
+            return Err(not_found(original, old));
+        }
+        haystack.replace(&needle, &replacement)
+    } else {
+        match match_count {
+            0 => return Err(not_found(original, old)),
+            1 => haystack.replacen(&needle, &replacement, 1),
+            n => {
+                return Err(ToolError::Failed(format!(
+                    "old_string is not unique; {n} matches — include more surrounding lines or set replace_all"
+                )));
+            }
+        }
+    };
+    let replaced = if replace_all { match_count } else { 1 };
+
+    // Re-apply CRLF only if we normalized (the exact-match path never
+    // touched line endings).
+    let updated = if crlf && !updated.contains("\r\n") {
+        updated.replace('\n', "\r\n")
+    } else {
+        updated
+    };
+    Ok((updated, replaced))
+}
+
+/// Builds the not-found error with a hint naming the first old_string line
+/// that does not occur in the file (after line-ending normalization), so
+/// the model can see *where* its snippet drifted.
+fn not_found(original: &str, old: &str) -> ToolError {
+    let file = original.replace("\r\n", "\n");
+    let missing = old
+        .replace("\r\n", "\n")
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.trim().is_empty())
+        .find(|l| !file.contains(l))
+        .map(|l| l.trim().chars().take(80).collect::<String>());
+    match missing {
+        Some(line) => ToolError::Failed(format!(
+            "old_string not found — first line with no match in file: `{line}`. Re-read the file and copy the text exactly (whitespace matters)"
+        )),
+        None => ToolError::Failed(
+            "old_string not found — every line exists in the file but not contiguously / with this exact indentation. Re-read the file and copy the block exactly"
+                .to_string(),
+        ),
     }
 }
 
@@ -192,5 +244,49 @@ mod tests {
             std::fs::read_to_string(dir.join("a.txt")).unwrap(),
             "bar bar"
         );
+    }
+
+    #[test]
+    fn apply_replacement_matches_lf_needle_against_crlf_file() {
+        let file = "fn a() {\r\n    1\r\n}\r\n";
+        let (out, n) =
+            apply_replacement(file, "fn a() {\n    1\n}", "fn a() {\n    2\n}", false).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(out, "fn a() {\r\n    2\r\n}\r\n");
+    }
+
+    #[test]
+    fn apply_replacement_matches_crlf_needle_against_lf_file() {
+        let file = "x\ny\n";
+        let (out, _) = apply_replacement(file, "x\r\ny", "z", false).unwrap();
+        assert_eq!(out, "z\n");
+    }
+
+    #[test]
+    fn apply_replacement_exact_path_keeps_mixed_endings() {
+        let file = "a\r\nb\nc";
+        let (out, _) = apply_replacement(file, "b", "B", false).unwrap();
+        assert_eq!(out, "a\r\nB\nc");
+    }
+
+    #[test]
+    fn apply_replacement_not_found_names_first_missing_line() {
+        let err = apply_replacement(
+            "let x = 1;\nlet y = 2;\n",
+            "let x = 1;\nlet q = 9;",
+            "",
+            false,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("old_string not found"), "{msg}");
+        assert!(msg.contains("let q = 9;"), "{msg}");
+    }
+
+    #[test]
+    fn apply_replacement_non_unique_errors_unless_replace_all() {
+        assert!(apply_replacement("a a", "a", "b", false).is_err());
+        let (out, n) = apply_replacement("a a", "a", "b", true).unwrap();
+        assert_eq!((out.as_str(), n), ("b b", 2));
     }
 }

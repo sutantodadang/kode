@@ -1,4 +1,5 @@
 mod error;
+mod prompt_budget;
 
 pub use error::{AgentError, Result};
 
@@ -10,6 +11,7 @@ use kode_core::event::{EventBus, KodeEvent};
 use kode_model::{Message, Model, ModelRequest, ResponseAccumulator, StreamEvent, Usage};
 use kode_tools::registry::ToolRuntime;
 use kode_tools::{RequiredPermission, ToolContext, ToolError};
+use prompt_budget::PromptBudget;
 
 const SYSTEM_PROMPT: &str = "You are Kode, a coding agent operating on the user's repository. \
 Use the provided tools to inspect and modify files and run commands. Prefer reading before \
@@ -25,6 +27,7 @@ pub struct Agent {
     events: EventBus,
     max_iterations: u32,
     max_tool_calls: u32,
+    prompt_budget: PromptBudget,
     effort: Option<String>,
 }
 
@@ -83,6 +86,7 @@ impl Agent {
             events,
             max_iterations: agent_cfg.max_iterations,
             max_tool_calls: agent_cfg.max_tool_calls,
+            prompt_budget: PromptBudget::new(agent_cfg.max_context_tokens),
             effort: None,
         }
     }
@@ -144,19 +148,18 @@ impl Agent {
 
         for iteration in 1..=self.max_iterations {
             if ctx.cancel.is_cancelled() {
-                self.events.emit(KodeEvent::AgentError {
-                    message: "cancelled".to_string(),
-                });
                 return Err(AgentError::Cancelled);
             }
 
             self.events.emit(KodeEvent::ModelStarted);
+            let tools = self.tools.specs();
+            let request_messages = self.prompt_budget.prepare(&messages, &tools)?;
             let mut stream = self
                 .model
                 .stream(ModelRequest {
-                    messages: messages.clone(),
-                    tools: self.tools.specs(),
-                    max_tokens: None,
+                    messages: request_messages,
+                    tools,
+                    max_tokens: Some(self.prompt_budget.output_tokens()),
                     temperature: None,
                     effort: self.effort.clone(),
                 })
@@ -167,9 +170,6 @@ impl Agent {
                 tokio::select! {
                     biased;
                     _ = ctx.cancel.cancelled() => {
-                        self.events.emit(KodeEvent::AgentError {
-                            message: "cancelled".to_string(),
-                        });
                         return Err(AgentError::Cancelled);
                     }
                     item = stream.next() => {
@@ -207,9 +207,6 @@ impl Agent {
 
             for call in &response.tool_calls {
                 if total_tool_calls >= self.max_tool_calls {
-                    self.events.emit(KodeEvent::AgentError {
-                        message: format!("tool call limit reached ({})", self.max_tool_calls),
-                    });
                     return Err(AgentError::ToolCallLimit(self.max_tool_calls));
                 }
 
@@ -261,9 +258,6 @@ impl Agent {
                         });
                     }
                     Err(ToolError::Cancelled) => {
-                        self.events.emit(KodeEvent::AgentError {
-                            message: "cancelled".to_string(),
-                        });
                         return Err(AgentError::Cancelled);
                     }
                     Err(e) => {
@@ -281,9 +275,6 @@ impl Agent {
             }
         }
 
-        self.events.emit(KodeEvent::AgentError {
-            message: format!("iteration limit reached ({})", self.max_iterations),
-        });
         Err(AgentError::IterationLimit(self.max_iterations))
     }
 }
