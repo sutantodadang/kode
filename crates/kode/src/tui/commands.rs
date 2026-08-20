@@ -46,6 +46,7 @@ pub const BUILTIN_COMMAND_NAMES: &[&str] = &[
 pub const VALID_PROVIDERS: &[&str] = &[
     "openai",
     "anthropic",
+    "antigravity",
     "codex",
     "opencode-go",
     "opencode",
@@ -145,6 +146,7 @@ pub fn provider_auth_state(
     opencode_keys: &[String],
     env_key: bool,
     anthropic_auth: bool,
+    antigravity_auth: bool,
 ) -> &'static str {
     match provider {
         "codex" => {
@@ -170,6 +172,13 @@ pub fn provider_auth_state(
         }
         "anthropic" => {
             if anthropic_auth {
+                " ✓ logged in"
+            } else {
+                ""
+            }
+        }
+        "antigravity" => {
+            if antigravity_auth {
                 " ✓ logged in"
             } else {
                 ""
@@ -247,6 +256,14 @@ pub(crate) fn anthropic_auth_present() -> bool {
         || std::env::var("ANTHROPIC_API_KEY")
             .map(|v| !v.is_empty())
             .unwrap_or(false)
+}
+
+/// True when Kode's own antigravity auth store
+/// (`~/.kode/auth/antigravity.json`) exists.
+pub(crate) fn antigravity_auth_present() -> bool {
+    kode_model::antigravity::default_auth_path()
+        .map(|p| p.exists())
+        .unwrap_or(false)
 }
 
 /// Validates a reasoning-effort value against
@@ -383,12 +400,20 @@ pub(crate) fn open_provider_picker(state: &mut AppState) {
     let opencode_keys = opencode_key_ids();
     let env_key = openai_env_key_present();
     let anthropic_auth = anthropic_auth_present();
+    let antigravity_auth = antigravity_auth_present();
     state.picker.items = VALID_PROVIDERS
         .iter()
         .map(|p| {
             format!(
                 "{p}{}",
-                provider_auth_state(p, codex_auth, &opencode_keys, env_key, anthropic_auth)
+                provider_auth_state(
+                    p,
+                    codex_auth,
+                    &opencode_keys,
+                    env_key,
+                    anthropic_auth,
+                    antigravity_auth
+                )
             )
         })
         .collect();

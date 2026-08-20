@@ -26,6 +26,16 @@ const ANTHROPIC_FALLBACK_MODELS: &[&str] = &[
     "claude-haiku-4-5-20251001",
 ];
 
+/// Static candidates used when the live `fetchAvailableModels` call fails
+/// (not logged in, network error). Pro tiers are encoded in the id.
+const ANTIGRAVITY_FALLBACK_MODELS: &[&str] = &[
+    "gemini-3.1-pro-high",
+    "gemini-3.1-pro-low",
+    "gemini-3-flash",
+    "claude-sonnet-4-6",
+    "claude-opus-4-6-thinking",
+];
+
 /// Codex CLI release version reported as `client_version` when listing
 /// models. The ChatGPT backend filters its response by this value — an
 /// outdated version can silently return an empty model list — so this needs
@@ -64,6 +74,12 @@ pub async fn list_models(
                 .map(|s| s.to_string())
                 .collect()
         })),
+        "antigravity" => Ok(fetch_antigravity_models().await.unwrap_or_else(|_| {
+            ANTIGRAVITY_FALLBACK_MODELS
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        })),
         other => Err(format!("no model catalog for provider '{other}'")),
     }
 }
@@ -72,6 +88,24 @@ pub async fn list_models(
 /// else an `"api"`-type key from Kode's own anthropic auth store. Returns
 /// `None` for OAuth-only auth (or no auth at all) — callers fall back to
 /// [`ANTHROPIC_FALLBACK_MODELS`] in that case.
+/// Fetches the live Antigravity model list using the stored OAuth token.
+/// Errors when not logged in or the call fails; callers fall back to
+/// [`ANTIGRAVITY_FALLBACK_MODELS`].
+async fn fetch_antigravity_models() -> Result<Vec<String>, String> {
+    let path = crate::antigravity::default_auth_path()
+        .ok_or_else(|| "cannot resolve home directory".to_string())?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let auth = crate::antigravity::load_fresh(&client, &path)
+        .await
+        .map_err(|e| e.to_string())?;
+    crate::antigravity::fetch_available_models(&client, &auth.access_token, &auth.project_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 fn anthropic_api_key() -> Option<String> {
     if let Ok(key) = std::env::var("ANTHROPIC_API_KEY")
         && !key.is_empty()

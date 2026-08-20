@@ -112,6 +112,9 @@ pub async fn run(cwd: &Path) -> anyhow::Result<()> {
         "anthropic" => {
             checks.push(anthropic_check(&anthropic_auth_result()));
         }
+        "antigravity" => {
+            checks.push(antigravity_check(&antigravity_auth_result()));
+        }
         _ => {}
     }
 
@@ -305,6 +308,24 @@ fn anthropic_check(result: &Result<kode_model::AnthropicAuth, String>) -> Check 
             "anthropic auth",
             err.clone(),
             "run: kode auth login anthropic (or set ANTHROPIC_API_KEY)",
+        ),
+    }
+}
+
+fn antigravity_auth_result() -> Result<kode_model::AntigravityAuth, String> {
+    let path = kode_model::antigravity::default_auth_path()
+        .ok_or_else(|| "cannot resolve home directory".to_string())?;
+    kode_model::antigravity::load(&path).map_err(|e| e.to_string())
+}
+
+fn antigravity_check(result: &Result<kode_model::AntigravityAuth, String>) -> Check {
+    match result {
+        Ok(_) => Check::pass("LLM", "antigravity auth", "oauth token present"),
+        Err(err) => Check::fail(
+            "LLM",
+            "antigravity auth",
+            err.clone(),
+            "run: kode auth login antigravity",
         ),
     }
 }
@@ -822,6 +843,27 @@ mod tests {
         }));
         assert_eq!(check.status, CheckStatus::Pass);
         assert_eq!(check.detail, "oauth token present");
+    }
+
+    #[test]
+    fn antigravity_check_ok_is_pass() {
+        let check = antigravity_check(&Ok(kode_model::AntigravityAuth {
+            access_token: "a".into(),
+            refresh_token: "r".into(),
+            expires_at: 1,
+            project_id: "p".into(),
+        }));
+        assert_eq!(check.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn antigravity_check_err_is_fail() {
+        let check = antigravity_check(&Err("boom".to_string()));
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert_eq!(
+            check.fix.as_deref(),
+            Some("run: kode auth login antigravity")
+        );
     }
 
     #[test]

@@ -27,6 +27,14 @@ You're prompted to choose:
 
 Prefer the API key path unless you specifically need to use subscription credits instead of pay-as-you-go billing.
 
+## Log in to Antigravity (Google)
+
+```
+kode auth login antigravity
+```
+
+⚠️ **EXPERIMENTAL**. Uses the Google OAuth client of the Antigravity IDE to reach Google's Cloud Code Assist API (Gemini models); Google could change or block it without notice. Kode starts a local PKCE flow on `localhost:51121`, opens your browser to the Google consent screen, exchanges the code, resolves (or auto-provisions, FREE tier) your managed Cloud Code Assist project, and writes everything to `~/.kode/auth/antigravity.json`. Tokens refresh automatically on later runs. OAuth only — there is no API-key mode.
+
 ## Log in to an opencode-family provider
 
 opencode-go, opencode, kilo, and lmstudio authenticate by pasting an API key:

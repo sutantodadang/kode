@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod antigravity;
 pub mod catalog;
 pub mod codex;
 mod error;
@@ -10,6 +11,7 @@ mod stream;
 mod types;
 
 pub use anthropic::{AnthropicAuth, AnthropicModel};
+pub use antigravity::{AntigravityAuth, AntigravityModel};
 pub use codex::{CodexAuth, CodexModel};
 pub use error::{ModelError, Result};
 pub use mock::MockModel;

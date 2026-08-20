@@ -1,8 +1,8 @@
 //! `kode auth login|status|logout` — Kode's own credential store for the
-//! `codex` and opencode-family (`opencode-go`, `opencode`, `kilo`,
-//! `lmstudio`) providers. Writes to `~/.kode/auth/{codex,opencode}.json` in
-//! the exact schemas `kode_model::codex` and `kode_model::opencode` already
-//! parse. Never reads `~/.codex` or opencode's own data/auth directories.
+//! `codex`, `anthropic`, `antigravity` and opencode-family (`opencode-go`,
+//! `opencode`, `kilo`, `lmstudio`) providers. Writes to
+//! `~/.kode/auth/<provider>.json` in the exact schemas the matching
+//! `kode_model` module already parses. Never reads another tool's auth files.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -25,15 +25,22 @@ const ANTHROPIC_REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/c
 const ANTHROPIC_REDIRECT_URI_ENCODED: &str =
     "https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback";
 
+const ANTIGRAVITY_AUTHORIZE_BASE: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+const ANTIGRAVITY_REDIRECT_URI: &str = "http://localhost:51121/oauth-callback";
+const ANTIGRAVITY_REDIRECT_URI_ENCODED: &str = "http%3A%2F%2Flocalhost%3A51121%2Foauth-callback";
+const ANTIGRAVITY_CALLBACK_PATH: &str = "/oauth-callback";
+const ANTIGRAVITY_SCOPES_ENCODED: &str = "https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fuserinfo.email%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fuserinfo.profile%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcclog%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fexperimentsandconfigs";
+
 const OPENCODE_PROVIDERS: [&str; 4] = ["opencode-go", "opencode", "kilo", "lmstudio"];
 
 const SUPPORTED_PROVIDERS_MSG: &str =
-    "supported: codex, anthropic, opencode-go, opencode, kilo, lmstudio";
+    "supported: codex, anthropic, antigravity, opencode-go, opencode, kilo, lmstudio";
 
 pub async fn login(provider: &str) -> anyhow::Result<()> {
     match provider {
         "codex" => login_codex().await,
         "anthropic" => login_anthropic().await,
+        "antigravity" => login_antigravity().await,
         p if OPENCODE_PROVIDERS.contains(&p) => login_opencode_key(p).await,
         other => anyhow::bail!("unsupported provider '{other}' ({SUPPORTED_PROVIDERS_MSG})"),
     }
@@ -86,6 +93,19 @@ pub async fn status() -> anyhow::Result<()> {
         }
     }
 
+    if let Ok(path) = antigravity_auth_path()
+        && path.exists()
+    {
+        printed = true;
+        match kode_model::antigravity::load(&path) {
+            Ok(auth) => println!(
+                "antigravity: logged in (oauth, project {})",
+                auth.project_id
+            ),
+            Err(_) => println!("antigravity: not logged in"),
+        }
+    }
+
     if !printed {
         println!("no credentials stored \u{2014} run: kode auth login <provider>");
     }
@@ -121,6 +141,15 @@ pub async fn logout(provider: &str) -> anyhow::Result<()> {
                 println!("nothing to remove");
             }
         }
+        "antigravity" => {
+            let path = antigravity_auth_path()?;
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+                println!("antigravity: logged out");
+            } else {
+                println!("nothing to remove");
+            }
+        }
         other => anyhow::bail!("unsupported provider '{other}' ({SUPPORTED_PROVIDERS_MSG})"),
     }
     Ok(())
@@ -140,7 +169,7 @@ async fn login_codex() -> anyhow::Result<()> {
 
     open_browser(&url);
 
-    let code = wait_for_callback(listener, &state).await?;
+    let code = wait_for_callback(listener, &state, "/auth/callback", "codex").await?;
     let (id_token, access_token, refresh_token) = exchange_code(&code, &verifier).await?;
     let account_id = decode_jwt_account_id(&id_token).ok_or_else(|| {
         anyhow::anyhow!("no ChatGPT account in token \u{2014} is your plan active?")
@@ -190,7 +219,12 @@ fn open_browser(url: &str) {
 /// arrives (returns the authorization code), a bad/mismatched callback
 /// arrives (returns an error immediately \u{2014} no hanging), or 300s elapse.
 /// Requests to any other path get a 404 and the loop keeps waiting.
-async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> anyhow::Result<String> {
+async fn wait_for_callback(
+    listener: TcpListener,
+    expected_state: &str,
+    callback_path: &str,
+    provider: &str,
+) -> anyhow::Result<String> {
     let result = tokio::time::timeout(CALLBACK_TIMEOUT, async {
         loop {
             let (mut stream, _) = listener.accept().await?;
@@ -203,7 +237,7 @@ async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> anyho
                 respond(&mut stream, 400, "bad request").await;
                 continue;
             };
-            if !path.starts_with("/auth/callback") {
+            if !path.starts_with(callback_path) {
                 respond(&mut stream, 404, "not found").await;
                 continue;
             }
@@ -221,7 +255,7 @@ async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> anyho
                 }
                 Err(msg) => {
                     respond(&mut stream, 400, msg).await;
-                    return Err(anyhow::anyhow!("codex login callback error: {msg}"));
+                    return Err(anyhow::anyhow!("{provider} login callback error: {msg}"));
                 }
             }
         }
@@ -589,6 +623,106 @@ fn remove_opencode_key(path: &Path, provider_id: &str) -> anyhow::Result<bool> {
     Ok(removed)
 }
 
+// --- antigravity (Google OAuth via Cloud Code Assist) ----------------------
+
+/// OAuth via a Google account (PKCE, localhost callback on port 51121), then
+/// resolves the managed Cloud Code Assist project. EXPERIMENTAL: not an
+/// officially supported third-party auth flow and may break without notice.
+async fn login_antigravity() -> anyhow::Result<()> {
+    println!(
+        "[EXPERIMENTAL] Antigravity (Google) OAuth is not an officially supported third-party flow \u{2014} it may break."
+    );
+    let verifier = random_hex(64);
+    let state = random_hex(32);
+    let challenge = base64url_nopad(&sha256(verifier.as_bytes()));
+    let url = build_antigravity_authorize_url(&challenge, &state);
+
+    let listener = TcpListener::bind("127.0.0.1:51121").await.map_err(|e| {
+        anyhow::anyhow!("cannot listen on 127.0.0.1:51121 for the login callback: {e}")
+    })?;
+
+    open_browser(&url);
+    println!("waiting for browser callback (up to 300s)...");
+    let code =
+        wait_for_callback(listener, &state, ANTIGRAVITY_CALLBACK_PATH, "antigravity").await?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+    let (access_token, refresh_token, expires_in) =
+        exchange_antigravity_code(&client, &code, &verifier).await?;
+    let project_id = kode_model::antigravity::discover_project(&client, &access_token)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let auth = kode_model::AntigravityAuth {
+        access_token,
+        refresh_token,
+        expires_at: now + expires_in,
+        project_id,
+    };
+    kode_model::antigravity::write_auth(&antigravity_auth_path()?, &auth)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!(
+        "antigravity: logged in (oauth, project {})",
+        auth.project_id
+    );
+    print_available_models("antigravity").await;
+    Ok(())
+}
+
+fn build_antigravity_authorize_url(challenge: &str, state: &str) -> String {
+    format!(
+        "{ANTIGRAVITY_AUTHORIZE_BASE}?client_id={}&redirect_uri={ANTIGRAVITY_REDIRECT_URI_ENCODED}&response_type=code&scope={ANTIGRAVITY_SCOPES_ENCODED}&code_challenge={challenge}&code_challenge_method=S256&state={state}&access_type=offline&prompt=consent",
+        kode_model::antigravity::OAUTH_CLIENT_ID
+    )
+}
+
+async fn exchange_antigravity_code(
+    client: &reqwest::Client,
+    code: &str,
+    verifier: &str,
+) -> anyhow::Result<(String, String, u64)> {
+    #[derive(serde::Deserialize)]
+    struct TokenResponse {
+        access_token: String,
+        refresh_token: String,
+        #[serde(default)]
+        expires_in: Option<u64>,
+    }
+
+    let resp = client
+        .post(kode_model::antigravity::OAUTH_TOKEN_URL)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("client_id", kode_model::antigravity::OAUTH_CLIENT_ID),
+            (
+                "client_secret",
+                kode_model::antigravity::OAUTH_CLIENT_SECRET,
+            ),
+            ("redirect_uri", ANTIGRAVITY_REDIRECT_URI),
+            ("code_verifier", verifier),
+        ])
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let snippet: String = text.chars().take(500).collect();
+        anyhow::bail!("token exchange failed ({status}): {snippet}");
+    }
+    let wire: TokenResponse = resp.json().await?;
+    Ok((
+        wire.access_token,
+        wire.refresh_token,
+        wire.expires_in.unwrap_or(3600),
+    ))
+}
+
 // --- store paths -------------------------------------------------------------
 
 fn codex_auth_path() -> anyhow::Result<PathBuf> {
@@ -603,6 +737,11 @@ fn opencode_auth_path() -> anyhow::Result<PathBuf> {
 
 fn anthropic_auth_path() -> anyhow::Result<PathBuf> {
     kode_model::anthropic::default_auth_path()
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve home directory for kode auth store"))
+}
+
+fn antigravity_auth_path() -> anyhow::Result<PathBuf> {
+    kode_model::antigravity::default_auth_path()
         .ok_or_else(|| anyhow::anyhow!("cannot resolve home directory for kode auth store"))
 }
 
@@ -860,6 +999,23 @@ mod tests {
         assert!(url.contains("state=state-xyz"));
         assert!(url.contains("id_token_add_organizations=true"));
         assert!(url.contains("codex_cli_simplified_flow=true"));
+    }
+
+    #[test]
+    fn build_antigravity_authorize_url_contains_required_params() {
+        let url = build_antigravity_authorize_url("chal", "st");
+        assert!(url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"));
+        for needle in [
+            "code_challenge=chal",
+            "code_challenge_method=S256",
+            "state=st",
+            "access_type=offline",
+            "prompt=consent",
+            "scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform",
+            "redirect_uri=http%3A%2F%2Flocalhost%3A51121%2Foauth-callback",
+        ] {
+            assert!(url.contains(needle), "missing {needle} in {url}");
+        }
     }
 
     #[test]

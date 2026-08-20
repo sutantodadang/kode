@@ -992,47 +992,68 @@ fn parse_slash_command_provider_with_arg() {
 #[test]
 fn provider_auth_state_codex_logged_in() {
     assert_eq!(
-        provider_auth_state("codex", true, &[], false, false),
+        provider_auth_state("codex", true, &[], false, false, false),
         " ✓ logged in"
     );
 }
 
 #[test]
 fn provider_auth_state_codex_not_logged_in() {
-    assert_eq!(provider_auth_state("codex", false, &[], false, false), "");
+    assert_eq!(
+        provider_auth_state("codex", false, &[], false, false, false),
+        ""
+    );
 }
 
 #[test]
 fn provider_auth_state_opencode_family_matches_key() {
     let keys = vec!["opencode-go".to_string()];
     assert_eq!(
-        provider_auth_state("opencode-go", false, &keys, false, false),
+        provider_auth_state("opencode-go", false, &keys, false, false, false),
         " ✓ logged in"
     );
     assert_eq!(
-        provider_auth_state("opencode", false, &keys, false, false),
+        provider_auth_state("opencode", false, &keys, false, false, false),
         ""
     );
-    assert_eq!(provider_auth_state("kilo", false, &keys, false, false), "");
+    assert_eq!(
+        provider_auth_state("kilo", false, &keys, false, false, false),
+        ""
+    );
 }
 
 #[test]
 fn provider_auth_state_openai_uses_env_key() {
     assert_eq!(
-        provider_auth_state("openai", false, &[], true, false),
+        provider_auth_state("openai", false, &[], true, false, false),
         " ✓ logged in"
     );
-    assert_eq!(provider_auth_state("openai", false, &[], false, false), "");
+    assert_eq!(
+        provider_auth_state("openai", false, &[], false, false, false),
+        ""
+    );
 }
 
 #[test]
 fn provider_auth_state_anthropic_uses_auth_present() {
     assert_eq!(
-        provider_auth_state("anthropic", false, &[], false, true),
+        provider_auth_state("anthropic", false, &[], false, true, false),
         " ✓ logged in"
     );
     assert_eq!(
-        provider_auth_state("anthropic", false, &[], false, false),
+        provider_auth_state("anthropic", false, &[], false, false, false),
+        ""
+    );
+}
+
+#[test]
+fn provider_auth_state_antigravity_uses_auth_present() {
+    assert_eq!(
+        provider_auth_state("antigravity", false, &[], false, false, true),
+        " ✓ logged in"
+    );
+    assert_eq!(
+        provider_auth_state("antigravity", false, &[], false, false, false),
         ""
     );
 }
@@ -1040,11 +1061,11 @@ fn provider_auth_state_anthropic_uses_auth_present() {
 #[test]
 fn provider_auth_state_lmstudio_always_local() {
     assert_eq!(
-        provider_auth_state("lmstudio", false, &[], false, false),
+        provider_auth_state("lmstudio", false, &[], false, false, false),
         " (local)"
     );
     assert_eq!(
-        provider_auth_state("lmstudio", true, &[], true, true),
+        provider_auth_state("lmstudio", true, &[], true, true, false),
         " (local)"
     );
 }

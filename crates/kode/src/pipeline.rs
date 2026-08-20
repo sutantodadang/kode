@@ -150,8 +150,17 @@ pub async fn run_task(
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
             Arc::new(anthropic_model) as Arc<dyn kode_model::Model>
         }
+        "antigravity" => {
+            let auth_path = kode_model::antigravity::default_auth_path().ok_or_else(|| {
+                anyhow::anyhow!("cannot resolve home directory for antigravity auth")
+            })?;
+            let antigravity_model =
+                kode_model::AntigravityModel::new(auth_path, config.model.model.clone())
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Arc::new(antigravity_model) as Arc<dyn kode_model::Model>
+        }
         other => anyhow::bail!(
-            "provider {other} not supported yet (supported: openai, anthropic, codex, opencode-go, opencode, kilo, lmstudio)"
+            "provider {other} not supported yet (supported: openai, anthropic, antigravity, codex, opencode-go, opencode, kilo, lmstudio)"
         ),
     };
 

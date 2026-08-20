@@ -34,8 +34,8 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Command {
-    /// Manage Kode's own credential store for codex/opencode-family
-    /// providers.
+    /// Manage Kode's own credential store for codex/anthropic/antigravity/
+    /// opencode-family providers.
     Auth {
         #[command(subcommand)]
         cmd: AuthCmd,
