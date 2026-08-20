@@ -959,6 +959,7 @@ dependencies = [
  "kode-core",
  "kode-model",
  "libc",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",

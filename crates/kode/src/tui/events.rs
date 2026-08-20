@@ -128,12 +128,15 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
                 }
             }
         }
-        KodeEvent::ToolFinished { name, ok } => {
+        KodeEvent::ToolFinished { name, ok, error } => {
             if !ok {
-                state.transcript.push(TranscriptLine::new(
-                    Gutter::ToolFail,
-                    format!("{name} failed"),
-                ));
+                let text = match error.as_deref().map(first_line_truncated) {
+                    Some(reason) if !reason.is_empty() => format!("{name} failed: {reason}"),
+                    _ => format!("{name} failed"),
+                };
+                state
+                    .transcript
+                    .push(TranscriptLine::new(Gutter::ToolFail, text));
             }
             state.current_tool = None;
             state.tool_started = None;
@@ -310,4 +313,17 @@ pub(crate) fn ledger_why_from(ks: &KnowledgeState) -> Vec<(WhySource, String)> {
         why.push((WhySource::Ingat, i.clone()));
     }
     why
+}
+
+/// First line of `s`, trimmed and clipped to 160 chars (with `…`), so a tool
+/// failure reason fits on one transcript row.
+pub(crate) fn first_line_truncated(s: &str) -> String {
+    const MAX: usize = 160;
+    let line = s.lines().next().unwrap_or("").trim();
+    if line.chars().count() <= MAX {
+        return line.to_string();
+    }
+    let mut out: String = line.chars().take(MAX - 1).collect();
+    out.push('\u{2026}');
+    out
 }

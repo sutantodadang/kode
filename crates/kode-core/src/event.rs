@@ -46,6 +46,9 @@ pub enum KodeEvent {
     ToolFinished {
         name: String,
         ok: bool,
+        /// Short, single-line failure reason when `ok == false` (None on
+        /// success). Frontends render it next to the tool name.
+        error: Option<String>,
     },
     VerificationStarted,
     VerificationFinished {

@@ -78,11 +78,15 @@ fn tool_finished_failure_pushes_failure_line() {
         KodeEvent::ToolFinished {
             name: "run_shell".into(),
             ok: false,
+            error: Some("boom".into()),
         },
     );
     assert_eq!(
         s.transcript,
-        vec![TranscriptLine::new(Gutter::ToolFail, "run_shell failed")]
+        vec![TranscriptLine::new(
+            Gutter::ToolFail,
+            "run_shell failed: boom"
+        )]
     );
     assert_eq!(s.current_tool, None);
 }
@@ -103,6 +107,7 @@ fn tool_started_sets_tool_timer_and_finished_clears_it() {
         KodeEvent::ToolFinished {
             name: "read_file".into(),
             ok: true,
+            error: None,
         },
     );
     assert!(s.tool_started.is_none());
@@ -116,6 +121,7 @@ fn tool_finished_success_pushes_nothing() {
         KodeEvent::ToolFinished {
             name: "run_shell".into(),
             ok: true,
+            error: None,
         },
     );
     assert!(s.transcript.is_empty());
@@ -728,10 +734,11 @@ fn ctrl_t_toggles_select_mode_and_notes() {
     );
     assert!(!quit);
     assert!(s.select_mode);
+    // Mode indicator lives on the input line, never in the transcript.
     assert!(
-        s.transcript
+        !s.transcript
             .iter()
-            .any(|l| l.gutter == Gutter::Note && l.text.contains("select mode"))
+            .any(|l| l.gutter == Gutter::Note && l.text.contains("select"))
     );
 
     handle_key(
@@ -747,7 +754,7 @@ fn ctrl_t_toggles_select_mode_and_notes() {
         .iter()
         .filter(|l| l.gutter == Gutter::Note)
         .count();
-    assert_eq!(note_count, 2);
+    assert_eq!(note_count, 0);
 }
 
 #[test]
@@ -1572,6 +1579,7 @@ fn tool_finished_never_touches_ledger_numstat() {
         KodeEvent::ToolFinished {
             name: "apply_patch".into(),
             ok: true,
+            error: None,
         },
     );
     apply_event(
@@ -1579,6 +1587,7 @@ fn tool_finished_never_touches_ledger_numstat() {
         KodeEvent::ToolFinished {
             name: "write_file".into(),
             ok: true,
+            error: None,
         },
     );
     apply_event(
@@ -1586,6 +1595,7 @@ fn tool_finished_never_touches_ledger_numstat() {
         KodeEvent::ToolFinished {
             name: "apply_patch".into(),
             ok: false,
+            error: Some("boom".into()),
         },
     );
     assert!(s.ledger.numstat.is_empty());

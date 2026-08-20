@@ -253,6 +253,7 @@ impl Agent {
                         self.events.emit(KodeEvent::ToolFinished {
                             name: call.name.clone(),
                             ok: true,
+                            error: None,
                         });
                         messages.push(Message::Tool {
                             tool_call_id: call.id.clone(),
@@ -269,6 +270,7 @@ impl Agent {
                         self.events.emit(KodeEvent::ToolFinished {
                             name: call.name.clone(),
                             ok: false,
+                            error: Some(e.to_string()),
                         });
                         messages.push(Message::Tool {
                             tool_call_id: call.id.clone(),

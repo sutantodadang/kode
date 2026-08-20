@@ -14,6 +14,7 @@ async-trait = { workspace = true }
 tracing = { workspace = true }
 kode-core = { workspace = true }
 kode-model = { path = "../kode-model" }
+reqwest = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

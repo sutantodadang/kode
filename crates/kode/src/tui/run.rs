@@ -476,15 +476,9 @@ pub(crate) fn handle_key(
     }
 
     if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('t') {
+        // Indicator is drawn on the input line (`draw_input`), not pushed
+        // into the transcript — it's a mode, not an event.
         state.select_mode = !state.select_mode;
-        let text = if state.select_mode {
-            "select mode — mouse released to terminal: drag to select, Ctrl+T to restore wheel scroll"
-        } else {
-            "select mode off — wheel scroll restored"
-        };
-        state
-            .transcript
-            .push(TranscriptLine::new(Gutter::Note, text));
         return false;
     }
 

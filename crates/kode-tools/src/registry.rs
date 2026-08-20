@@ -5,7 +5,9 @@ use kode_model::ToolSpec;
 
 use crate::error::{Result, ToolError};
 use crate::permission::{Decision, PermissionHandler, decide};
-use crate::tools::{ApplyPatch, GitDiff, GitStatus, ReadFile, RunCommand, WriteFile};
+use crate::tools::{
+    ApplyPatch, FetchUrl, GitDiff, GitStatus, ReadFile, RunCommand, WebSearch, WriteFile,
+};
 use crate::{Tool, ToolContext, ToolOutput};
 
 pub struct ToolRegistry {
@@ -50,6 +52,8 @@ impl ToolRegistry {
         registry.register(Arc::new(RunCommand));
         registry.register(Arc::new(GitStatus));
         registry.register(Arc::new(GitDiff));
+        registry.register(Arc::new(FetchUrl));
+        registry.register(Arc::new(WebSearch));
         registry
     }
 }
@@ -139,10 +143,10 @@ mod tests {
     }
 
     #[test]
-    fn specs_returns_six() {
+    fn specs_returns_all_builtins() {
         let registry = ToolRegistry::with_builtins();
         let specs = registry.specs();
-        assert_eq!(specs.len(), 6);
+        assert_eq!(specs.len(), 8);
         let names: Vec<_> = specs.iter().map(|s| s.name.as_str()).collect();
         for expected in [
             "read_file",
@@ -151,6 +155,8 @@ mod tests {
             "run_command",
             "git_status",
             "git_diff",
+            "fetch_url",
+            "web_search",
         ] {
             assert!(names.contains(&expected), "missing {expected}");
         }

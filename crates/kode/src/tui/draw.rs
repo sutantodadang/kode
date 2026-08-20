@@ -1022,6 +1022,10 @@ pub(crate) fn slash_hint_lines(items: &[(String, String)], selected: usize) -> V
 /// line, no boxes, dim `─` rules only. Positions the terminal cursor at the
 /// end of the typed text, except while a picker or permission prompt has
 /// focus.
+/// Right-edge input-line indicator while Ctrl+T select mode is on (mouse
+/// released to the terminal so native drag-select/copy works).
+pub(crate) const SELECT_MODE_HINT: &str = "select · Ctrl+T to exit  ";
+
 pub(crate) fn draw_input(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &AppState) {
     if area.height == 0 {
         return;
@@ -1045,15 +1049,23 @@ pub(crate) fn draw_input(f: &mut ratatui::Frame, area: ratatui::layout::Rect, st
     };
 
     let suffix = input_suffix(state.knowledge.as_ref());
-    let suffix_text = suffix.plain_text();
+    let select_text = if state.select_mode {
+        SELECT_MODE_HINT
+    } else {
+        ""
+    };
+    let suffix_len = suffix.plain_text().chars().count() + select_text.chars().count();
     let prefix_width = 3 + state.input.chars().count(); // " › " + input
-    let pad = (line_area.width as usize).saturating_sub(prefix_width + suffix_text.chars().count());
+    let pad = (line_area.width as usize).saturating_sub(prefix_width + suffix_len);
 
     let mut spans = vec![
         Span::styled(" › ", Style::default().fg(theme::MUTED)),
         Span::raw(state.input.clone()),
         Span::raw(" ".repeat(pad)),
     ];
+    if state.select_mode {
+        spans.push(Span::styled(select_text, Style::default().fg(theme::T)));
+    }
     spans.extend(suffix.spans());
     f.render_widget(Paragraph::new(Line::from(spans)), line_area);
 
