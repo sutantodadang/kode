@@ -22,6 +22,7 @@ const MEMORY_SEARCH_LIMIT: u32 = 12;
 /// Per-memory body is truncated to this many characters when formatted into
 /// a section bullet.
 const MEMORY_BODY_TRUNCATE_CHARS: usize = 600;
+const CONTEXT_TRUNCATED_MARKER: &str = "\n[truncated to fit context budget]";
 
 /// Fuses git working-tree state, Zindeks repository context, and Ingat
 /// engineering memories into a deterministic, priority-ordered,
@@ -92,11 +93,10 @@ impl ContextCompiler {
 
         let (git_state, intel_result, memory_result) = tokio::join!(git_fut, intel_fut, memory_fut);
 
-        // (section, memory_count) — memory_count is 0 for non-memory
-        // sections, and the number of memory bullets folded into the
-        // section body otherwise. Used to compute `memories_retained` after
-        // the budget pass without re-deriving it from section text.
-        let mut candidates: Vec<(ContextSection, usize)> = Vec::new();
+        // The vector is empty for non-memory sections; memory candidates
+        // retain their item boundaries so budgeting can account for exactly
+        // which memories made it into the prompt.
+        let mut candidates: Vec<(ContextSection, Vec<String>)> = Vec::new();
         let mut intel_status = "disabled".to_string();
         let mut memory_status = "disabled".to_string();
         let mut memories_retrieved = 0usize;
@@ -116,7 +116,7 @@ impl ContextCompiler {
                     body,
                     tokens,
                 },
-                0,
+                Vec::new(),
             ));
         }
 
@@ -132,7 +132,7 @@ impl ContextCompiler {
                         body: code_context.text,
                         tokens,
                     },
-                    0,
+                    Vec::new(),
                 ));
             }
             Some(Err(IntelError::NotIndexed(_))) => {
@@ -179,12 +179,11 @@ impl ContextCompiler {
                             .cmp(&provenance_rank(b.provenance))
                             .then_with(|| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal))
                     });
-                    let count = group.len();
-                    let body = group
+                    let bullets = group
                         .iter()
                         .map(|m| format_memory_bullet(m))
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                        .collect::<Vec<_>>();
+                    let body = bullets.join("\n");
                     let tokens = estimate_tokens(&body);
                     candidates.push((
                         ContextSection {
@@ -193,7 +192,7 @@ impl ContextCompiler {
                             body,
                             tokens,
                         },
-                        count,
+                        bullets,
                     ));
                 }
             }
@@ -208,23 +207,57 @@ impl ContextCompiler {
         let mut sections = Vec::new();
         let mut remaining = self.budget_tokens;
         let mut memories_retained = 0usize;
-        for (mut section, mem_count) in candidates {
+        let mut sections_truncated = 0usize;
+        for (mut section, memory_bullets) in candidates {
             if section.tokens <= remaining {
                 remaining -= section.tokens;
-                memories_retained += mem_count;
+                memories_retained += memory_bullets.len();
                 sections.push(section);
-            } else if remaining >= MIN_TRUNCATE_BUDGET {
-                let char_budget = remaining * 4;
-                let mut truncated: String = section.body.chars().take(char_budget).collect();
-                truncated.push_str("\n[truncated to fit context budget]");
-                section.body = truncated;
-                section.tokens = estimate_tokens(&section.body);
-                memories_retained += mem_count;
-                sections.push(section);
-                break;
-            } else {
-                break;
+                continue;
             }
+
+            if remaining < MIN_TRUNCATE_BUDGET {
+                continue;
+            }
+
+            let original_memory_count = memory_bullets.len();
+            if !memory_bullets.is_empty() {
+                let mut retained = Vec::new();
+                for bullet in memory_bullets {
+                    let mut candidate = retained.clone();
+                    candidate.push(bullet.clone());
+                    let suffix = if candidate.len() < original_memory_count {
+                        CONTEXT_TRUNCATED_MARKER
+                    } else {
+                        ""
+                    };
+                    if estimate_tokens(&(candidate.join("\n") + suffix)) > remaining {
+                        break;
+                    }
+                    retained.push(bullet);
+                }
+                if retained.is_empty() {
+                    continue;
+                }
+                memories_retained += retained.len();
+                let is_truncated = retained.len() < original_memory_count;
+                if is_truncated {
+                    sections_truncated += 1;
+                }
+                section.body = retained.join("\n");
+                if is_truncated {
+                    section.body.push_str(CONTEXT_TRUNCATED_MARKER);
+                }
+                section.tokens = estimate_tokens(&section.body);
+            } else if let Some(body) = truncate_to_token_budget(&section.body, remaining) {
+                sections_truncated += 1;
+                section.body = body;
+                section.tokens = estimate_tokens(&section.body);
+            } else {
+                continue;
+            }
+            remaining = remaining.saturating_sub(section.tokens);
+            sections.push(section);
         }
 
         let compiled_tokens: usize = sections.iter().map(|s| s.tokens).sum();
@@ -241,9 +274,31 @@ impl ContextCompiler {
                 memory_status,
                 memories_retrieved,
                 memories_retained,
+                memories_dropped: memories_retrieved.saturating_sub(memories_retained),
+                sections_truncated,
+                sections_dropped: sections_retrieved.saturating_sub(sections_retained),
             },
         }
     }
+}
+
+/// Truncates text so the marker is included in (rather than appended beyond)
+/// the token budget. The estimate invariant therefore remains exact.
+fn truncate_to_token_budget(body: &str, token_budget: usize) -> Option<String> {
+    const MARKER: &str = "\n[truncated to fit context budget]";
+    let marker_tokens = estimate_tokens(MARKER);
+    if token_budget <= marker_tokens {
+        return None;
+    }
+    let content_chars = token_budget.saturating_sub(marker_tokens) * 4;
+    let mut truncated: String = body.chars().take(content_chars).collect();
+    truncated.push_str(MARKER);
+    while estimate_tokens(&truncated) > token_budget {
+        let marker_chars = MARKER.chars().count();
+        let keep = truncated.chars().count().saturating_sub(marker_chars + 1);
+        truncated = truncated.chars().take(keep).collect::<String>() + MARKER;
+    }
+    Some(truncated)
 }
 
 /// Ordering rank for a memory's provenance within a section — lower sorts
@@ -395,7 +450,9 @@ mod tests {
                 .ends_with("[truncated to fit context budget]")
         );
         assert!(compiled.stats.raw_tokens >= 9_000);
-        assert!(compiled.stats.compiled_tokens <= 1_100);
+        assert!(compiled.stats.compiled_tokens <= 1_000);
+        assert_eq!(compiled.stats.sections_truncated, 1);
+        assert_eq!(compiled.stats.sections_dropped, 0);
     }
 
     #[tokio::test]
@@ -543,6 +600,47 @@ mod tests {
         assert_eq!(compiled.stats.memory_status, "ok");
         assert_eq!(compiled.stats.memories_retrieved, 3);
         assert_eq!(compiled.stats.memories_retained, 3);
+    }
+
+    #[tokio::test]
+    async fn partial_memory_section_counts_only_retained_items() {
+        use kode_memory::MockEngineeringMemory;
+
+        let dir = temp_dir("memory-partial-accounting");
+        let memory = MockEngineeringMemory {
+            search_results: vec![
+                new_memory(
+                    Some(MemoryKind::ProjectRule),
+                    None,
+                    "first",
+                    &"a".repeat(500),
+                    0.9,
+                ),
+                new_memory(
+                    Some(MemoryKind::ProjectRule),
+                    None,
+                    "second",
+                    &"b".repeat(500),
+                    0.8,
+                ),
+                new_memory(
+                    Some(MemoryKind::ProjectRule),
+                    None,
+                    "third",
+                    &"c".repeat(500),
+                    0.7,
+                ),
+            ],
+            ..Default::default()
+        };
+        let compiler = ContextCompiler::new(None, Some(Arc::new(memory)), 200);
+        let compiled = compiler.compile(&request(), &dir).await;
+
+        assert!(compiled.stats.compiled_tokens <= 200);
+        assert_eq!(compiled.stats.memories_retrieved, 3);
+        assert_eq!(compiled.stats.memories_retained, 1);
+        assert_eq!(compiled.stats.memories_dropped, 2);
+        assert_eq!(compiled.stats.sections_truncated, 1);
     }
 
     #[test]

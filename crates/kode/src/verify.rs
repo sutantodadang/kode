@@ -6,7 +6,8 @@ use kode_core::CancellationToken;
 /// verification pipeline, and print the report. Exits with an error when
 /// verification did not pass.
 pub async fn run(cwd: &Path, cancel: CancellationToken) -> anyhow::Result<()> {
-    let profile = kode_verify::detect(cwd);
+    let config = kode_core::KodeConfig::load(cwd)?;
+    let profile = kode_verify::detect_with_config(cwd, &config.verify);
     println!(
         "verifying ({:?}): {} steps",
         profile.kind,

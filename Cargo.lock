@@ -882,12 +882,14 @@ dependencies = [
 name = "kode-core"
 version = "0.2.4"
 dependencies = [
+ "libc",
  "serde",
  "thiserror",
  "tokio",
  "tokio-util",
  "toml",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -958,7 +960,6 @@ dependencies = [
  "async-trait",
  "kode-core",
  "kode-model",
- "libc",
  "reqwest",
  "serde",
  "serde_json",
@@ -966,7 +967,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -978,6 +978,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "toml",
  "tracing",
 ]
 

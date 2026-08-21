@@ -50,6 +50,9 @@ pub struct ContextStats {
     pub memory_status: String,
     pub memories_retrieved: usize,
     pub memories_retained: usize,
+    pub memories_dropped: usize,
+    pub sections_truncated: usize,
+    pub sections_dropped: usize,
 }
 
 /// The result of [`crate::ContextCompiler::compile`]: a deterministic,
@@ -163,6 +166,9 @@ mod tests {
                 memory_status: "disabled".to_string(),
                 memories_retrieved: 0,
                 memories_retained: 0,
+                memories_dropped: 0,
+                sections_truncated: 0,
+                sections_dropped: 0,
             },
         };
         let rendered = compiled.render().unwrap();

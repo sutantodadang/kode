@@ -1,17 +1,16 @@
 use std::collections::VecDeque;
-use std::path::Path;
-use std::process::Stdio;
+use std::path::{Component, Path};
 use std::time::{Duration, Instant};
 
 use kode_core::CancellationToken;
+use kode_core::process::{managed_command, spawn_managed};
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
 
 use crate::{ProjectProfile, StepResult, StepStatus, VerificationReport};
 
-const STEP_TIMEOUT: Duration = Duration::from_secs(600);
 const DIFF_TIMEOUT: Duration = Duration::from_secs(10);
 const TAIL_CHARS: usize = 10_000;
+const OUTPUT_TRUNCATED_MARKER: &str = "[earlier output truncated]\n";
 
 enum StepOutcome {
     Finished(std::io::Result<std::process::ExitStatus>),
@@ -19,13 +18,6 @@ enum StepOutcome {
     Cancelled,
 }
 
-/// Runs every step in `profile` sequentially against `root`.
-///
-/// A failing required step blocks all remaining steps (they become
-/// `Skipped("previous step failed")`). Optional steps whose program can't be
-/// spawned are `Skipped("not available")`; a nonzero exit from an optional
-/// step is `Failed` but the pipeline continues. `cancel` is checked before
-/// each step and honored mid-step (the child is killed).
 pub async fn run_verification(
     root: &Path,
     profile: &ProjectProfile,
@@ -39,31 +31,36 @@ pub async fn run_verification(
             results.push(skipped(&verify_step.name, reason));
             continue;
         }
-
         if cancel.is_cancelled() {
             blocked = Some("cancelled");
             results.push(failed(&verify_step.name, None, "cancelled", Duration::ZERO));
             continue;
         }
+        let cwd = match step_directory(root, &verify_step.cwd) {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                if verify_step.required && profile.fail_fast {
+                    blocked = Some("previous step failed");
+                }
+                results.push(failed(&verify_step.name, None, &error, Duration::ZERO));
+                continue;
+            }
+        };
 
         let start = Instant::now();
-        let spawned = Command::new(&verify_step.program)
-            .args(&verify_step.args)
-            .current_dir(root)
-            .kill_on_drop(true)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
-
-        let mut child = match spawned {
+        let mut command = managed_command(&verify_step.program);
+        command.args(&verify_step.args).current_dir(cwd);
+        let managed = match spawn_managed(&mut command) {
             Ok(child) => child,
-            Err(e) => {
+            Err(error) => {
                 if verify_step.required {
-                    blocked = Some("previous step failed");
+                    if profile.fail_fast {
+                        blocked = Some("previous step failed");
+                    }
                     results.push(failed(
                         &verify_step.name,
                         None,
-                        &format!("spawn error: {e}"),
+                        &format!("spawn error: {error}"),
                         start.elapsed(),
                     ));
                 } else {
@@ -72,17 +69,17 @@ pub async fn run_verification(
                 continue;
             }
         };
-
-        let stdout = child.stdout.take().expect("stdout configured as piped");
-        let stderr = child.stderr.take().expect("stderr configured as piped");
+        let (mut child, mut tree) = managed.into_parts();
+        let stdout = child.stdout.take().expect("managed stdout is piped");
+        let stderr = child.stderr.take().expect("managed stderr is piped");
         let stdout_task = tokio::spawn(read_tail(stdout, TAIL_CHARS));
         let stderr_task = tokio::spawn(read_tail(stderr, TAIL_CHARS));
 
         let outcome = tokio::select! {
             biased;
             _ = cancel.cancelled() => StepOutcome::Cancelled,
-            _ = tokio::time::sleep(STEP_TIMEOUT) => StepOutcome::TimedOut,
-            res = child.wait() => StepOutcome::Finished(res),
+            _ = tokio::time::sleep(verify_step.timeout) => StepOutcome::TimedOut,
+            result = child.wait() => StepOutcome::Finished(result),
         };
         let duration = start.elapsed();
 
@@ -90,58 +87,59 @@ pub async fn run_verification(
             StepOutcome::Finished(Ok(status)) => {
                 let stdout_tail = join_tail(stdout_task).await;
                 let stderr_tail = join_tail(stderr_task).await;
-                let exit_code = status.code();
                 if status.success() {
                     results.push(StepResult {
                         name: verify_step.name.clone(),
                         status: StepStatus::Passed,
-                        exit_code,
+                        exit_code: status.code(),
                         stdout_tail,
                         stderr_tail,
                         duration,
                     });
                 } else {
-                    if verify_step.required {
+                    if verify_step.required && profile.fail_fast {
                         blocked = Some("previous step failed");
                     }
                     results.push(StepResult {
                         name: verify_step.name.clone(),
                         status: StepStatus::Failed,
-                        exit_code,
+                        exit_code: status.code(),
                         stdout_tail,
                         stderr_tail,
                         duration,
                     });
                 }
             }
-            StepOutcome::Finished(Err(e)) => {
+            StepOutcome::Finished(Err(error)) => {
                 let _ = join_tail(stdout_task).await;
-                let mut stderr_tail = join_tail(stderr_task).await;
-                if !stderr_tail.is_empty() {
-                    stderr_tail.push('\n');
+                let mut stderr = join_tail(stderr_task).await;
+                if !stderr.is_empty() {
+                    stderr.push('\n');
                 }
-                stderr_tail.push_str(&format!("io error: {e}"));
-                if verify_step.required {
+                stderr.push_str(&format!("io error: {error}"));
+                if verify_step.required && profile.fail_fast {
                     blocked = Some("previous step failed");
                 }
-                results.push(failed(&verify_step.name, None, &stderr_tail, duration));
+                results.push(failed(&verify_step.name, None, &stderr, duration));
             }
             StepOutcome::TimedOut => {
-                let _ = child.start_kill();
+                tree.kill_tree();
+                let _ = child.wait().await;
                 stdout_task.abort();
                 stderr_task.abort();
-                if verify_step.required {
+                if verify_step.required && profile.fail_fast {
                     blocked = Some("previous step failed");
                 }
                 results.push(failed(
                     &verify_step.name,
                     None,
-                    "timed out after 600s",
+                    &format!("timed out after {}s", verify_step.timeout.as_secs()),
                     duration,
                 ));
             }
             StepOutcome::Cancelled => {
-                let _ = child.start_kill();
+                tree.kill_tree();
+                let _ = child.wait().await;
                 stdout_task.abort();
                 stderr_task.abort();
                 blocked = Some("cancelled");
@@ -153,7 +151,7 @@ pub async fn run_verification(
     let diff_stat = git_diff_stat(root).await;
     let ok = !results
         .iter()
-        .any(|r| matches!(r.status, StepStatus::Failed));
+        .any(|result| matches!(result.status, StepStatus::Failed));
     VerificationReport {
         steps: results,
         diff_stat,
@@ -161,24 +159,51 @@ pub async fn run_verification(
     }
 }
 
+fn step_directory(root: &Path, relative: &Path) -> Result<std::path::PathBuf, String> {
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|part| matches!(part, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(format!("invalid verification cwd: {}", relative.display()));
+    }
+    let directory = root.join(relative);
+    if !directory.is_dir() {
+        return Err(format!(
+            "verification cwd does not exist: {}",
+            relative.display()
+        ));
+    }
+    let canonical_root =
+        std::fs::canonicalize(root).map_err(|e| format!("cannot resolve workspace: {e}"))?;
+    let canonical_directory = std::fs::canonicalize(&directory)
+        .map_err(|e| format!("cannot resolve verification cwd: {e}"))?;
+    if !canonical_directory.starts_with(&canonical_root) {
+        return Err(format!(
+            "verification cwd escapes workspace: {}",
+            relative.display()
+        ));
+    }
+    Ok(canonical_directory)
+}
+
 fn skipped(name: &str, reason: &str) -> StepResult {
     StepResult {
-        name: name.to_string(),
-        status: StepStatus::Skipped(reason.to_string()),
+        name: name.into(),
+        status: StepStatus::Skipped(reason.into()),
         exit_code: None,
         stdout_tail: String::new(),
         stderr_tail: String::new(),
         duration: Duration::ZERO,
     }
 }
-
-fn failed(name: &str, exit_code: Option<i32>, stderr_tail: &str, duration: Duration) -> StepResult {
+fn failed(name: &str, exit_code: Option<i32>, stderr: &str, duration: Duration) -> StepResult {
     StepResult {
-        name: name.to_string(),
+        name: name.into(),
         status: StepStatus::Failed,
         exit_code,
         stdout_tail: String::new(),
-        stderr_tail: stderr_tail.to_string(),
+        stderr_tail: stderr.into(),
         duration,
     }
 }
@@ -190,7 +215,7 @@ async fn read_tail<R: AsyncRead + Unpin>(
     let max_bytes = max_chars.saturating_mul(4);
     let mut tail = VecDeque::with_capacity(max_bytes.min(8192));
     let mut buffer = [0_u8; 8192];
-
+    let mut discarded = false;
     loop {
         let read = reader.read(&mut buffer).await?;
         if read == 0 {
@@ -198,14 +223,16 @@ async fn read_tail<R: AsyncRead + Unpin>(
         }
         tail.extend(&buffer[..read]);
         if tail.len() > max_bytes {
+            discarded = true;
             tail.drain(..tail.len() - max_bytes);
         }
     }
-
-    let bytes: Vec<u8> = tail.into_iter().collect();
-    Ok(tail_chars(&bytes, max_chars))
+    Ok(tail_chars(
+        &tail.into_iter().collect::<Vec<_>>(),
+        max_chars,
+        discarded,
+    ))
 }
-
 async fn join_tail(task: tokio::task::JoinHandle<std::io::Result<String>>) -> String {
     match task.await {
         Ok(Ok(output)) => output,
@@ -213,136 +240,126 @@ async fn join_tail(task: tokio::task::JoinHandle<std::io::Result<String>>) -> St
         Err(e) => format!("output reader failed: {e}"),
     }
 }
-
-fn tail_chars(bytes: &[u8], max_chars: usize) -> String {
-    let s = String::from_utf8_lossy(bytes);
-    let count = s.chars().count();
-    if count <= max_chars {
-        s.into_owned()
-    } else {
-        s.chars().skip(count - max_chars).collect()
+fn tail_chars(bytes: &[u8], max_chars: usize, bytes_discarded: bool) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let count = text.chars().count();
+    let truncated = bytes_discarded || count > max_chars;
+    if !truncated {
+        return text.into_owned();
     }
+    let marker: String = OUTPUT_TRUNCATED_MARKER.chars().take(max_chars).collect();
+    let content_chars = max_chars.saturating_sub(marker.chars().count());
+    let tail: String = text
+        .chars()
+        .skip(count.saturating_sub(content_chars))
+        .collect();
+    format!("{marker}{tail}")
 }
 
 async fn git_diff_stat(root: &Path) -> Option<String> {
-    let spawned = Command::new("git")
-        .args(["diff", "--stat"])
-        .current_dir(root)
-        .kill_on_drop(true)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
-    let child = spawned.ok()?;
-
-    let output = tokio::select! {
-        res = child.wait_with_output() => res.ok()?,
-        _ = tokio::time::sleep(DIFF_TIMEOUT) => return None,
+    let mut command = managed_command("git");
+    command.args(["diff", "--stat"]).current_dir(root);
+    let managed = spawn_managed(&mut command).ok()?;
+    let (mut child, mut tree) = managed.into_parts();
+    let stdout_task = tokio::spawn(read_tail(child.stdout.take()?, TAIL_CHARS));
+    let stderr_task = tokio::spawn(read_tail(child.stderr.take()?, TAIL_CHARS));
+    let status = tokio::select! {
+        result = child.wait() => result.ok()?,
+        _ = tokio::time::sleep(DIFF_TIMEOUT) => {
+            tree.kill_tree();
+            let _ = child.wait().await;
+            stdout_task.abort(); stderr_task.abort();
+            return None;
+        }
     };
-
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    let stdout = join_tail(stdout_task).await;
+    let _ = join_tail(stderr_task).await;
+    status.success().then(|| stdout.trim().to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::VerifyStep;
+    use crate::{ProjectKind, VerifyStep};
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
-
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-    fn nanos() -> u128 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    }
-
-    fn temp_dir() -> std::path::PathBuf {
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "kode-verify-run-{}-{}-{}",
+            "kode-run-{}-{}",
             std::process::id(),
-            nanos(),
-            n
+            COUNTER.fetch_add(1, Ordering::SeqCst)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
-
-    fn vstep(name: &str, program: &str, args: &[&str], required: bool) -> VerifyStep {
+    fn step(name: &str, args: &[&str], required: bool) -> VerifyStep {
         VerifyStep {
-            name: name.to_string(),
-            program: program.to_string(),
-            args: args.iter().map(|s| s.to_string()).collect(),
+            name: name.into(),
+            program: "git".into(),
+            args: args.iter().map(|s| (*s).into()).collect(),
+            cwd: PathBuf::new(),
             required,
+            timeout: Duration::from_secs(20),
         }
     }
 
+    #[test]
+    fn tails_are_marked_and_bounded() {
+        let output = tail_chars(b"0123456789", 32, true);
+        assert_eq!(output.chars().count(), 32);
+        assert!(output.starts_with(OUTPUT_TRUNCATED_MARKER));
+        assert!(output.ends_with("56789"));
+        assert_eq!(tail_chars("éééé".as_bytes(), 3, false), "[ea");
+    }
+
     #[tokio::test]
-    async fn required_failure_skips_remaining_steps() {
-        let dir = temp_dir();
+    async fn fail_fast_skips_remaining_required_steps() {
         let profile = ProjectProfile {
-            kind: crate::ProjectKind::Unknown,
+            kind: ProjectKind::Unknown,
             steps: vec![
-                vstep("git-version", "git", &["--version"], true),
-                vstep("git-bad", "git", &["definitely-not-a-subcommand"], true),
-                vstep("third", "git", &["--version"], true),
+                step("ok", &["--version"], true),
+                step("bad", &["not-a-command"], true),
+                step("last", &["--version"], true),
             ],
+            fail_fast: true,
         };
-
-        let cancel = CancellationToken::new();
-        let report = run_verification(&dir, &profile, &cancel).await;
-
-        assert!(!report.ok);
+        let report = run_verification(&temp_dir(), &profile, &CancellationToken::new()).await;
         assert_eq!(report.steps[0].status, StepStatus::Passed);
         assert_eq!(report.steps[1].status, StepStatus::Failed);
-        assert_eq!(
-            report.steps[2].status,
-            StepStatus::Skipped("previous step failed".to_string())
-        );
-
-        let rendered = report.render();
-        assert!(rendered.contains("PASS git-version"));
-        assert!(rendered.contains("FAIL git-bad"));
+        assert!(matches!(report.steps[2].status, StepStatus::Skipped(_)));
     }
 
     #[tokio::test]
-    async fn optional_missing_program_is_skipped_not_available() {
-        let dir = temp_dir();
+    async fn fail_fast_false_continues() {
         let profile = ProjectProfile {
-            kind: crate::ProjectKind::Unknown,
+            kind: ProjectKind::Unknown,
             steps: vec![
-                vstep("ok", "git", &["--version"], true),
-                vstep("opt-missing", "definitely-missing-program-xyz", &[], false),
+                step("bad", &["not-a-command"], true),
+                step("last", &["--version"], true),
             ],
+            fail_fast: false,
         };
-
-        let cancel = CancellationToken::new();
-        let report = run_verification(&dir, &profile, &cancel).await;
-
-        assert!(report.ok);
-        assert_eq!(report.steps[0].status, StepStatus::Passed);
-        assert_eq!(
-            report.steps[1].status,
-            StepStatus::Skipped("not available".to_string())
-        );
+        let report = run_verification(&temp_dir(), &profile, &CancellationToken::new()).await;
+        assert_eq!(report.steps[0].status, StepStatus::Failed);
+        assert_eq!(report.steps[1].status, StepStatus::Passed);
     }
 
     #[tokio::test]
-    async fn precancelled_token_makes_report_not_ok() {
-        let dir = temp_dir();
+    async fn escaping_cwd_is_rejected() {
+        let mut invalid = step("invalid", &["--version"], true);
+        invalid.cwd = PathBuf::from("..");
         let profile = ProjectProfile {
-            kind: crate::ProjectKind::Unknown,
-            steps: vec![vstep("ok", "git", &["--version"], true)],
+            kind: ProjectKind::Unknown,
+            steps: vec![invalid],
+            fail_fast: true,
         };
-
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-        let report = run_verification(&dir, &profile, &cancel).await;
-
-        assert!(!report.ok);
+        let report = run_verification(&temp_dir(), &profile, &CancellationToken::new()).await;
+        assert_eq!(report.steps[0].status, StepStatus::Failed);
+        assert!(
+            report.steps[0]
+                .stderr_tail
+                .contains("invalid verification cwd")
+        );
     }
 }

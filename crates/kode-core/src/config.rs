@@ -73,6 +73,14 @@ fn default_reduced_motion() -> bool {
     false
 }
 
+fn default_verify_timeout_seconds() -> u64 {
+    600
+}
+
+fn default_verify_fail_fast() -> bool {
+    true
+}
+
 /// Top-level Kode configuration, loaded from `.kode/config.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -83,6 +91,7 @@ pub struct KodeConfig {
     pub agent: AgentConfig,
     pub permissions: PermissionsConfig,
     pub mcp: McpConfig,
+    pub verify: VerifyConfig,
     pub ui: UiConfig,
 }
 
@@ -352,6 +361,43 @@ impl Default for UiConfig {
     }
 }
 
+/// Post-edit verification policy. An empty `steps` list enables automatic,
+/// monorepo-aware detection; any explicit steps replace auto-detection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VerifyConfig {
+    #[serde(default = "default_verify_timeout_seconds")]
+    pub timeout_seconds: u64,
+    #[serde(default = "default_verify_fail_fast")]
+    pub fail_fast: bool,
+    #[serde(default)]
+    pub steps: Vec<VerifyStepConfig>,
+}
+
+impl Default for VerifyConfig {
+    fn default() -> Self {
+        Self {
+            timeout_seconds: default_verify_timeout_seconds(),
+            fail_fast: default_verify_fail_fast(),
+            steps: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VerifyStepConfig {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+    #[serde(default = "default_true")]
+    pub required: bool,
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+}
+
 /// Configuration for user-defined external MCP (Model Context Protocol)
 /// servers, distinct from the first-class `[zindeks]`/`[ingat]` integrations.
 /// Each entry's tools register into the tool runtime as `{server}__{tool}`.
@@ -430,7 +476,34 @@ mod tests {
         assert_eq!(cfg.agent.history_budget_tokens, 6000);
         assert_eq!(cfg.permissions.default_mode, PermissionMode::Ask);
         assert!(cfg.mcp.servers.is_empty());
+        assert_eq!(cfg.verify.timeout_seconds, 600);
+        assert!(cfg.verify.fail_fast);
+        assert!(cfg.verify.steps.is_empty());
         assert!(!cfg.ui.reduced_motion);
+    }
+
+    #[test]
+    fn verify_steps_deserialize() {
+        let cfg: KodeConfig = toml::from_str(
+            r#"
+[verify]
+timeout_seconds = 90
+fail_fast = false
+
+[[verify.steps]]
+name = "frontend"
+command = "pnpm"
+args = ["test"]
+cwd = "web"
+required = true
+timeout_seconds = 120
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.verify.timeout_seconds, 90);
+        assert!(!cfg.verify.fail_fast);
+        assert_eq!(cfg.verify.steps[0].cwd, Some(PathBuf::from("web")));
+        assert_eq!(cfg.verify.steps[0].timeout_seconds, Some(120));
     }
 
     #[test]

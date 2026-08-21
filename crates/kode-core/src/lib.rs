@@ -3,6 +3,7 @@ pub mod config;
 pub mod error;
 pub mod event;
 pub mod paths;
+pub mod process;
 
 pub use cancel::{CancellationToken, cancel_on_ctrl_c};
 pub use config::KodeConfig;

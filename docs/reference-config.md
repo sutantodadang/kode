@@ -100,6 +100,38 @@ Note: the TOML key is `default`, not `default_mode` (the Rust field is renamed v
 default = "ask"
 ```
 
+## `[verify]`
+
+Verification is auto-detected by default, including Rust/Go/Node/Python subprojects in polyglot repositories. Lockfiles select pnpm, Yarn, Bun, or npm. Explicit `[[verify.steps]]` entries replace auto-detection.
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `timeout_seconds` | integer | `600` | Default timeout for each verification step. |
+| `fail_fast` | bool | `true` | Skip remaining steps after a required step fails. |
+| `steps` | array of tables | `[]` | Explicit commands; when non-empty, disables auto-detection. |
+
+Each step accepts `name`, `command`, `args`, workspace-relative `cwd`, `required`, and an optional per-step `timeout_seconds` override.
+
+```toml
+[verify]
+timeout_seconds = 600
+fail_fast = true
+
+[[verify.steps]]
+name = "rust"
+command = "cargo"
+args = ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
+required = true
+
+[[verify.steps]]
+name = "frontend"
+command = "pnpm"
+args = ["test"]
+cwd = "web"
+timeout_seconds = 900
+required = true
+```
+
 ## `[ui]`
 
 | Key | Type | Default | Effect |
@@ -157,6 +189,10 @@ history_budget_tokens = 6000
 
 [permissions]
 default = "ask"
+
+[verify]
+timeout_seconds = 600
+fail_fast = true
 
 [mcp.servers.everything]
 command = "npx"

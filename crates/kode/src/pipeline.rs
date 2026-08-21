@@ -66,6 +66,131 @@ impl TaskOutcome {
     }
 }
 
+struct VerificationService<'a> {
+    root: &'a Path,
+    config: &'a kode_core::config::VerifyConfig,
+    cancel: &'a CancellationToken,
+}
+
+impl VerificationService<'_> {
+    async fn run(&self) -> kode_verify::VerificationReport {
+        let profile = kode_verify::detect_with_config(self.root, self.config);
+        kode_verify::run_verification(self.root, &profile, self.cancel).await
+    }
+}
+
+async fn run_verification_phase(
+    service: &VerificationService<'_>,
+    events: &EventBus,
+) -> (kode_verify::VerificationReport, Verdict) {
+    events.emit(KodeEvent::VerificationStarted);
+    let report = service.run().await;
+    emit_verify_steps(events, &report);
+    let verdict = verification_verdict(report.ok, report.ran_any());
+    events.emit(KodeEvent::VerificationFinished {
+        ok: verdict == Verdict::Verified,
+    });
+    events.emit(KodeEvent::TaskProgress {
+        step: TaskStep::Verify,
+        done: verdict == Verdict::Verified,
+    });
+    if verdict == Verdict::NoChecks {
+        events.emit(KodeEvent::Note {
+            text: "no verification checks for this project — changes are unverified".to_string(),
+        });
+    }
+    (report, verdict)
+}
+
+struct ModelFactory;
+
+impl ModelFactory {
+    fn create(config: &KodeConfig) -> anyhow::Result<Arc<dyn kode_model::Model>> {
+        if config.model.model.is_empty() {
+            anyhow::bail!("set model.model in .kode/config.toml");
+        }
+
+        let model: Arc<dyn kode_model::Model> = match config.model.provider.as_str() {
+            "openai" => {
+                let api_key = std::env::var("OPENAI_API_KEY")
+                    .or_else(|_| std::env::var("KODE_API_KEY"))
+                    .map_err(|_| anyhow::anyhow!("set OPENAI_API_KEY to run `kode exec`"))?;
+
+                let mut opts = OpenAiOptions {
+                    api_key,
+                    model: config.model.model.clone(),
+                    ..Default::default()
+                };
+                if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
+                    opts.base_url = base_url;
+                }
+                Arc::new(OpenAiModel::new(opts))
+            }
+            "codex" => {
+                let auth_path = kode_model::codex::default_auth_path().ok_or_else(|| {
+                    anyhow::anyhow!("cannot resolve home directory for codex auth")
+                })?;
+                let auth =
+                    kode_model::codex::load(&auth_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+                if auth.auth_mode == "apikey" {
+                    let api_key = auth.api_key.clone().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "codex auth.json has auth_mode=apikey but no OPENAI_API_KEY — run: kode auth login codex"
+                        )
+                    })?;
+                    Arc::new(OpenAiModel::new(OpenAiOptions {
+                        api_key,
+                        model: config.model.model.clone(),
+                        ..Default::default()
+                    }))
+                } else {
+                    Arc::new(
+                        kode_model::CodexModel::new(auth_path, config.model.model.clone())
+                            .map_err(|e| anyhow::anyhow!("{e}"))?,
+                    )
+                }
+            }
+            "opencode-go" | "opencode" | "kilo" | "lmstudio" => {
+                let auth_path = kode_model::opencode::default_auth_path().ok_or_else(|| {
+                    anyhow::anyhow!("cannot resolve home directory for opencode auth")
+                })?;
+                Arc::new(
+                    kode_model::opencode::resolve(
+                        &config.model.provider,
+                        config.model.model.clone(),
+                        &auth_path,
+                        None,
+                    )
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+                )
+            }
+            "anthropic" => {
+                let auth_path = kode_model::anthropic::default_auth_path().ok_or_else(|| {
+                    anyhow::anyhow!("cannot resolve home directory for anthropic auth")
+                })?;
+                Arc::new(
+                    kode_model::AnthropicModel::new(auth_path, config.model.model.clone())
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                )
+            }
+            "antigravity" => {
+                let auth_path = kode_model::antigravity::default_auth_path().ok_or_else(|| {
+                    anyhow::anyhow!("cannot resolve home directory for antigravity auth")
+                })?;
+                Arc::new(
+                    kode_model::AntigravityModel::new(auth_path, config.model.model.clone())
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                )
+            }
+            other => anyhow::bail!(
+                "provider {other} not supported yet (supported: openai, anthropic, antigravity, codex, opencode-go, opencode, kilo, lmstudio)"
+            ),
+        };
+        Ok(model)
+    }
+}
+
 /// Runs one agentic task end-to-end: model/config setup, code intelligence
 /// and engineering memory binding, context compilation, the agent loop, and
 /// post-edit verification with a single retry. This is the single code path
@@ -82,87 +207,7 @@ pub async fn run_task(
     history: &[kode_agent::HistoryTurn],
     plan_mode: bool,
 ) -> anyhow::Result<TaskOutcome> {
-    if config.model.model.is_empty() {
-        anyhow::bail!("set model.model in .kode/config.toml");
-    }
-
-    let model: Arc<dyn kode_model::Model> = match config.model.provider.as_str() {
-        "openai" => {
-            let api_key = std::env::var("OPENAI_API_KEY")
-                .or_else(|_| std::env::var("KODE_API_KEY"))
-                .map_err(|_| anyhow::anyhow!("set OPENAI_API_KEY to run `kode exec`"))?;
-
-            let mut opts = OpenAiOptions {
-                api_key,
-                model: config.model.model.clone(),
-                ..Default::default()
-            };
-            if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
-                opts.base_url = base_url;
-            }
-            Arc::new(OpenAiModel::new(opts)) as Arc<dyn kode_model::Model>
-        }
-        "codex" => {
-            let auth_path = kode_model::codex::default_auth_path()
-                .ok_or_else(|| anyhow::anyhow!("cannot resolve home directory for codex auth"))?;
-            let auth = kode_model::codex::load(&auth_path).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-            if auth.auth_mode == "apikey" {
-                let api_key = auth.api_key.clone().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "codex auth.json has auth_mode=apikey but no OPENAI_API_KEY — run: kode auth login codex"
-                    )
-                })?;
-                let opts = OpenAiOptions {
-                    api_key,
-                    model: config.model.model.clone(),
-                    ..Default::default()
-                };
-                Arc::new(OpenAiModel::new(opts)) as Arc<dyn kode_model::Model>
-            } else {
-                let codex_model =
-                    kode_model::CodexModel::new(auth_path, config.model.model.clone())
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
-                Arc::new(codex_model) as Arc<dyn kode_model::Model>
-            }
-        }
-        "opencode-go" | "opencode" | "kilo" | "lmstudio" => {
-            let auth_path = kode_model::opencode::default_auth_path().ok_or_else(|| {
-                anyhow::anyhow!("cannot resolve home directory for opencode auth")
-            })?;
-            // Base URLs come from the builtin gateway table only; no reads of
-            // another tool's config.
-            let opencode_model = kode_model::opencode::resolve(
-                &config.model.provider,
-                config.model.model.clone(),
-                &auth_path,
-                None,
-            )
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-            Arc::new(opencode_model) as Arc<dyn kode_model::Model>
-        }
-        "anthropic" => {
-            let auth_path = kode_model::anthropic::default_auth_path().ok_or_else(|| {
-                anyhow::anyhow!("cannot resolve home directory for anthropic auth")
-            })?;
-            let anthropic_model =
-                kode_model::AnthropicModel::new(auth_path, config.model.model.clone())
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-            Arc::new(anthropic_model) as Arc<dyn kode_model::Model>
-        }
-        "antigravity" => {
-            let auth_path = kode_model::antigravity::default_auth_path().ok_or_else(|| {
-                anyhow::anyhow!("cannot resolve home directory for antigravity auth")
-            })?;
-            let antigravity_model =
-                kode_model::AntigravityModel::new(auth_path, config.model.model.clone())
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-            Arc::new(antigravity_model) as Arc<dyn kode_model::Model>
-        }
-        other => anyhow::bail!(
-            "provider {other} not supported yet (supported: openai, anthropic, antigravity, codex, opencode-go, opencode, kilo, lmstudio)"
-        ),
-    };
+    let model = ModelFactory::create(config)?;
 
     let ctx = ToolContext {
         workspace_root: cwd.to_path_buf(),
@@ -372,26 +417,13 @@ pub async fn run_task(
     let mut verification = VerificationStatus::NotNeeded;
 
     if outcome1.mutated {
-        let profile = kode_verify::detect(cwd);
-        events.emit(KodeEvent::VerificationStarted);
-        let report = kode_verify::run_verification(cwd, &profile, &ctx.cancel).await;
-        emit_verify_steps(&events, &report);
-        let verdict = verification_verdict(report.ok, report.ran_any());
+        let verification_service = VerificationService {
+            root: cwd,
+            config: &config.verify,
+            cancel: &ctx.cancel,
+        };
+        let (report, verdict) = run_verification_phase(&verification_service, &events).await;
         verification = verification_status(verdict);
-        events.emit(KodeEvent::VerificationFinished {
-            ok: verdict == Verdict::Verified,
-        });
-        events.emit(KodeEvent::TaskProgress {
-            step: TaskStep::Verify,
-            done: verdict == Verdict::Verified,
-        });
-
-        if verdict == Verdict::NoChecks {
-            events.emit(KodeEvent::Note {
-                text: "no verification checks for this project — changes are unverified"
-                    .to_string(),
-            });
-        }
 
         if verdict == Verdict::Failed {
             events.emit(KodeEvent::Note {
@@ -449,25 +481,10 @@ pub async fn run_task(
             let mut retry_report = report;
 
             if mutated_any {
-                let profile = kode_verify::detect(cwd);
-                events.emit(KodeEvent::VerificationStarted);
-                retry_report = kode_verify::run_verification(cwd, &profile, &ctx.cancel).await;
-                emit_verify_steps(&events, &retry_report);
-                let verdict2 = verification_verdict(retry_report.ok, retry_report.ran_any());
+                let (report, verdict2) =
+                    run_verification_phase(&verification_service, &events).await;
+                retry_report = report;
                 verification = verification_status(verdict2);
-                events.emit(KodeEvent::VerificationFinished {
-                    ok: verdict2 == Verdict::Verified,
-                });
-                events.emit(KodeEvent::TaskProgress {
-                    step: TaskStep::Verify,
-                    done: verdict2 == Verdict::Verified,
-                });
-                if verdict2 == Verdict::NoChecks {
-                    events.emit(KodeEvent::Note {
-                        text: "no verification checks for this project — changes are unverified"
-                            .to_string(),
-                    });
-                }
             }
             events.emit(KodeEvent::Note {
                 text: retry_report.summary_line(),
