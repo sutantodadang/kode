@@ -823,7 +823,7 @@ dependencies = [
 
 [[package]]
 name = "kode"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -852,7 +852,7 @@ dependencies = [
 
 [[package]]
 name = "kode-agent"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "futures",
  "kode-core",
@@ -866,7 +866,7 @@ dependencies = [
 
 [[package]]
 name = "kode-context"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "futures",
  "kode-core",
@@ -880,7 +880,7 @@ dependencies = [
 
 [[package]]
 name = "kode-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "serde",
  "thiserror",
@@ -892,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "kode-intel"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "futures",
@@ -907,7 +907,7 @@ dependencies = [
 
 [[package]]
 name = "kode-mcp"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "kode-core",
@@ -921,7 +921,7 @@ dependencies = [
 
 [[package]]
 name = "kode-memory"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "kode-core",
@@ -938,7 +938,7 @@ dependencies = [
 
 [[package]]
 name = "kode-model"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "futures",
@@ -953,7 +953,7 @@ dependencies = [
 
 [[package]]
 name = "kode-tools"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "kode-core",
@@ -971,7 +971,7 @@ dependencies = [
 
 [[package]]
 name = "kode-verify"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "kode-core",
  "serde_json",
