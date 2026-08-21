@@ -1,8 +1,10 @@
+use std::collections::VecDeque;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use kode_core::CancellationToken;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 use crate::{ProjectProfile, StepResult, StepStatus, VerificationReport};
@@ -12,7 +14,7 @@ const DIFF_TIMEOUT: Duration = Duration::from_secs(10);
 const TAIL_CHARS: usize = 10_000;
 
 enum StepOutcome {
-    Finished(std::io::Result<std::process::Output>),
+    Finished(std::io::Result<std::process::ExitStatus>),
     TimedOut,
     Cancelled,
 }
@@ -53,7 +55,7 @@ pub async fn run_verification(
             .stderr(Stdio::piped())
             .spawn();
 
-        let child = match spawned {
+        let mut child = match spawned {
             Ok(child) => child,
             Err(e) => {
                 if verify_step.required {
@@ -71,20 +73,25 @@ pub async fn run_verification(
             }
         };
 
+        let stdout = child.stdout.take().expect("stdout configured as piped");
+        let stderr = child.stderr.take().expect("stderr configured as piped");
+        let stdout_task = tokio::spawn(read_tail(stdout, TAIL_CHARS));
+        let stderr_task = tokio::spawn(read_tail(stderr, TAIL_CHARS));
+
         let outcome = tokio::select! {
             biased;
             _ = cancel.cancelled() => StepOutcome::Cancelled,
             _ = tokio::time::sleep(STEP_TIMEOUT) => StepOutcome::TimedOut,
-            res = child.wait_with_output() => StepOutcome::Finished(res),
+            res = child.wait() => StepOutcome::Finished(res),
         };
         let duration = start.elapsed();
 
         match outcome {
-            StepOutcome::Finished(Ok(output)) => {
-                let stdout_tail = tail(&output.stdout, TAIL_CHARS);
-                let stderr_tail = tail(&output.stderr, TAIL_CHARS);
-                let exit_code = output.status.code();
-                if output.status.success() {
+            StepOutcome::Finished(Ok(status)) => {
+                let stdout_tail = join_tail(stdout_task).await;
+                let stderr_tail = join_tail(stderr_task).await;
+                let exit_code = status.code();
+                if status.success() {
                     results.push(StepResult {
                         name: verify_step.name.clone(),
                         status: StepStatus::Passed,
@@ -108,17 +115,21 @@ pub async fn run_verification(
                 }
             }
             StepOutcome::Finished(Err(e)) => {
+                let _ = join_tail(stdout_task).await;
+                let mut stderr_tail = join_tail(stderr_task).await;
+                if !stderr_tail.is_empty() {
+                    stderr_tail.push('\n');
+                }
+                stderr_tail.push_str(&format!("io error: {e}"));
                 if verify_step.required {
                     blocked = Some("previous step failed");
                 }
-                results.push(failed(
-                    &verify_step.name,
-                    None,
-                    &format!("io error: {e}"),
-                    duration,
-                ));
+                results.push(failed(&verify_step.name, None, &stderr_tail, duration));
             }
             StepOutcome::TimedOut => {
+                let _ = child.start_kill();
+                stdout_task.abort();
+                stderr_task.abort();
                 if verify_step.required {
                     blocked = Some("previous step failed");
                 }
@@ -130,6 +141,9 @@ pub async fn run_verification(
                 ));
             }
             StepOutcome::Cancelled => {
+                let _ = child.start_kill();
+                stdout_task.abort();
+                stderr_task.abort();
                 blocked = Some("cancelled");
                 results.push(failed(&verify_step.name, None, "cancelled", duration));
             }
@@ -169,7 +183,38 @@ fn failed(name: &str, exit_code: Option<i32>, stderr_tail: &str, duration: Durat
     }
 }
 
-fn tail(bytes: &[u8], max_chars: usize) -> String {
+async fn read_tail<R: AsyncRead + Unpin>(
+    mut reader: R,
+    max_chars: usize,
+) -> std::io::Result<String> {
+    let max_bytes = max_chars.saturating_mul(4);
+    let mut tail = VecDeque::with_capacity(max_bytes.min(8192));
+    let mut buffer = [0_u8; 8192];
+
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        tail.extend(&buffer[..read]);
+        if tail.len() > max_bytes {
+            tail.drain(..tail.len() - max_bytes);
+        }
+    }
+
+    let bytes: Vec<u8> = tail.into_iter().collect();
+    Ok(tail_chars(&bytes, max_chars))
+}
+
+async fn join_tail(task: tokio::task::JoinHandle<std::io::Result<String>>) -> String {
+    match task.await {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => format!("output read error: {e}"),
+        Err(e) => format!("output reader failed: {e}"),
+    }
+}
+
+fn tail_chars(bytes: &[u8], max_chars: usize) -> String {
     let s = String::from_utf8_lossy(bytes);
     let count = s.chars().count();
     if count <= max_chars {
