@@ -72,7 +72,7 @@ autostart = true
 
 | Key | Type | Default | Effect |
 |---|---|---|---|
-| `max_iterations` | integer | `40` | Upper bound on agent loop iterations per task, as a runaway guard. |
+| `max_iterations` | integer | `80` | Upper bound on agent loop iterations per task, as a runaway guard. |
 | `max_tool_calls` | integer | `100` | Upper bound on total tool calls per task. |
 | `max_context_tokens` | integer | `100000` | Upper bound on the model's total context window Kode will fill, across system prompt, history, and compiled knowledge context. |
 | `context_budget_tokens` | integer | `16000` | Token budget for knowledge context compiled each turn from zindeks (code graph) and Ingat (memory). This is what the TUI breadcrumb's `ctx X/Yk` meter tracks: it is not the model's context window, which is `max_context_tokens`. |
@@ -80,7 +80,7 @@ autostart = true
 
 ```toml
 [agent]
-max_iterations = 40
+max_iterations = 80
 max_tool_calls = 100
 max_context_tokens = 100000
 context_budget_tokens = 16000
@@ -149,7 +149,7 @@ url = "http://127.0.0.1:3200"
 autostart = true
 
 [agent]
-max_iterations = 40
+max_iterations = 80
 max_tool_calls = 100
 max_context_tokens = 100000
 context_budget_tokens = 16000

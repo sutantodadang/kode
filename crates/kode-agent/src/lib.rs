@@ -13,9 +13,14 @@ use kode_tools::registry::ToolRuntime;
 use kode_tools::{RequiredPermission, ToolContext, ToolError};
 use prompt_budget::PromptBudget;
 
-const SYSTEM_PROMPT: &str = "You are Kode, a coding agent operating on the user's repository. \
-Use the provided tools to inspect and modify files and run commands. Prefer reading before \
-writing. When the task is complete, reply with a concise final answer and stop calling tools.";
+fn system_prompt() -> String {
+    format!(
+        "You are Kode, a coding agent operating on the user's repository. Use the provided tools to inspect and modify files and run commands. Prefer reading before writing. When the task is complete, reply with a concise final answer and stop calling tools.
+
+Environment: OS is `{os}`. `run_command` spawns the program directly with NO shell: no pipes, redirects, globs or builtins, and Unix tools such as `rg`, `grep`, `find`, `cat`, `ls`, `sed` are NOT guaranteed to exist (they usually do not on Windows). To search code use `run_command` with program `git` and args like [\"grep\", \"-n\", \"<pattern>\"] — it works on every platform. To read files use `read_file`. Do not retry a program that was reported as not found.",
+        os = std::env::consts::OS
+    )
+}
 
 /// A repeated identical tool call is blocked after this many occurrences in a
 /// row, to stop the model from looping on the same no-op action.
@@ -120,7 +125,7 @@ impl Agent {
     ) -> Result<AgentOutcome> {
         self.events.emit(KodeEvent::AgentStarted);
 
-        let mut messages = vec![Message::System(SYSTEM_PROMPT.to_string())];
+        let mut messages = vec![Message::System(system_prompt())];
         if let Some(c) = context {
             messages.push(Message::System(format!(
                 "Repository and session context:\n\n{c}"

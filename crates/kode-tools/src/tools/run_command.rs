@@ -48,22 +48,22 @@ async fn read_bounded<R: AsyncRead + Unpin>(
         }
     }
 
-    let mut output = String::from_utf8_lossy(&captured).into_owned();
-    output = truncate_chars(output);
-    if truncated && !output.ends_with(OUTPUT_TRUNCATED_MARKER) {
-        output.push_str(OUTPUT_TRUNCATED_MARKER);
-    }
-    Ok(output)
+    let output = String::from_utf8_lossy(&captured).into_owned();
+    Ok(truncate_chars(output, truncated))
 }
 
-fn truncate_chars(s: String) -> String {
-    if s.chars().count() > MAX_OUTPUT_CHARS {
-        let mut truncated: String = s.chars().take(MAX_OUTPUT_CHARS).collect();
-        truncated.push_str(OUTPUT_TRUNCATED_MARKER);
-        truncated
-    } else {
-        s
+fn truncate_chars(s: String, bytes_were_discarded: bool) -> String {
+    let char_count = s.chars().count();
+    if !bytes_were_discarded && char_count <= MAX_OUTPUT_CHARS {
+        return s;
     }
+
+    // The marker is part of the public output limit, rather than an
+    // unaccounted suffix that pushes an allegedly bounded result over it.
+    let keep_chars = MAX_OUTPUT_CHARS.saturating_sub(OUTPUT_TRUNCATED_MARKER.chars().count());
+    let mut truncated: String = s.chars().take(keep_chars).collect();
+    truncated.push_str(OUTPUT_TRUNCATED_MARKER);
+    truncated
 }
 
 #[async_trait::async_trait]
@@ -128,8 +128,20 @@ impl Tool for RunCommand {
 
         let managed = spawn_managed(&mut command).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
+                let hint = match program.as_str() {
+                    "rg" | "grep" | "ag" | "ack" | "findstr" => {
+                        " To search code use program `git` with args [\"grep\", \"-n\", \"<pattern>\"]."
+                    }
+                    "cat" | "head" | "tail" | "less" | "more" | "type" => {
+                        " Use the `read_file` tool instead."
+                    }
+                    "find" | "ls" | "dir" | "tree" => {
+                        " To list tracked files use program `git` with args [\"ls-files\"]."
+                    }
+                    _ => "",
+                };
                 ToolError::Failed(format!(
-                    "program not found: '{program}' — run_command uses no shell: pass the executable in `program` and its arguments in `args` (shell builtins, pipes and redirects are not available)"
+                    "program not found: '{program}' — run_command uses no shell: pass the executable in `program` and its arguments in `args` (shell builtins, pipes and redirects are not available).{hint}"
                 ))
             } else {
                 ToolError::Io(e)
@@ -185,6 +197,22 @@ mod tests {
             workspace_root: std::env::temp_dir(),
             cancel: kode_core::CancellationToken::new(),
         }
+    }
+
+    #[test]
+    fn truncation_marker_is_included_in_character_limit() {
+        let output = truncate_chars("x".repeat(MAX_OUTPUT_CHARS + 1), false);
+
+        assert_eq!(output.chars().count(), MAX_OUTPUT_CHARS);
+        assert!(output.ends_with(OUTPUT_TRUNCATED_MARKER));
+    }
+
+    #[test]
+    fn byte_discard_is_reported_even_when_decoded_text_is_short() {
+        let output = truncate_chars("short".to_string(), true);
+
+        assert!(output.ends_with(OUTPUT_TRUNCATED_MARKER));
+        assert!(output.chars().count() <= MAX_OUTPUT_CHARS);
     }
 
     #[tokio::test]

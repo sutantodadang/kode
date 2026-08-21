@@ -46,7 +46,7 @@ fn default_ingat_url() -> String {
 }
 
 fn default_max_iterations() -> u32 {
-    40
+    80
 }
 
 fn default_max_tool_calls() -> u32 {
@@ -423,7 +423,7 @@ mod tests {
         assert!(cfg.ingat.enabled);
         assert_eq!(cfg.ingat.url, "http://127.0.0.1:3200");
         assert!(cfg.ingat.autostart);
-        assert_eq!(cfg.agent.max_iterations, 40);
+        assert_eq!(cfg.agent.max_iterations, 80);
         assert_eq!(cfg.agent.max_tool_calls, 100);
         assert_eq!(cfg.agent.max_context_tokens, 100_000);
         assert_eq!(cfg.agent.context_budget_tokens, 16_000);
