@@ -884,7 +884,7 @@ fn meter_zero_budget_is_all_empty() {
 #[test]
 fn gutter_prefix_matches_glyph_vocabulary() {
     assert_eq!(gutter_prefix(&Gutter::None).0, "  ");
-    assert_eq!(gutter_prefix(&Gutter::Prose).0, "A ");
+    assert_eq!(gutter_prefix(&Gutter::Prose).0, "│ ");
     assert_eq!(gutter_prefix(&Gutter::Tool).0, "T▸");
     assert_eq!(gutter_prefix(&Gutter::ToolFail).0, "T▸");
     assert_eq!(gutter_prefix(&Gutter::Verify).0, "V ");

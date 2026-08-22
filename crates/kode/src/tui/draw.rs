@@ -296,7 +296,7 @@ pub(crate) fn aperture_should_collapse(
 pub(crate) fn gutter_prefix(gutter: &Gutter) -> (&'static str, Color) {
     match gutter {
         Gutter::None => ("  ", Color::Reset),
-        Gutter::Prose => ("A ", theme::DIM),
+        Gutter::Prose => ("│ ", theme::DIM),
         Gutter::Tool => ("T▸", theme::T),
         Gutter::ToolFail => ("T▸", theme::ERR),
         Gutter::Verify => ("V ", theme::OK),
@@ -336,8 +336,8 @@ pub(crate) fn md_span_style(style: &markdown::MdStyle) -> Style {
 pub(crate) fn transcript_line_to_ratatui(line: &TranscriptLine) -> Line<'static> {
     let (prefix, color) = gutter_prefix(&line.gutter);
     let mut prefix_style = Style::default().fg(color);
-    // Source/role letters are bold per DESIGN.md's glyph vocabulary. Agent
-    // prose stays dim and unbolded so user turns remain the stronger anchor.
+    // Source/user letters are bold per DESIGN.md's glyph vocabulary. Agent
+    // prose keeps a quiet bar so a multi-line response reads as one block.
     if matches!(
         line.gutter,
         Gutter::Tool
