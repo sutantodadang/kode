@@ -296,7 +296,7 @@ pub(crate) fn aperture_should_collapse(
 pub(crate) fn gutter_prefix(gutter: &Gutter) -> (&'static str, Color) {
     match gutter {
         Gutter::None => ("  ", Color::Reset),
-        Gutter::Prose => ("│ ", theme::DIM),
+        Gutter::Prose => ("A ", theme::DIM),
         Gutter::Tool => ("T▸", theme::T),
         Gutter::ToolFail => ("T▸", theme::ERR),
         Gutter::Verify => ("V ", theme::OK),
@@ -311,7 +311,7 @@ pub(crate) fn gutter_prefix(gutter: &Gutter) -> (&'static str, Color) {
         Gutter::Ingat => ("I ", theme::I),
         Gutter::Git => ("G ", theme::DIM),
         Gutter::Error => ("× ", theme::ERR),
-        Gutter::User => ("› ", theme::MUTED),
+        Gutter::User => ("U ", Color::Reset),
     }
 }
 
@@ -336,9 +336,8 @@ pub(crate) fn md_span_style(style: &markdown::MdStyle) -> Style {
 pub(crate) fn transcript_line_to_ratatui(line: &TranscriptLine) -> Line<'static> {
     let (prefix, color) = gutter_prefix(&line.gutter);
     let mut prefix_style = Style::default().fg(color);
-    // Source-letter glyphs (`T`/`V`) are bold+colored per DESIGN.md's glyph
-    // vocabulary; the plain `│` prose bar and other non-letter glyphs stay
-    // unbolded.
+    // Source/role letters are bold per DESIGN.md's glyph vocabulary. Agent
+    // prose stays dim and unbolded so user turns remain the stronger anchor.
     if matches!(
         line.gutter,
         Gutter::Tool
@@ -349,6 +348,7 @@ pub(crate) fn transcript_line_to_ratatui(line: &TranscriptLine) -> Line<'static>
             | Gutter::Zindeks
             | Gutter::Ingat
             | Gutter::Git
+            | Gutter::User
     ) {
         prefix_style = prefix_style.add_modifier(Modifier::BOLD);
     }
@@ -389,7 +389,12 @@ pub(crate) fn transcript_line_to_ratatui(line: &TranscriptLine) -> Line<'static>
             }
         }
         _ => {
-            spans.push(Span::raw(line.text.clone()));
+            let style = if line.gutter == Gutter::User {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            spans.push(Span::styled(line.text.clone(), style));
         }
     }
     Line::from(spans)
@@ -863,18 +868,23 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
             let streaming = !state.current_stream.is_empty() || !state.stream_pending.is_empty();
             let frame = spinner_glyph(elapsed.as_millis(), state.reduced_motion, streaming);
             let secs = elapsed.as_secs_f64();
-            let label = match &state.current_tool {
-                Some(tool) => {
-                    let tool_secs = state
-                        .tool_started
-                        .map(|t| t.elapsed().as_secs_f64())
-                        .unwrap_or(secs);
-                    format!("▸ {tool} · {tool_secs:.1}s")
-                }
-                None => format!("{frame} {} · {secs:.1}s", state.status.state.label()),
+            let (label, color) = if state.interrupt_confirmation_active() {
+                ("× press Esc again to interrupt".to_string(), theme::ERR)
+            } else {
+                let label = match &state.current_tool {
+                    Some(tool) => {
+                        let tool_secs = state
+                            .tool_started
+                            .map(|t| t.elapsed().as_secs_f64())
+                            .unwrap_or(secs);
+                        format!("▸ {tool} · {tool_secs:.1}s")
+                    }
+                    None => format!("{frame} {} · {secs:.1}s", state.status.state.label()),
+                };
+                (label, theme::T)
             };
             entries.push((
-                Line::from(Span::styled(label, Style::default().fg(theme::T))),
+                Line::from(Span::styled(label, Style::default().fg(color))),
                 None,
             ));
         }

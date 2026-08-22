@@ -151,6 +151,7 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             state.status.state = RunState::Idle;
             state.run_started = None;
             state.current_tool = None;
+            state.interrupt_armed_at = None;
         }
         KodeEvent::AgentError { message } => {
             state
@@ -160,6 +161,7 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             state.status.state = RunState::Idle;
             state.run_started = None;
             state.current_tool = None;
+            state.interrupt_armed_at = None;
             if !state.response_buf.is_empty() {
                 state.last_response = std::mem::take(&mut state.response_buf);
             }
@@ -193,6 +195,7 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             state.status.state = RunState::Idle;
             state.run_started = None;
             state.current_tool = None;
+            state.interrupt_armed_at = None;
             if !state.response_buf.is_empty() {
                 state.last_response = std::mem::take(&mut state.response_buf);
             }

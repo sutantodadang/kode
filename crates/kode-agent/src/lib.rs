@@ -13,6 +13,59 @@ use kode_tools::registry::ToolRuntime;
 use kode_tools::{RequiredPermission, ToolContext, ToolError};
 use prompt_budget::PromptBudget;
 
+const MAX_TOOL_LABEL_CHARS: usize = 240;
+
+fn display_arg(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-./\\:=@".contains(c))
+    {
+        arg.to_string()
+    } else {
+        serde_json::to_string(arg).unwrap_or_else(|_| "\"?\"".to_string())
+    }
+}
+
+fn truncate_tool_label(label: String) -> String {
+    if label.chars().count() <= MAX_TOOL_LABEL_CHARS {
+        return label;
+    }
+    let mut clipped: String = label.chars().take(MAX_TOOL_LABEL_CHARS - 1).collect();
+    clipped.push('…');
+    clipped
+}
+
+fn tool_event_label(name: &str, arguments: &serde_json::Value) -> String {
+    if name != "run_command" {
+        return name.to_string();
+    }
+
+    let Some(program) = arguments.get("program").and_then(serde_json::Value::as_str) else {
+        return name.to_string();
+    };
+    let mut command = display_arg(program);
+    if let Some(args) = arguments.get("args").and_then(serde_json::Value::as_array) {
+        for arg in args.iter().filter_map(serde_json::Value::as_str) {
+            command.push(' ');
+            command.push_str(&display_arg(arg));
+        }
+    }
+
+    let mut label = format!("{name} · {command}");
+    if let Some(cwd) = arguments.get("cwd").and_then(serde_json::Value::as_str) {
+        label.push_str(" · cwd ");
+        label.push_str(cwd);
+    }
+    if let Some(timeout) = arguments
+        .get("timeout_secs")
+        .and_then(serde_json::Value::as_u64)
+    {
+        label.push_str(&format!(" · timeout {timeout}s"));
+    }
+    truncate_tool_label(label)
+}
+
 fn system_prompt() -> String {
     format!(
         "You are Kode, a coding agent operating on the user's repository. Use the provided tools to inspect and modify files and run commands. Prefer reading before writing. When the task is complete, reply with a concise final answer and stop calling tools.
@@ -237,7 +290,7 @@ impl Agent {
                     name: call.name.clone(),
                 });
                 self.events.emit(KodeEvent::ToolStarted {
-                    name: call.name.clone(),
+                    name: tool_event_label(&call.name, &call.arguments),
                 });
                 total_tool_calls += 1;
 
@@ -338,6 +391,32 @@ mod tests {
                 arguments_delta: second.to_string(),
             },
         ]
+    }
+
+    #[test]
+    fn run_command_label_shows_exact_invocation_and_controls() {
+        let label = tool_event_label(
+            "run_command",
+            &serde_json::json!({
+                "program": "cargo",
+                "args": ["test", "-p", "kode agent", ""],
+                "cwd": "crates/kode-agent",
+                "timeout_secs": 600
+            }),
+        );
+
+        assert_eq!(
+            label,
+            "run_command · cargo test -p \"kode agent\" \"\" · cwd crates/kode-agent · timeout 600s"
+        );
+    }
+
+    #[test]
+    fn ordinary_tool_label_stays_compact() {
+        assert_eq!(
+            tool_event_label("read_file", &serde_json::json!({"path": "large.rs"})),
+            "read_file"
+        );
     }
 
     #[tokio::test]

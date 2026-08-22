@@ -2,13 +2,15 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use kode_context::git::{NumstatRow, RepoState};
 use kode_core::event::TaskStep;
 use tokio::sync::oneshot;
 
 use super::markdown;
+
+pub(crate) const INTERRUPT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 
 /// The agent run's current phase, shown in the breadcrumb/spinner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,6 +311,10 @@ pub struct AppState {
     /// When the currently running tool started — drives the tool elapsed
     /// label.
     pub tool_started: Option<Instant>,
+    /// First Esc press during a run. A second Esc inside
+    /// `INTERRUPT_CONFIRM_WINDOW` performs the cancellation; any other key
+    /// disarms it.
+    pub interrupt_armed_at: Option<Instant>,
     /// The Knowledge Aperture's data, `Some` from the current run's
     /// `Knowledge` event until it contracts back to the normal band.
     pub aperture: Option<ApertureState>,
@@ -419,6 +425,7 @@ impl AppState {
             run_started: None,
             current_tool: None,
             tool_started: None,
+            interrupt_armed_at: None,
             aperture: None,
             ledger_open: false,
             ledger: LedgerState::default(),
@@ -462,11 +469,17 @@ impl AppState {
         self.decide_marked_this_run = false;
         self.aperture = None;
         self.tool_started = None;
+        self.interrupt_armed_at = None;
         self.response_buf.clear();
         self.md_in_code_block = false;
         self.stream_pending.clear();
         self.stream_last_flush = None;
         self.pending_task = Some(task.to_string());
+    }
+
+    pub(crate) fn interrupt_confirmation_active(&self) -> bool {
+        self.interrupt_armed_at
+            .is_some_and(|armed| armed.elapsed() <= INTERRUPT_CONFIRM_WINDOW)
     }
 }
 

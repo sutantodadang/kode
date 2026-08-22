@@ -450,6 +450,10 @@ pub(crate) fn handle_key(
     modifiers: KeyModifiers,
     current_cancel: &Option<CancellationToken>,
 ) -> bool {
+    if code != KeyCode::Esc {
+        state.interrupt_armed_at = None;
+    }
+
     if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
         if !state.running {
             return true;
@@ -508,7 +512,12 @@ pub(crate) fn handle_key(
             } else if state.running
                 && let Some(c) = current_cancel
             {
-                c.cancel();
+                if state.interrupt_confirmation_active() {
+                    state.interrupt_armed_at = None;
+                    c.cancel();
+                } else {
+                    state.interrupt_armed_at = Some(Instant::now());
+                }
             }
         }
         KeyCode::Char('q') if !state.running && state.input.is_empty() => {

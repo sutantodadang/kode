@@ -550,8 +550,8 @@ pub(crate) fn handle_slash_command(
                  /provider [name], /copy, /plan, /help · shift+tab toggles auto mode (tools run \
                  without asking) · ctrl+y copies the last response · Ctrl+T toggles select mode \
                  (releases mouse capture for native text selection) · Ctrl+K toggles the \
-                 Knowledge Band, Ctrl+L opens the Ledger, Esc closes the Ledger or cancels the \
-                 run · click a tool-group header to expand/collapse it",
+                 Knowledge Band, Ctrl+L opens the Ledger, Esc closes the Ledger or press Esc \
+                 twice to interrupt a run · click a tool-group header to expand/collapse it",
             ));
         }
         SlashCommand::Custom { name, args } => {

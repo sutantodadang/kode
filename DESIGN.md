@@ -16,7 +16,7 @@ Preview: `.kode-design-preview.html` (rendered mocks of every surface below).
 ## Layout (ratatui panes)
 1. **Breadcrumb** — 1 row, always: repo · branch+state · provider/model · effort · live context meter (`▓▓▓░░ 3.4k/16k`).
 2. **Knowledge Band** — 3 rows under breadcrumb, collapsible (Ctrl+K): `Z` top graph facts, `I` top recalled memory (italic, quoted verbatim), `G` git impact. Real data from the last context compilation only; hidden entirely when a source is unavailable.
-3. **Transcript** — home surface. Agent/event lines carry a 2-col provenance gutter: `Z I G T V` glyphs for knowledge/tool/verification lines, plain `│` for agent prose. Never fake provenance on prose the sources didn't produce.
+3. **Transcript** — home surface. Conversation and event lines carry a 2-col role/provenance gutter: `U A` identify user/agent turns; `Z I G T V` identify knowledge/tool/verification lines. Never fake source provenance on agent prose.
 4. **Input line** — bottom, `›` prompt, right edge shows per-source context counts (`Z:4 I:2 G:2`).
 5. **Knowledge Aperture** — signature moment. On task submit the band expands ~6 rows: request tree (`─┬─`) with real graph trace, recalled memory + confidence, git impact; contracts on first tool call. Never decorative, never faked; absent when engines are absent.
 6. **Ledger view** — Ctrl+L alternate screen: OBJECTIVE / numbered steps (`01 UNDERSTAND ✓`) / CURRENT CHANGE diff / WHY (provenance lines). Chat history demoted, not deleted.
@@ -35,6 +35,7 @@ Preview: `.kode-design-preview.html` (rendered mocks of every surface below).
 - Every color pairs with a fixed glyph — shape carries meaning without color (colorblind-safe).
 
 ## Glyphs (the whole vocabulary — nothing else)
+- Roles: `U` user (bold, primary) · `A` agent prose (dim)
 - Sources: `Z I G T V` (bold, colored)
 - Progress: `●` active (`◉` alternate), `○` pending, `✓` done, `×` failed
 - Trees: `├─ └─ │ ─┬─` · Relationships: `→` · Input: `›` · Tool: `▸` · Diff: `+ -`
@@ -71,3 +72,5 @@ No gradients · no emoji spam · no chat bubbles · no card grids · no permanen
 | 2026-08-17 | Ledger's `●` active-step marker alternates `●`/`◉` at 4 Hz while a task is running; static `●` when idle or `reduced_motion` is on | Motion-set audit item 4 — the 4 Hz pulse was specified in this file's Motion section but the Ledger glyph was static |
 | 2026-08-17 | Transcript scrollbar: 1-col strip on the right edge, dim `│` track + normal-intensity `│` thumb (no `┃` — outside the glyph vocabulary), no end arrows; auto-hides when content fits the viewport; scroll offset now clamped to content length each render | User-approved addition — transcript had no scrollbar and no clamp, so scroll could run past the end of content |
 | 2026-08-17 | Mouse capture enabled for the transcript: wheel scrolls 3 lines per notch, same clamp + follow semantics as the arrow keys; no click/drag handling. Terminal-native text selection is superseded by the `/copy` command | Completes the scrollbar work — a scrollbar with no wheel support reads as decoration, not a real scroll surface |
+| 2026-08-22 | Transcript role gutter uses `U` for bold user turns and dim `A` for agent prose | User and agent text previously differed only by subtle `›`/`│` marks, making long conversations hard to scan |
+| 2026-08-22 | Running-task interruption requires two Esc presses within 2 seconds; the first replaces the live status with `× press Esc again to interrupt` | A single accidental Esc should not discard in-flight agent work |

@@ -884,7 +884,7 @@ fn meter_zero_budget_is_all_empty() {
 #[test]
 fn gutter_prefix_matches_glyph_vocabulary() {
     assert_eq!(gutter_prefix(&Gutter::None).0, "  ");
-    assert_eq!(gutter_prefix(&Gutter::Prose).0, "│ ");
+    assert_eq!(gutter_prefix(&Gutter::Prose).0, "A ");
     assert_eq!(gutter_prefix(&Gutter::Tool).0, "T▸");
     assert_eq!(gutter_prefix(&Gutter::ToolFail).0, "T▸");
     assert_eq!(gutter_prefix(&Gutter::Verify).0, "V ");
@@ -893,7 +893,18 @@ fn gutter_prefix_matches_glyph_vocabulary() {
     assert_eq!(gutter_prefix(&Gutter::Ingat).0, "I ");
     assert_eq!(gutter_prefix(&Gutter::Git).0, "G ");
     assert_eq!(gutter_prefix(&Gutter::Error).0, "× ");
-    assert_eq!(gutter_prefix(&Gutter::User).0, "› ");
+    assert_eq!(gutter_prefix(&Gutter::User).0, "U ");
+}
+
+#[test]
+fn user_turn_is_bold_while_agent_prose_is_not() {
+    let user = transcript_line_to_ratatui(&TranscriptLine::new(Gutter::User, "fix the bug"));
+    let agent = transcript_line_to_ratatui(&TranscriptLine::new(Gutter::Prose, "fixed"));
+
+    assert!(user.spans[0].style.add_modifier.contains(Modifier::BOLD));
+    assert!(user.spans[1].style.add_modifier.contains(Modifier::BOLD));
+    assert!(!agent.spans[0].style.add_modifier.contains(Modifier::BOLD));
+    assert!(!agent.spans[1].style.add_modifier.contains(Modifier::BOLD));
 }
 
 #[test]
@@ -2603,6 +2614,48 @@ fn handle_key_esc_clears_input_when_hint_visible() {
     handle_key(&mut s, &dir, KeyCode::Esc, KeyModifiers::NONE, &None);
     assert!(s.input.is_empty());
     assert!(!s.running);
+}
+
+#[test]
+fn running_esc_requires_second_press_to_cancel() {
+    let dir = temp_project_dir();
+    let mut s = state();
+    s.running = true;
+    let cancel = kode_core::CancellationToken::new();
+    let current = Some(cancel.clone());
+
+    handle_key(&mut s, &dir, KeyCode::Esc, KeyModifiers::NONE, &current);
+    assert!(s.interrupt_confirmation_active());
+    assert!(!cancel.is_cancelled());
+
+    handle_key(&mut s, &dir, KeyCode::Esc, KeyModifiers::NONE, &current);
+    assert!(cancel.is_cancelled());
+    assert!(!s.interrupt_confirmation_active());
+}
+
+#[test]
+fn expired_or_abandoned_interrupt_confirmation_does_not_cancel() {
+    let dir = temp_project_dir();
+    let mut s = state();
+    s.running = true;
+    let cancel = kode_core::CancellationToken::new();
+    let current = Some(cancel.clone());
+
+    s.interrupt_armed_at =
+        Some(Instant::now() - INTERRUPT_CONFIRM_WINDOW - Duration::from_millis(1));
+    handle_key(&mut s, &dir, KeyCode::Esc, KeyModifiers::NONE, &current);
+    assert!(s.interrupt_confirmation_active());
+    assert!(!cancel.is_cancelled());
+
+    handle_key(
+        &mut s,
+        &dir,
+        KeyCode::Char('x'),
+        KeyModifiers::NONE,
+        &current,
+    );
+    assert!(!s.interrupt_confirmation_active());
+    assert!(!cancel.is_cancelled());
 }
 
 #[test]
