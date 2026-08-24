@@ -11,6 +11,27 @@ use tokio::sync::oneshot;
 use super::markdown;
 
 pub(crate) const INTERRUPT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
+pub(crate) const PASTE_ATTACHMENT_MIN_LINES: usize = 8;
+pub(crate) const PASTE_ATTACHMENT_MIN_CHARS: usize = 1000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PastedAttachment {
+    pub name: String,
+    pub content: String,
+    pub line_count: usize,
+    pub char_count: usize,
+}
+
+impl PastedAttachment {
+    pub(crate) fn summary(&self) -> String {
+        format!(
+            "{} · {} lines · {} chars",
+            self.name,
+            self.line_count,
+            compact_count(self.char_count)
+        )
+    }
+}
 
 /// The agent run's current phase, shown in the breadcrumb/spinner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,6 +312,11 @@ pub struct AppState {
     pub scroll: u16,
     pub follow: bool,
     pub input: String,
+    /// Large/multiline bracketed pastes kept outside the visible text input.
+    /// They are materialized into the submitted task only when Enter is
+    /// pressed, so the composer stays compact.
+    pub pasted_attachments: Vec<PastedAttachment>,
+    pub(crate) next_paste_id: u64,
     pub picker: PickerState,
     /// Last received Knowledge digest; `None` until the first context
     /// compilation of the session completes.
@@ -421,6 +447,8 @@ impl AppState {
             scroll: 0,
             follow: true,
             input: String::new(),
+            pasted_attachments: Vec::new(),
+            next_paste_id: 1,
             picker: PickerState::default(),
             knowledge: None,
             knowledge_band_open: true,
@@ -494,6 +522,107 @@ impl AppState {
         self.interrupt_armed_at
             .is_some_and(|armed| armed.elapsed() <= INTERRUPT_CONFIRM_WINDOW)
     }
+
+    pub(crate) fn composer_has_content(&self) -> bool {
+        !self.input.trim().is_empty() || !self.pasted_attachments.is_empty()
+    }
+
+    pub(crate) fn add_paste(&mut self, pasted: &str) {
+        let normalized = pasted.replace("\r\n", "\n").replace('\r', "\n");
+        let normalized: String = normalized
+            .chars()
+            .filter(|character| *character != '\0')
+            .collect();
+        let line_count = normalized.split('\n').count();
+        let char_count = normalized.chars().count();
+        if line_count < PASTE_ATTACHMENT_MIN_LINES && char_count < PASTE_ATTACHMENT_MIN_CHARS {
+            self.input.push_str(&normalized);
+            return;
+        }
+
+        let name = format!("pasted-text-{}.txt", self.next_paste_id);
+        self.next_paste_id = self.next_paste_id.saturating_add(1);
+        self.pasted_attachments.push(PastedAttachment {
+            name,
+            content: normalized,
+            line_count,
+            char_count,
+        });
+    }
+
+    pub(crate) fn take_composer_submission(&mut self) -> String {
+        let mut task = std::mem::take(&mut self.input);
+        for attachment in std::mem::take(&mut self.pasted_attachments) {
+            if !task.is_empty() {
+                task.push_str("\n\n");
+            }
+            task.push_str(&format!(
+                "<pasted_text name=\"{}\" lines=\"{}\" chars=\"{}\">\n",
+                attachment.name, attachment.line_count, attachment.char_count
+            ));
+            task.push_str(&attachment.content);
+            if !attachment.content.ends_with('\n') {
+                task.push('\n');
+            }
+            task.push_str("</pasted_text>");
+        }
+        task
+    }
+}
+
+fn compact_count(count: usize) -> String {
+    if count < 1000 {
+        count.to_string()
+    } else {
+        format!("{:.1}k", count as f64 / 1000.0)
+    }
+}
+
+fn attachment_summary_from_header(header: &str) -> Option<String> {
+    if !header.starts_with("<pasted_text ") || !header.ends_with('>') {
+        return None;
+    }
+    let attribute = |name: &str| {
+        header
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix(&format!("{name}=\"")))
+            .map(|value| value.trim_end_matches(['\"', '>']))
+    };
+    let name = attribute("name")?;
+    let lines = attribute("lines")?;
+    let chars = attribute("chars")?.parse::<usize>().ok()?;
+    Some(format!(
+        "+ {name} · {lines} lines · {} chars",
+        compact_count(chars)
+    ))
+}
+
+pub(crate) fn user_transcript_lines(task: &str) -> Vec<TranscriptLine> {
+    let mut rendered = Vec::new();
+    let mut lines = task.lines();
+    let mut first = true;
+    while let Some(line) = lines.next() {
+        if let Some(summary) = attachment_summary_from_header(line) {
+            let gutter = if first { Gutter::User } else { Gutter::None };
+            rendered.push(TranscriptLine::new(gutter, summary));
+            first = false;
+            for content_line in lines.by_ref() {
+                if content_line == "</pasted_text>" {
+                    break;
+                }
+            }
+            continue;
+        }
+        let gutter = if first { Gutter::User } else { Gutter::None };
+        let text = if first {
+            line.to_string()
+        } else {
+            format!("  {line}")
+        };
+        rendered.push(TranscriptLine::new(gutter, text));
+        first = false;
+    }
+    rendered
 }
 
 /// Persists the in-flight task (if any) as a completed `session::Turn`: both
@@ -570,9 +699,7 @@ pub(crate) fn restore_session(state: &mut AppState, cwd: &Path, id: &str) -> boo
                 ));
             }
             for t in &turns {
-                state
-                    .transcript
-                    .push(TranscriptLine::new(Gutter::User, t.task.clone()));
+                state.transcript.extend(user_transcript_lines(&t.task));
                 let mut in_code_block = false;
                 for line in t.response.lines() {
                     let rendered = markdown::render_line(line, &mut in_code_block);
@@ -602,7 +729,8 @@ pub(crate) fn restore_session(state: &mut AppState, cwd: &Path, id: &str) -> boo
 /// First line of `task`, truncated to 70 chars (char-safe) — the Ledger
 /// view's OBJECTIVE text.
 pub(crate) fn ledger_objective(task: &str) -> String {
-    let first_line = task.lines().next().unwrap_or("");
+    let display = user_transcript_lines(task);
+    let first_line = display.first().map_or("", |line| line.text.as_str());
     truncate_chars(first_line, 70)
 }
 

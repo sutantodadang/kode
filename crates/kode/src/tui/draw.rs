@@ -762,10 +762,20 @@ pub(crate) fn total_wrapped_rows(lines: &[Line<'static>], width: u16) -> usize {
 }
 
 pub(crate) const MAX_INPUT_LINES: usize = 6;
+pub(crate) const MAX_VISIBLE_PASTE_ATTACHMENTS: usize = 3;
 
 pub(crate) fn input_height(input: &str) -> u16 {
     let lines = input.split('\n').count().clamp(1, MAX_INPUT_LINES);
     (lines + 1) as u16
+}
+
+pub(crate) fn composer_height(state: &AppState) -> u16 {
+    input_height(&state.input).saturating_add(
+        state
+            .pasted_attachments
+            .len()
+            .min(MAX_VISIBLE_PASTE_ATTACHMENTS) as u16,
+    )
 }
 
 pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
@@ -797,6 +807,7 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
     let hint_items = if !state.picker.open
         && state.pending.is_empty()
         && !state.ledger_open
+        && state.pasted_attachments.is_empty()
         && state.input.starts_with('/')
     {
         let custom = custom_commands::discover(cwd, BUILTIN_COMMAND_NAMES);
@@ -807,7 +818,7 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
     if !hint_items.is_empty() {
         constraints.push(Constraint::Length(hint_items.len() as u16));
     }
-    constraints.push(Constraint::Length(input_height(&state.input)));
+    constraints.push(Constraint::Length(composer_height(state)));
 
     let areas = Layout::vertical(constraints).split(f.area());
     let mut idx = 0;
@@ -1056,11 +1067,38 @@ pub(crate) fn draw_input(f: &mut ratatui::Frame, area: ratatui::layout::Rect, st
     if area.height < 2 {
         return;
     }
-    let input_area = ratatui::layout::Rect {
+    let composer_area = ratatui::layout::Rect {
         y: area.y + 1,
         height: area.height - 1,
         ..area
     };
+
+    let attachment_count = state
+        .pasted_attachments
+        .len()
+        .min(MAX_VISIBLE_PASTE_ATTACHMENTS)
+        .min(composer_area.height as usize);
+    let attachment_start = state
+        .pasted_attachments
+        .len()
+        .saturating_sub(attachment_count);
+    let mut rendered = Vec::new();
+    for attachment in &state.pasted_attachments[attachment_start..] {
+        rendered.push(Line::from(vec![
+            Span::styled(" + ", Style::default().fg(theme::T)),
+            Span::styled(attachment.summary(), Style::default().fg(theme::MUTED)),
+        ]));
+    }
+
+    let input_area = ratatui::layout::Rect {
+        y: composer_area.y + attachment_count as u16,
+        height: composer_area.height.saturating_sub(attachment_count as u16),
+        ..composer_area
+    };
+    if input_area.height == 0 {
+        f.render_widget(Paragraph::new(rendered), composer_area);
+        return;
+    }
 
     let suffix = input_suffix(state.knowledge.as_ref());
     let select_text = if state.select_mode {
@@ -1072,8 +1110,6 @@ pub(crate) fn draw_input(f: &mut ratatui::Frame, area: ratatui::layout::Rect, st
     let visible_count = all_lines.len().min(input_area.height as usize);
     let visible_start = all_lines.len().saturating_sub(visible_count);
     let visible = &all_lines[visible_start..];
-    let mut rendered = Vec::with_capacity(visible.len());
-
     for (visible_index, text) in visible.iter().enumerate() {
         let actual_index = visible_start + visible_index;
         let prefix = if actual_index == 0 { " › " } else { " │ " };
@@ -1094,7 +1130,7 @@ pub(crate) fn draw_input(f: &mut ratatui::Frame, area: ratatui::layout::Rect, st
         }
         rendered.push(Line::from(spans));
     }
-    f.render_widget(Paragraph::new(rendered), input_area);
+    f.render_widget(Paragraph::new(rendered), composer_area);
 
     if !state.picker.open && state.pending.is_empty() {
         let last_len = all_lines.last().map_or(0, |line| line.chars().count());

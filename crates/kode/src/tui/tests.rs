@@ -2007,6 +2007,10 @@ fn multiline_input_height_grows_and_caps() {
     assert_eq!(input_height(""), 2);
     assert_eq!(input_height("one\ntwo"), 3);
     assert_eq!(input_height("1\n2\n3\n4\n5\n6\n7"), 7);
+
+    let mut s = state();
+    s.add_paste("1\n2\n3\n4\n5\n6\n7\n8");
+    assert_eq!(composer_height(&s), 3);
 }
 
 // -- breadcrumb model nudge -------------------------------------------
@@ -2658,10 +2662,56 @@ fn shift_enter_inserts_newline_without_submitting() {
 
 #[test]
 fn bracketed_paste_preserves_multiline_text_as_one_input_buffer() {
-    let mut input = "prefix\n".to_string();
-    append_paste(&mut input, "# Title\r\n\r\nline one\rline two\0");
+    let mut s = state();
+    s.input = "prefix\n".to_string();
+    append_paste(&mut s, "# Title\r\nline one\rline two\0");
 
-    assert_eq!(input, "prefix\n# Title\n\nline one\nline two");
+    assert_eq!(s.input, "prefix\n# Title\nline one\nline two");
+    assert!(s.pasted_attachments.is_empty());
+}
+
+#[test]
+fn long_paste_becomes_compact_attachment_but_submits_full_content() {
+    let mut s = state();
+    s.input = "Build this product".to_string();
+    let pasted = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8";
+    append_paste(&mut s, pasted);
+
+    assert_eq!(s.input, "Build this product");
+    assert_eq!(s.pasted_attachments.len(), 1);
+    assert_eq!(
+        s.pasted_attachments[0].summary(),
+        "pasted-text-1.txt · 8 lines · 55 chars"
+    );
+
+    let task = s.take_composer_submission();
+    assert!(task.starts_with("Build this product\n\n<pasted_text"));
+    assert!(task.contains(pasted));
+    assert!(s.pasted_attachments.is_empty());
+
+    let transcript = user_transcript_lines(&task);
+    assert_eq!(
+        transcript[0],
+        TranscriptLine::new(Gutter::User, "Build this product")
+    );
+    assert!(
+        transcript
+            .iter()
+            .any(|line| line.text == "+ pasted-text-1.txt · 8 lines · 55 chars")
+    );
+    assert!(!transcript.iter().any(|line| line.text.contains("line 3")));
+}
+
+#[test]
+fn backspace_removes_last_attachment_when_text_input_is_empty() {
+    let dir = temp_project_dir();
+    let mut s = state();
+    s.add_paste("1\n2\n3\n4\n5\n6\n7\n8");
+    assert_eq!(s.pasted_attachments.len(), 1);
+
+    handle_key(&mut s, &dir, KeyCode::Backspace, KeyModifiers::NONE, &None);
+
+    assert!(s.pasted_attachments.is_empty());
 }
 
 #[test]

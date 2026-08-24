@@ -548,8 +548,8 @@ pub(crate) fn handle_slash_command(
                 Gutter::Note,
                 "commands: /model [name], /effort <minimal|low|medium|high|xhigh|max|ultra>, \
                  /provider [name], /copy, /plan, /help · shift+tab toggles auto mode (tools run \
-                 without asking) · shift+enter adds a newline · multiline paste stays in the \
-                 composer · Enter during a run steers the active agent · ctrl+y copies the last response · Ctrl+T toggles select mode \
+                 without asking) · shift+enter adds a newline · long paste becomes a compact \
+                 attachment · Enter during a run steers the active agent · ctrl+y copies the last response · Ctrl+T toggles select mode \
                  (releases mouse capture for native text selection) · Ctrl+K toggles the \
                  Knowledge Band, Ctrl+L opens the Ledger, Esc closes the Ledger or press Esc \
                  twice to interrupt a run · skills are auto-discovered; name one as $skill · \

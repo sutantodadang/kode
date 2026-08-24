@@ -79,9 +79,8 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub(crate) fn append_paste(input: &mut String, pasted: &str) {
-    let normalized = pasted.replace("\r\n", "\n").replace('\r', "\n");
-    input.extend(normalized.chars().filter(|character| *character != '\0'));
+pub(crate) fn append_paste(state: &mut AppState, pasted: &str) {
+    state.add_paste(pasted);
 }
 
 /// Best-effort current branch via `git branch --show-current`. `None` when
@@ -127,17 +126,7 @@ pub(crate) struct SubmittedTask {
 }
 
 pub(crate) fn push_user_transcript(state: &mut AppState, message: &str) {
-    for (index, line) in message.split('\n').enumerate() {
-        if index == 0 {
-            state
-                .transcript
-                .push(TranscriptLine::new(Gutter::User, line));
-        } else {
-            state
-                .transcript
-                .push(TranscriptLine::new(Gutter::None, format!("  {line}")));
-        }
-    }
+    state.transcript.extend(user_transcript_lines(message));
 }
 
 pub(crate) fn route_running_input(
@@ -384,10 +373,10 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                             }
                             if key.code == KeyCode::Enter
                                 && !key.modifiers.contains(KeyModifiers::SHIFT)
-                                && !state.input.trim().is_empty()
+                                && state.composer_has_content()
                             {
                                 if state.running {
-                                    let steering = std::mem::take(&mut state.input);
+                                    let steering = state.take_composer_submission();
                                     route_running_input(
                                         &mut state,
                                         current_steering.as_ref(),
@@ -395,15 +384,25 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                         steering,
                                     );
                                 } else {
-                                    let mut input = std::mem::take(&mut state.input);
+                                    let had_attachments = !state.pasted_attachments.is_empty();
+                                    let mut input = state.take_composer_submission();
                                     let custom = custom_commands::discover(cwd, BUILTIN_COMMAND_NAMES);
-                                    let hints = slash_hint_items(&input, &custom);
+                                    let hints = if had_attachments {
+                                        Vec::new()
+                                    } else {
+                                        slash_hint_items(&input, &custom)
+                                    };
                                     if !hints.is_empty() {
                                         // Enter on a hint row completes to the highlighted command.
                                         input = hints[state.slash_selected.min(hints.len() - 1)].0.clone();
                                         state.slash_selected = 0;
                                     }
-                                    if let Some(cmd) = parse_slash_command(&input) {
+                                    let command = if had_attachments {
+                                        None
+                                    } else {
+                                        parse_slash_command(&input)
+                                    };
+                                    if let Some(cmd) = command {
                                         if let Some(expanded) =
                                             handle_slash_command(&mut state, cwd, &mut config, &picker_tx, cmd)
                                         {
@@ -432,7 +431,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                     }
                     Some(Ok(Event::Paste(pasted))) => {
                         if !state.picker.open {
-                            append_paste(&mut state.input, &pasted);
+                            append_paste(&mut state, &pasted);
                         }
                     }
                     Some(Ok(Event::Mouse(mouse))) => {
@@ -638,13 +637,16 @@ pub(crate) fn handle_key(
     // Gate the discovery scan on `/`-prefixed input — cheap for normal
     // typing, and `slash_hint_items` would return empty for anything else
     // anyway.
-    let hint_count =
-        if state.pending.is_empty() && !state.picker.open && state.input.starts_with('/') {
-            let custom = custom_commands::discover(cwd, BUILTIN_COMMAND_NAMES);
-            slash_hint_items(&state.input, &custom).len()
-        } else {
-            0
-        };
+    let hint_count = if state.pending.is_empty()
+        && !state.picker.open
+        && state.pasted_attachments.is_empty()
+        && state.input.starts_with('/')
+    {
+        let custom = custom_commands::discover(cwd, BUILTIN_COMMAND_NAMES);
+        slash_hint_items(&state.input, &custom).len()
+    } else {
+        0
+    };
 
     match code {
         KeyCode::Enter if modifiers.contains(KeyModifiers::SHIFT) => {
@@ -667,7 +669,9 @@ pub(crate) fn handle_key(
                 }
             }
         }
-        KeyCode::Char('q') if !state.running && state.input.is_empty() => {
+        KeyCode::Char('q')
+            if !state.running && state.input.is_empty() && state.pasted_attachments.is_empty() =>
+        {
             return true;
         }
         KeyCode::Char('y') if !state.pending.is_empty() => {
@@ -692,7 +696,11 @@ pub(crate) fn handle_key(
             state.slash_selected = 0;
         }
         KeyCode::Backspace => {
-            state.input.pop();
+            if state.input.is_empty() {
+                state.pasted_attachments.pop();
+            } else {
+                state.input.pop();
+            }
             state.slash_selected = 0;
         }
         KeyCode::Up => {
