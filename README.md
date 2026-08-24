@@ -14,6 +14,7 @@ Local-first coding agent that thinks in your code graph, not just your files.
 - **Local-first.** Your code and credentials never leave your machine, except for the model API call itself.
 - **Honest verification.** A skipped check is reported as Skipped, never as Passed.
 - **Resumable sessions.** Every turn persists to disk. Pick up where you left off with `--continue` or `/resume`.
+- **Progressively loaded skills.** Reuse project or user `SKILL.md` packages without filling every prompt with every instruction body.
 - **Provider choice.** Log in with codex via OAuth, or paste an API key for an opencode-family provider.
 
 ## Install
@@ -63,6 +64,7 @@ kode --continue               # resume your last session
 | [Auth providers](docs/howto-auth-providers.md) | Setting up codex and opencode-family auth |
 | [Resume sessions](docs/howto-resume-sessions.md) | How session persistence and resume work |
 | [Custom commands](docs/howto-custom-commands.md) | Writing your own `/name` slash commands |
+| [Skills](docs/howto-skills.md) | Creating and using progressively loaded `SKILL.md` packages |
 | [Team memory](docs/howto-team-memory.md) | Sharing engineering memory with your team via git |
 | [CLI reference](docs/reference-cli.md) | Full command and flag reference |
 | [Config reference](docs/reference-config.md) | Configuration file and options |

@@ -71,7 +71,9 @@ fn system_prompt() -> String {
     format!(
         "You are Kode, a coding agent operating on the user's repository. Use the provided tools to inspect and modify files and run commands. Prefer reading before writing. When the task is complete, reply with a concise final answer and stop calling tools.
 
-Environment: OS is `{os}`. `run_command` spawns the program directly with NO shell: no pipes, redirects, globs or builtins, and Unix tools such as `rg`, `grep`, `find`, `cat`, `ls`, `sed` are NOT guaranteed to exist (they usually do not on Windows). To search code use `run_command` with program `git` and args like [\"grep\", \"-n\", \"<pattern>\"] — it works on every platform. To read files use `read_file`. Do not retry a program that was reported as not found.",
+Environment: OS is `{os}`. `run_command` spawns the program directly with NO shell: no pipes, redirects, globs or builtins, and Unix tools such as `rg`, `grep`, `find`, `cat`, `ls`, `sed` are NOT guaranteed to exist (they usually do not on Windows). To search code use `run_command` with program `git` and args like [\"grep\", \"-n\", \"<pattern>\"] — it works on every platform. To read files use `read_file`. Do not retry a program that was reported as not found.
+
+Skills: when repository context lists available skills, call `use_skill` before taking task actions if the user names a skill (for example `$review`) or the task clearly matches a skill description. Read `SKILL.md` first, then use `use_skill` with a relative `path` for any referenced resource you need. User instructions override skill instructions.",
         os = std::env::consts::OS
     )
 }
@@ -494,6 +496,14 @@ mod tests {
             tool_event_label("read_file", &serde_json::json!({"path": "large.rs"})),
             "read_file"
         );
+    }
+
+    #[test]
+    fn system_prompt_requires_progressive_skill_loading() {
+        let prompt = system_prompt();
+        assert!(prompt.contains("call `use_skill`"));
+        assert!(prompt.contains("Read `SKILL.md` first"));
+        assert!(prompt.contains("User instructions override skill instructions"));
     }
 
     struct DelayedSteeringModel {

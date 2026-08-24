@@ -552,7 +552,8 @@ pub(crate) fn handle_slash_command(
                  active agent · ctrl+y copies the last response · Ctrl+T toggles select mode \
                  (releases mouse capture for native text selection) · Ctrl+K toggles the \
                  Knowledge Band, Ctrl+L opens the Ledger, Esc closes the Ledger or press Esc \
-                 twice to interrupt a run · click a tool-group header to expand/collapse it",
+                 twice to interrupt a run · skills are auto-discovered; name one as $skill · \
+                 click a tool-group header to expand/collapse it",
             ));
         }
         SlashCommand::Custom { name, args } => {

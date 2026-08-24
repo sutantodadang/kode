@@ -13,14 +13,16 @@ use kode_model::{OpenAiModel, OpenAiOptions, Usage};
 use kode_tools::ToolContext;
 use kode_tools::permission::PermissionHandler;
 use kode_tools::registry::{ToolRegistry, ToolRuntime};
+use kode_tools::skills::SkillCatalog;
+use kode_tools::tools::UseSkill;
 use tokio::sync::mpsc;
 
 /// Appended to the task text for the plan-mode turn (see
-/// [`run_plan_phase`]). The turn runs under an empty tool registry, so this
-/// also tells the model plainly that it has nothing to call.
+/// [`run_plan_phase`]). The turn exposes no implementation tools; only the
+/// read-only `use_skill` tool may be registered.
 const PLAN_INSTRUCTION: &str = "Before making any changes, write a concise numbered plan for \
 accomplishing this task: the concrete steps you would take and which files you would touch. \
-Do not write code. You have no tools available for this turn — just describe the plan, then stop.";
+Do not write code. You have no implementation tools available for this turn; `use_skill` may be available for reading relevant instructions. Describe the plan, then stop.";
 
 /// Set once this process has made its one autostart attempt for the Ingat
 /// service (successful or not). Guards against re-attempting on every task
@@ -272,7 +274,17 @@ pub async fn run_task(
         None
     };
 
+    let skills = Arc::new(SkillCatalog::discover(cwd));
+    if !skills.is_empty() {
+        events.emit(KodeEvent::Note {
+            text: format!("{} skills available", skills.len()),
+        });
+    }
+
     let mut registry = ToolRegistry::with_builtins();
+    if !skills.is_empty() {
+        registry.register(Arc::new(UseSkill::new(skills.clone())));
+    }
     if let Some(mem) = &memory {
         let repository = cwd
             .file_name()
@@ -335,6 +347,9 @@ pub async fn run_task(
         done: true,
     });
 
+    let skill_summary = skills.prompt_summary();
+    let initial_context = merge_agent_context(compiled.render(), skill_summary.as_deref());
+
     let (kept_history, history_truncated) =
         kode_agent::select_history(history, config.agent.history_budget_tokens as usize);
     if history_truncated {
@@ -355,11 +370,12 @@ pub async fn run_task(
             &config.agent,
             effort.clone(),
             task,
-            compiled.render().as_deref(),
+            initial_context.as_deref(),
             kept_history,
             history_truncated,
             &ctx,
             steering.as_mut(),
+            Some(skills.clone()),
         )
         .await?;
 
@@ -401,7 +417,7 @@ pub async fn run_task(
     let outcome1 = agent
         .run_with_context_and_steering(
             &exec_task,
-            compiled.render().as_deref(),
+            initial_context.as_deref(),
             kept_history,
             history_truncated,
             &ctx,
@@ -470,11 +486,13 @@ pub async fn run_task(
                 token_estimate: repair_context.token_estimate(),
                 sections: repair_context.sections.len(),
             });
+            let repair_agent_context =
+                merge_agent_context(repair_context.render(), skill_summary.as_deref());
 
             let retry_outcome = agent
                 .run_with_context_and_steering(
                     &retry_task,
-                    repair_context.render().as_deref(),
+                    repair_agent_context.as_deref(),
                     kept_history,
                     history_truncated,
                     &ctx,
@@ -577,6 +595,15 @@ fn close_and_defer_steering(
     }
 }
 
+fn merge_agent_context(repository: Option<String>, skills: Option<&str>) -> Option<String> {
+    match (repository, skills) {
+        (Some(repository), Some(skills)) => Some(format!("{repository}\n\n{skills}")),
+        (Some(repository), None) => Some(repository),
+        (None, Some(skills)) => Some(skills.to_string()),
+        (None, None) => None,
+    }
+}
+
 /// Outcome of [`run_plan_phase`]: the human's approve/reject answer to
 /// "execute this plan?", carrying the plan turn's own `AgentOutcome` either
 /// way — `run_task` reports it as the `TaskFinished` counters when the plan
@@ -592,10 +619,9 @@ enum PlanOutcome {
     },
 }
 
-/// Runs the plan-mode turn: a model call under an empty tool registry (no
-/// tools disabled means none are ever offered) that streams a numbered plan
-/// for `task` into the transcript via the normal `ModelToken` event path,
-/// then asks `handler` to approve or reject it via the same
+/// Runs the plan-mode turn with no implementation tools (only optional
+/// read-only skill loading), streams a numbered plan for `task` into the
+/// transcript via the normal `ModelToken` event path, then asks `handler` to approve or reject it via the same
 /// `PermissionHandler::confirm` mechanism used for mutating tool calls.
 /// Reuses the same compiled `context`/`history` the exec turn uses — see the
 /// design note in `run_task`. Factored out of `run_task` (rather than the
@@ -614,10 +640,15 @@ async fn run_plan_phase(
     history_truncated: bool,
     ctx: &ToolContext,
     steering: Option<&mut mpsc::UnboundedReceiver<String>>,
+    skills: Option<Arc<SkillCatalog>>,
 ) -> anyhow::Result<PlanOutcome> {
-    // Empty registry — no tools are ever offered on this turn, so the
-    // permission mode is moot; `Deny` names that intent explicitly.
-    let tools = ToolRuntime::new(ToolRegistry::new(), PermissionMode::Deny, handler.clone());
+    // No implementation tools are offered on this turn. `Deny` still permits
+    // the optional read-only `use_skill` tool.
+    let mut registry = ToolRegistry::new();
+    if let Some(skills) = skills {
+        registry.register(Arc::new(UseSkill::new(skills)));
+    }
+    let tools = ToolRuntime::new(registry, PermissionMode::Deny, handler.clone());
     let plan_agent = Agent::new(model, tools, events.clone(), agent_cfg).with_effort(effort);
 
     let plan_prompt = format!("{task}\n\n{PLAN_INSTRUCTION}");
@@ -961,6 +992,18 @@ mod plan_phase_tests {
     use kode_tools::permission::{AutoApprove, AutoDeny};
 
     #[test]
+    fn skill_catalog_is_appended_to_repository_context() {
+        assert_eq!(
+            merge_agent_context(Some("repo".to_string()), Some("skills")),
+            Some("repo\n\nskills".to_string())
+        );
+        assert_eq!(
+            merge_agent_context(None, Some("skills")),
+            Some("skills".to_string())
+        );
+    }
+
+    #[test]
     fn closing_steering_returns_unconsumed_messages() {
         let events = EventBus::new(8);
         let mut event_rx = events.subscribe();
@@ -1026,6 +1069,7 @@ mod plan_phase_tests {
             false,
             &ctx(dir),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1067,6 +1111,7 @@ mod plan_phase_tests {
             &[],
             false,
             &ctx(dir),
+            None,
             None,
         )
         .await

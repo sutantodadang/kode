@@ -7,6 +7,7 @@ pub mod path;
 pub mod permission;
 pub mod proc;
 pub mod registry;
+pub mod skills;
 pub mod tools;
 
 pub use error::{Result, ToolError};
