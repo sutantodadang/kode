@@ -2657,6 +2657,14 @@ fn shift_enter_inserts_newline_without_submitting() {
 }
 
 #[test]
+fn bracketed_paste_preserves_multiline_text_as_one_input_buffer() {
+    let mut input = "prefix\n".to_string();
+    append_paste(&mut input, "# Title\r\n\r\nline one\rline two\0");
+
+    assert_eq!(input, "prefix\n# Title\n\nline one\nline two");
+}
+
+#[test]
 fn multiline_user_transcript_uses_one_user_anchor() {
     let mut s = state();
     push_user_transcript(&mut s, "first\nsecond\nthird");

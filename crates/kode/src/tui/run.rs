@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind,
-    KeyModifiers, MouseEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -70,8 +70,18 @@ pub(crate) struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            std::io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
     }
+}
+
+pub(crate) fn append_paste(input: &mut String, pasted: &str) {
+    let normalized = pasted.replace("\r\n", "\n").replace('\r', "\n");
+    input.extend(normalized.chars().filter(|character| *character != '\0'));
 }
 
 /// Best-effort current branch via `git branch --show-current`. `None` when
@@ -228,7 +238,12 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
     let mut config = KodeConfig::load(cwd).unwrap_or_default();
 
     enable_raw_mode()?;
-    execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        std::io::stdout(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let _guard = TerminalGuard;
 
     let backend = CrosstermBackend::new(std::io::stdout());
@@ -413,6 +428,11 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                     }
                                 }
                             }
+                        }
+                    }
+                    Some(Ok(Event::Paste(pasted))) => {
+                        if !state.picker.open {
+                            append_paste(&mut state.input, &pasted);
                         }
                     }
                     Some(Ok(Event::Mouse(mouse))) => {
