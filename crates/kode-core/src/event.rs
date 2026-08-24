@@ -50,6 +50,16 @@ pub enum KodeEvent {
         /// success). Frontends render it next to the tool name.
         error: Option<String>,
     },
+    /// A user steering message was accepted into the active agent's message
+    /// history. The TUI uses this acknowledgment when persisting the turn.
+    SteeringAccepted {
+        message: String,
+    },
+    /// Messages reached the pipeline after its last agent segment. They are
+    /// returned to the TUI to run as the next turn instead of being dropped.
+    SteeringDeferred {
+        messages: Vec<String>,
+    },
     VerificationStarted,
     VerificationFinished {
         ok: bool,

@@ -25,7 +25,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::commands::*;
 use super::draw::{aperture_should_collapse, draw};
-use super::events::apply_event;
+use super::events::{apply_event, flush_model_stream};
 use super::state::*;
 use crate::custom_commands;
 use crate::pipeline;
@@ -110,7 +110,53 @@ pub(crate) fn spawn_git_poll(cwd: std::path::PathBuf, tx: mpsc::UnboundedSender<
 /// the user transcript line, and spawns the task future. Shared by the
 /// plain-text Enter path and expanded custom-slash-command prompts so both
 /// go through the exact same pipeline invocation — returns the child
-/// cancellation token to track as `current_cancel`.
+/// cancellation token and steering sender for the active run.
+pub(crate) struct SubmittedTask {
+    pub cancel: CancellationToken,
+    pub steering: mpsc::UnboundedSender<String>,
+}
+
+pub(crate) fn push_user_transcript(state: &mut AppState, message: &str) {
+    for (index, line) in message.split('\n').enumerate() {
+        if index == 0 {
+            state
+                .transcript
+                .push(TranscriptLine::new(Gutter::User, line));
+        } else {
+            state
+                .transcript
+                .push(TranscriptLine::new(Gutter::None, format!("  {line}")));
+        }
+    }
+}
+
+pub(crate) fn route_running_input(
+    state: &mut AppState,
+    steering_tx: Option<&mpsc::UnboundedSender<String>>,
+    queued_followup: &mut Option<String>,
+    message: String,
+) {
+    flush_model_stream(state);
+    push_user_transcript(state, &message);
+    let sent =
+        state.steering_active && steering_tx.is_some_and(|tx| tx.send(message.clone()).is_ok());
+    if sent {
+        return;
+    }
+
+    match queued_followup.as_mut() {
+        Some(queued) => {
+            queued.push_str("\n\n");
+            queued.push_str(&message);
+        }
+        None => *queued_followup = Some(message),
+    }
+    state.transcript.push(TranscriptLine::new(
+        Gutter::Note,
+        "queued for the next turn after the current run finishes",
+    ));
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn submit_task(
     state: &mut AppState,
@@ -120,13 +166,15 @@ pub(crate) fn submit_task(
     events: &EventBus,
     handler: &Arc<dyn PermissionHandler>,
     task: String,
-) -> CancellationToken {
+    echo_user: bool,
+) -> SubmittedTask {
     let plan_mode = state.plan_mode;
     state.start_new_task(&task, plan_mode);
-    state
-        .transcript
-        .push(TranscriptLine::new(Gutter::User, task.clone()));
+    if echo_user {
+        push_user_transcript(state, &task);
+    }
     let child = cancel.child_token();
+    let (steering_tx, steering_rx) = mpsc::unbounded_channel();
     state.running = true;
     state.status.state = RunState::Thinking;
 
@@ -158,6 +206,7 @@ pub(crate) fn submit_task(
             task_child,
             &task_history,
             plan_mode,
+            Some(steering_rx),
         )
         .await
         {
@@ -166,7 +215,10 @@ pub(crate) fn submit_task(
             });
         }
     });
-    child
+    SubmittedTask {
+        cancel: child,
+        steering: steering_tx,
+    }
 }
 
 /// Launches the interactive TUI. Runs until the user quits (Ctrl-C/'q' while
@@ -249,6 +301,8 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
 
     let mut key_events = EventStream::new();
     let mut current_cancel: Option<CancellationToken> = None;
+    let mut current_steering: Option<mpsc::UnboundedSender<String>> = None;
+    let mut queued_followup: Option<String> = None;
     let mut aperture_tick = tokio::time::interval(Duration::from_millis(100));
     // Tracks whether the terminal currently has mouse capture enabled, so
     // Ctrl+T (`state.select_mode`) is synced to the real terminal mode at
@@ -313,31 +367,50 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                             if handle_key(&mut state, cwd, key.code, key.modifiers, &current_cancel) {
                                 break 'outer;
                             }
-                            if key.code == KeyCode::Enter && !state.running && !state.input.trim().is_empty() {
-                                let mut input = std::mem::take(&mut state.input);
-                                let custom = custom_commands::discover(cwd, BUILTIN_COMMAND_NAMES);
-                                let hints = slash_hint_items(&input, &custom);
-                                if !hints.is_empty() {
-                                    // Enter on a hint row completes to the highlighted command.
-                                    input = hints[state.slash_selected.min(hints.len() - 1)].0.clone();
-                                    state.slash_selected = 0;
-                                }
-                                if let Some(cmd) = parse_slash_command(&input) {
-                                    if let Some(expanded) =
-                                        handle_slash_command(&mut state, cwd, &mut config, &picker_tx, cmd)
-                                    {
-                                        current_cancel = Some(submit_task(
-                                            &mut state, cwd, &config, &cancel, &events, &handler, expanded,
-                                        ));
-                                    }
-                                } else if state.status.model.is_empty() {
-                                    state.transcript.push(TranscriptLine::new(Gutter::Note, "pick a model first"));
-                                    open_picker(&mut state, config.model.provider.clone(), &picker_tx);
+                            if key.code == KeyCode::Enter
+                                && !key.modifiers.contains(KeyModifiers::SHIFT)
+                                && !state.input.trim().is_empty()
+                            {
+                                if state.running {
+                                    let steering = std::mem::take(&mut state.input);
+                                    route_running_input(
+                                        &mut state,
+                                        current_steering.as_ref(),
+                                        &mut queued_followup,
+                                        steering,
+                                    );
                                 } else {
-                                    let task = input;
-                                    current_cancel = Some(submit_task(
-                                        &mut state, cwd, &config, &cancel, &events, &handler, task,
-                                    ));
+                                    let mut input = std::mem::take(&mut state.input);
+                                    let custom = custom_commands::discover(cwd, BUILTIN_COMMAND_NAMES);
+                                    let hints = slash_hint_items(&input, &custom);
+                                    if !hints.is_empty() {
+                                        // Enter on a hint row completes to the highlighted command.
+                                        input = hints[state.slash_selected.min(hints.len() - 1)].0.clone();
+                                        state.slash_selected = 0;
+                                    }
+                                    if let Some(cmd) = parse_slash_command(&input) {
+                                        if let Some(expanded) =
+                                            handle_slash_command(&mut state, cwd, &mut config, &picker_tx, cmd)
+                                        {
+                                            let submitted = submit_task(
+                                                &mut state, cwd, &config, &cancel, &events, &handler, expanded,
+                                                true,
+                                            );
+                                            current_cancel = Some(submitted.cancel);
+                                            current_steering = Some(submitted.steering);
+                                        }
+                                    } else if state.status.model.is_empty() {
+                                        state.transcript.push(TranscriptLine::new(Gutter::Note, "pick a model first"));
+                                        open_picker(&mut state, config.model.provider.clone(), &picker_tx);
+                                    } else {
+                                        let task = input;
+                                        let submitted = submit_task(
+                                            &mut state, cwd, &config, &cancel, &events, &handler, task,
+                                            true,
+                                        );
+                                        current_cancel = Some(submitted.cancel);
+                                        current_steering = Some(submitted.steering);
+                                    }
                                 }
                             }
                         }
@@ -360,7 +433,26 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                             _ => None,
                         };
                         let is_agent_error = matches!(ev, KodeEvent::AgentError { .. });
+                        let deferred_steering = match &ev {
+                            KodeEvent::SteeringDeferred { messages } => Some(messages.clone()),
+                            _ => None,
+                        };
                         apply_event(&mut state, ev);
+                        if let Some(messages) = deferred_steering {
+                            for message in messages {
+                                match queued_followup.as_mut() {
+                                    Some(queued) => {
+                                        queued.push_str("\n\n");
+                                        queued.push_str(&message);
+                                    }
+                                    None => queued_followup = Some(message),
+                                }
+                            }
+                            state.transcript.push(TranscriptLine::new(
+                                Gutter::Note,
+                                "late steering moved to the next turn",
+                            ));
+                        }
                         if let Some(tool_calls) = finished_tool_calls {
                             record_completed_turn(
                                 &mut state,
@@ -373,8 +465,40 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                             // that the task's edits (if any) have landed —
                             // same lazy poll as TUI start, no fixed interval.
                             spawn_git_poll(cwd.to_path_buf(), git_tx.clone());
+                            current_cancel = None;
+                            current_steering = None;
+                            if let Some(task) = queued_followup.take() {
+                                let submitted = submit_task(
+                                    &mut state,
+                                    cwd,
+                                    &config,
+                                    &cancel,
+                                    &events,
+                                    &handler,
+                                    task,
+                                    false,
+                                );
+                                current_cancel = Some(submitted.cancel);
+                                current_steering = Some(submitted.steering);
+                            }
                         } else if is_agent_error {
                             state.pending_task = None;
+                            current_cancel = None;
+                            current_steering = None;
+                            if let Some(task) = queued_followup.take() {
+                                let submitted = submit_task(
+                                    &mut state,
+                                    cwd,
+                                    &config,
+                                    &cancel,
+                                    &events,
+                                    &handler,
+                                    task,
+                                    false,
+                                );
+                                current_cancel = Some(submitted.cancel);
+                                current_steering = Some(submitted.steering);
+                            }
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -503,6 +627,9 @@ pub(crate) fn handle_key(
         };
 
     match code {
+        KeyCode::Enter if modifiers.contains(KeyModifiers::SHIFT) => {
+            state.input.push('\n');
+        }
         KeyCode::Esc => {
             if hint_count > 0 {
                 state.input.clear();

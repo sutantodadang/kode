@@ -6,23 +6,17 @@ use super::draw::should_flush_stream_buffer;
 use super::markdown;
 use super::state::*;
 
-/// Applies one `KodeEvent` to `state`. Any accumulated `current_stream` text
-/// is flushed into the transcript before non-token events are processed, so
-/// the transcript always reads as a sequence of complete lines.
-pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
-    // Any non-token event ends the current streaming window: drain
-    // whatever's still buffered (not yet flushed to the visible stream)
-    // into `current_stream` unconditionally, so no trailing text is lost
-    // when a tool call/finish/etc. interrupts mid-word.
-    if !matches!(ev, KodeEvent::ModelToken { .. }) {
-        if !state.stream_pending.is_empty() {
-            let pending = std::mem::take(&mut state.stream_pending);
-            state.current_stream.push_str(&pending);
-        }
-        state.stream_last_flush = None;
+/// Flushes all streamed model text into the stable transcript. Called before
+/// non-token events and before a user steering line is inserted, preserving
+/// chronological ordering even when steering lands mid-stream.
+pub(crate) fn flush_model_stream(state: &mut AppState) {
+    if !state.stream_pending.is_empty() {
+        let pending = std::mem::take(&mut state.stream_pending);
+        state.current_stream.push_str(&pending);
     }
+    state.stream_last_flush = None;
 
-    if !matches!(ev, KodeEvent::ModelToken { .. }) && !state.current_stream.is_empty() {
+    if !state.current_stream.is_empty() {
         let text = std::mem::take(&mut state.current_stream);
         state.response_buf.push_str(&text);
         for line in text.split('\n') {
@@ -44,10 +38,20 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             }
         }
     }
+}
+
+/// Applies one `KodeEvent` to `state`. Any accumulated `current_stream` text
+/// is flushed into the transcript before non-token events are processed, so
+/// the transcript always reads as a sequence of complete lines.
+pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
+    if !matches!(ev, KodeEvent::ModelToken { .. }) {
+        flush_model_stream(state);
+    }
 
     match ev {
         KodeEvent::AgentStarted => {
             state.running = true;
+            state.steering_active = true;
             state.status.state = RunState::Thinking;
             state.run_started = Some(Instant::now());
             state.current_tool = None;
@@ -60,6 +64,9 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             state.status.context_tokens = token_estimate;
         }
         KodeEvent::ModelStarted => {
+            if !state.response_buf.is_empty() && !state.response_buf.ends_with('\n') {
+                state.response_buf.push_str("\n\n");
+            }
             state.status.state = RunState::Thinking;
             state.current_tool = None;
         }
@@ -141,15 +148,21 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             state.current_tool = None;
             state.tool_started = None;
         }
+        KodeEvent::SteeringAccepted { message } => {
+            state.append_pending_steering(&message);
+        }
+        KodeEvent::SteeringDeferred { .. } => {}
         KodeEvent::VerificationStarted => {
             state.status.state = RunState::Verify;
+            state.steering_active = false;
             state.current_tool = None;
         }
         KodeEvent::VerificationFinished { .. } => {}
         KodeEvent::AgentFinished => {
-            state.running = false;
-            state.status.state = RunState::Idle;
-            state.run_started = None;
+            // The pipeline may still be verifying or preparing a repair
+            // agent. `TaskFinished` owns the transition to idle.
+            state.status.state = RunState::Thinking;
+            state.steering_active = false;
             state.current_tool = None;
             state.interrupt_armed_at = None;
         }
@@ -158,6 +171,7 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
                 .transcript
                 .push(TranscriptLine::new(Gutter::Error, message));
             state.running = false;
+            state.steering_active = false;
             state.status.state = RunState::Idle;
             state.run_started = None;
             state.current_tool = None;
@@ -192,6 +206,7 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
                 ),
             ));
             state.running = false;
+            state.steering_active = false;
             state.status.state = RunState::Idle;
             state.run_started = None;
             state.current_tool = None;

@@ -761,6 +761,13 @@ pub(crate) fn total_wrapped_rows(lines: &[Line<'static>], width: u16) -> usize {
         .sum()
 }
 
+pub(crate) const MAX_INPUT_LINES: usize = 6;
+
+pub(crate) fn input_height(input: &str) -> u16 {
+    let lines = input.split('\n').count().clamp(1, MAX_INPUT_LINES);
+    (lines + 1) as u16
+}
+
 pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
     let band_lines = if state.ledger_open {
         // The Ledger view replaces the band + transcript area entirely.
@@ -800,7 +807,7 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
     if !hint_items.is_empty() {
         constraints.push(Constraint::Length(hint_items.len() as u16));
     }
-    constraints.push(Constraint::Length(2)); // input: rule + line, no box
+    constraints.push(Constraint::Length(input_height(&state.input)));
 
     let areas = Layout::vertical(constraints).split(f.area());
     let mut idx = 0;
@@ -1026,12 +1033,9 @@ pub(crate) fn slash_hint_lines(items: &[(String, String)], selected: usize) -> V
         .collect()
 }
 
-/// Renders the 2-row input form: a DIM full-width rule, then `› {input}`
-/// with a right-aligned suffix ([`InputSuffix`]). Replaces the old bordered
-/// "task" box entirely — `DESIGN.md`: input is a single borderless `›`
-/// line, no boxes, dim `─` rules only. Positions the terminal cursor at the
-/// end of the typed text, except while a picker or permission prompt has
-/// focus.
+/// Renders the input form: a DIM full-width rule, then up to six editable
+/// lines. `Shift+Enter` inserts a newline; overflow keeps the newest lines
+/// visible. The suffix sits on the final visible row.
 /// Right-edge input-line indicator while Ctrl+T select mode is on (mouse
 /// released to the terminal so native drag-select/copy works).
 pub(crate) const SELECT_MODE_HINT: &str = "select · Ctrl+T to exit  ";
@@ -1052,9 +1056,9 @@ pub(crate) fn draw_input(f: &mut ratatui::Frame, area: ratatui::layout::Rect, st
     if area.height < 2 {
         return;
     }
-    let line_area = ratatui::layout::Rect {
+    let input_area = ratatui::layout::Rect {
         y: area.y + 1,
-        height: 1,
+        height: area.height - 1,
         ..area
     };
 
@@ -1064,26 +1068,41 @@ pub(crate) fn draw_input(f: &mut ratatui::Frame, area: ratatui::layout::Rect, st
     } else {
         ""
     };
-    let suffix_len = suffix.plain_text().chars().count() + select_text.chars().count();
-    let prefix_width = 3 + state.input.chars().count(); // " › " + input
-    let pad = (line_area.width as usize).saturating_sub(prefix_width + suffix_len);
+    let all_lines: Vec<&str> = state.input.split('\n').collect();
+    let visible_count = all_lines.len().min(input_area.height as usize);
+    let visible_start = all_lines.len().saturating_sub(visible_count);
+    let visible = &all_lines[visible_start..];
+    let mut rendered = Vec::with_capacity(visible.len());
 
-    let mut spans = vec![
-        Span::styled(" › ", Style::default().fg(theme::MUTED)),
-        Span::raw(state.input.clone()),
-        Span::raw(" ".repeat(pad)),
-    ];
-    if state.select_mode {
-        spans.push(Span::styled(select_text, Style::default().fg(theme::T)));
+    for (visible_index, text) in visible.iter().enumerate() {
+        let actual_index = visible_start + visible_index;
+        let prefix = if actual_index == 0 { " › " } else { " │ " };
+        let is_last = visible_index + 1 == visible.len();
+        let mut spans = vec![
+            Span::styled(prefix, Style::default().fg(theme::MUTED)),
+            Span::raw((*text).to_string()),
+        ];
+        if is_last {
+            let suffix_len = suffix.plain_text().chars().count() + select_text.chars().count();
+            let used = 3 + text.chars().count();
+            let pad = (input_area.width as usize).saturating_sub(used + suffix_len);
+            spans.push(Span::raw(" ".repeat(pad)));
+            if state.select_mode {
+                spans.push(Span::styled(select_text, Style::default().fg(theme::T)));
+            }
+            spans.extend(suffix.spans());
+        }
+        rendered.push(Line::from(spans));
     }
-    spans.extend(suffix.spans());
-    f.render_widget(Paragraph::new(Line::from(spans)), line_area);
+    f.render_widget(Paragraph::new(rendered), input_area);
 
     if !state.picker.open && state.pending.is_empty() {
-        let cursor_x = (line_area.x as usize + 3 + state.input.chars().count())
-            .min((line_area.x + line_area.width).saturating_sub(1) as usize)
+        let last_len = all_lines.last().map_or(0, |line| line.chars().count());
+        let cursor_x = (input_area.x as usize + 3 + last_len)
+            .min((input_area.x + input_area.width).saturating_sub(1) as usize)
             as u16;
-        f.set_cursor_position((cursor_x, line_area.y));
+        let cursor_y = input_area.y + visible_count.saturating_sub(1) as u16;
+        f.set_cursor_position((cursor_x, cursor_y));
     }
 }
 

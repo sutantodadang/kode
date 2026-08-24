@@ -182,6 +182,7 @@ pub async fn run(
         cancel,
         &history_turns,
         plan_mode,
+        None,
     )
     .await;
 

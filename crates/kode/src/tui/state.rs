@@ -283,6 +283,10 @@ pub struct AppState {
     pub current_stream: String,
     pub status: StatusInfo,
     pub running: bool,
+    /// Whether the active pipeline currently has an agent receiver ready for
+    /// steering. False during verification/finalization; input submitted in
+    /// that window is queued as the next turn by the TUI loop.
+    pub steering_active: bool,
     pub pending: VecDeque<PermReq>,
     pub scroll: u16,
     pub follow: bool,
@@ -412,6 +416,7 @@ impl AppState {
             current_stream: String::new(),
             status: StatusInfo::new(provider, model, effort),
             running: false,
+            steering_active: false,
             pending: VecDeque::new(),
             scroll: 0,
             follow: true,
@@ -466,6 +471,7 @@ impl AppState {
     /// pipeline.
     pub fn start_new_task(&mut self, task: &str, plan_mode: bool) {
         self.ledger = LedgerState::new(ledger_objective(task), plan_mode);
+        self.steering_active = true;
         self.decide_marked_this_run = false;
         self.aperture = None;
         self.tool_started = None;
@@ -475,6 +481,13 @@ impl AppState {
         self.stream_pending.clear();
         self.stream_last_flush = None;
         self.pending_task = Some(task.to_string());
+    }
+
+    pub(crate) fn append_pending_steering(&mut self, message: &str) {
+        if let Some(task) = self.pending_task.as_mut() {
+            task.push_str("\n\n[Steering]\n");
+            task.push_str(message);
+        }
     }
 
     pub(crate) fn interrupt_confirmation_active(&self) -> bool {

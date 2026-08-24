@@ -13,6 +13,7 @@ use kode_model::{OpenAiModel, OpenAiOptions, Usage};
 use kode_tools::ToolContext;
 use kode_tools::permission::PermissionHandler;
 use kode_tools::registry::{ToolRegistry, ToolRuntime};
+use tokio::sync::mpsc;
 
 /// Appended to the task text for the plan-mode turn (see
 /// [`run_plan_phase`]). The turn runs under an empty tool registry, so this
@@ -206,6 +207,7 @@ pub async fn run_task(
     cancel: CancellationToken,
     history: &[kode_agent::HistoryTurn],
     plan_mode: bool,
+    mut steering: Option<mpsc::UnboundedReceiver<String>>,
 ) -> anyhow::Result<TaskOutcome> {
     let model = ModelFactory::create(config)?;
 
@@ -357,11 +359,13 @@ pub async fn run_task(
             kept_history,
             history_truncated,
             &ctx,
+            steering.as_mut(),
         )
         .await?;
 
         match plan_result {
             PlanOutcome::Rejected { outcome } => {
+                close_and_defer_steering(&events, &mut steering);
                 events.emit(KodeEvent::Note {
                     text: "plan rejected — task cancelled".to_string(),
                 });
@@ -395,12 +399,13 @@ pub async fn run_task(
     }
 
     let outcome1 = agent
-        .run_with_context(
+        .run_with_context_and_steering(
             &exec_task,
             compiled.render().as_deref(),
             kept_history,
             history_truncated,
             &ctx,
+            steering.as_mut(),
         )
         .await
         .map_err(|err| anyhow::anyhow!(err))?;
@@ -467,12 +472,13 @@ pub async fn run_task(
             });
 
             let retry_outcome = agent
-                .run_with_context(
+                .run_with_context_and_steering(
                     &retry_task,
                     repair_context.render().as_deref(),
                     kept_history,
                     history_truncated,
                     &ctx,
+                    steering.as_mut(),
                 )
                 .await
                 .map_err(|err| anyhow::anyhow!(err))?;
@@ -530,6 +536,7 @@ pub async fn run_task(
         }
     }
 
+    close_and_defer_steering(&events, &mut steering);
     events.emit(KodeEvent::TaskFinished {
         iterations,
         tool_calls,
@@ -549,6 +556,25 @@ pub async fn run_task(
             output_tokens,
         },
     })
+}
+
+fn close_and_defer_steering(
+    events: &EventBus,
+    steering: &mut Option<mpsc::UnboundedReceiver<String>>,
+) {
+    let Some(receiver) = steering.as_mut() else {
+        return;
+    };
+    receiver.close();
+    let mut messages = Vec::new();
+    while let Ok(message) = receiver.try_recv() {
+        if !message.trim().is_empty() {
+            messages.push(message);
+        }
+    }
+    if !messages.is_empty() {
+        events.emit(KodeEvent::SteeringDeferred { messages });
+    }
 }
 
 /// Outcome of [`run_plan_phase`]: the human's approve/reject answer to
@@ -587,6 +613,7 @@ async fn run_plan_phase(
     history: &[kode_agent::HistoryTurn],
     history_truncated: bool,
     ctx: &ToolContext,
+    steering: Option<&mut mpsc::UnboundedReceiver<String>>,
 ) -> anyhow::Result<PlanOutcome> {
     // Empty registry — no tools are ever offered on this turn, so the
     // permission mode is moot; `Deny` names that intent explicitly.
@@ -595,7 +622,14 @@ async fn run_plan_phase(
 
     let plan_prompt = format!("{task}\n\n{PLAN_INSTRUCTION}");
     let outcome = plan_agent
-        .run_with_context(&plan_prompt, context, history, history_truncated, ctx)
+        .run_with_context_and_steering(
+            &plan_prompt,
+            context,
+            history,
+            history_truncated,
+            ctx,
+            steering,
+        )
         .await
         .map_err(|err| anyhow::anyhow!(err))?;
 
@@ -926,6 +960,24 @@ mod plan_phase_tests {
     use kode_model::{FinishReason, Message, MockModel, StreamEvent};
     use kode_tools::permission::{AutoApprove, AutoDeny};
 
+    #[test]
+    fn closing_steering_returns_unconsumed_messages() {
+        let events = EventBus::new(8);
+        let mut event_rx = events.subscribe();
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send("late direction".to_string()).unwrap();
+        let mut steering = Some(rx);
+
+        close_and_defer_steering(&events, &mut steering);
+
+        assert!(tx.send("too late".to_string()).is_err());
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            KodeEvent::SteeringDeferred { messages }
+                if messages == vec!["late direction".to_string()]
+        ));
+    }
+
     fn temp_dir(label: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -973,6 +1025,7 @@ mod plan_phase_tests {
             &[],
             false,
             &ctx(dir),
+            None,
         )
         .await
         .unwrap();
@@ -1014,6 +1067,7 @@ mod plan_phase_tests {
             &[],
             false,
             &ctx(dir),
+            None,
         )
         .await
         .unwrap();

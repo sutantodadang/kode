@@ -43,6 +43,35 @@ fn model_token_buffers_short_chunks_until_boundary() {
 }
 
 #[test]
+fn steered_model_responses_are_separated_in_saved_response() {
+    let mut s = state();
+    apply_event(
+        &mut s,
+        KodeEvent::ModelToken {
+            text: "first".into(),
+        },
+    );
+    apply_event(&mut s, KodeEvent::ModelStarted);
+    apply_event(
+        &mut s,
+        KodeEvent::ModelToken {
+            text: "second".into(),
+        },
+    );
+    apply_event(
+        &mut s,
+        KodeEvent::TaskFinished {
+            iterations: 2,
+            tool_calls: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+        },
+    );
+
+    assert_eq!(s.last_response, "first\n\nsecond");
+}
+
+#[test]
 fn tool_started_flushes_current_stream_and_pushes_line() {
     let mut s = state();
     apply_event(
@@ -285,13 +314,15 @@ fn agent_started_sets_running_and_thinking() {
 }
 
 #[test]
-fn agent_finished_clears_running() {
+fn agent_finished_keeps_pipeline_running_until_task_finished() {
     let mut s = state();
     s.running = true;
+    s.run_started = Some(Instant::now());
     apply_event(&mut s, KodeEvent::AgentFinished);
-    assert!(!s.running);
-    assert_eq!(s.status.state, RunState::Idle);
-    assert!(s.run_started.is_none());
+    assert!(s.running);
+    assert!(!s.steering_active);
+    assert_eq!(s.status.state, RunState::Thinking);
+    assert!(s.run_started.is_some());
 }
 
 #[test]
@@ -1971,6 +2002,13 @@ fn input_suffix_counts_when_knowledge_present() {
     assert_eq!(input_suffix(Some(&ks)).plain_text(), "ctx Z:2 I:1 G:0");
 }
 
+#[test]
+fn multiline_input_height_grows_and_caps() {
+    assert_eq!(input_height(""), 2);
+    assert_eq!(input_height("one\ntwo"), 3);
+    assert_eq!(input_height("1\n2\n3\n4\n5\n6\n7"), 7);
+}
+
 // -- breadcrumb model nudge -------------------------------------------
 
 fn line_text(line: &Line) -> String {
@@ -2604,6 +2642,100 @@ fn handle_key_typing_resets_hint_selection() {
     handle_key(&mut s, &dir, KeyCode::Char('m'), KeyModifiers::NONE, &None);
     assert_eq!(s.slash_selected, 0);
     assert_eq!(s.input, "/m");
+}
+
+#[test]
+fn shift_enter_inserts_newline_without_submitting() {
+    let dir = temp_project_dir();
+    let mut s = state();
+    s.input = "first line".to_string();
+
+    handle_key(&mut s, &dir, KeyCode::Enter, KeyModifiers::SHIFT, &None);
+    handle_key(&mut s, &dir, KeyCode::Char('s'), KeyModifiers::NONE, &None);
+
+    assert_eq!(s.input, "first line\ns");
+}
+
+#[test]
+fn multiline_user_transcript_uses_one_user_anchor() {
+    let mut s = state();
+    push_user_transcript(&mut s, "first\nsecond\nthird");
+
+    assert_eq!(s.transcript.len(), 3);
+    assert_eq!(s.transcript[0], TranscriptLine::new(Gutter::User, "first"));
+    assert_eq!(
+        s.transcript[1],
+        TranscriptLine::new(Gutter::None, "  second")
+    );
+    assert_eq!(
+        s.transcript[2],
+        TranscriptLine::new(Gutter::None, "  third")
+    );
+}
+
+#[test]
+fn running_input_routes_to_active_steering_channel() {
+    let mut s = state();
+    s.steering_active = true;
+    s.pending_task = Some("original".to_string());
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut queued = None;
+
+    route_running_input(
+        &mut s,
+        Some(&tx),
+        &mut queued,
+        "change direction".to_string(),
+    );
+
+    assert_eq!(rx.try_recv().unwrap(), "change direction");
+    assert!(queued.is_none());
+    assert_eq!(s.pending_task.as_deref(), Some("original"));
+
+    apply_event(
+        &mut s,
+        KodeEvent::SteeringAccepted {
+            message: "change direction".to_string(),
+        },
+    );
+    assert_eq!(
+        s.pending_task.as_deref(),
+        Some("original\n\n[Steering]\nchange direction")
+    );
+}
+
+#[test]
+fn steering_line_follows_any_text_already_streamed_by_agent() {
+    let mut s = state();
+    s.steering_active = true;
+    s.current_stream = "agent before steer".to_string();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut queued = None;
+
+    route_running_input(&mut s, Some(&tx), &mut queued, "user steer".to_string());
+
+    assert_eq!(s.transcript[0].gutter, Gutter::Prose);
+    assert_eq!(s.transcript[0].text, "agent before steer");
+    assert_eq!(s.transcript[1].gutter, Gutter::User);
+    assert_eq!(s.transcript[1].text, "user steer");
+}
+
+#[test]
+fn running_input_queues_followup_when_agent_is_not_steerable() {
+    let mut s = state();
+    s.steering_active = false;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut queued = None;
+
+    route_running_input(&mut s, Some(&tx), &mut queued, "after verify".to_string());
+
+    assert!(rx.try_recv().is_err());
+    assert_eq!(queued.as_deref(), Some("after verify"));
+    assert!(
+        s.transcript
+            .iter()
+            .any(|line| line.text.contains("queued for the next turn"))
+    );
 }
 
 #[test]

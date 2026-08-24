@@ -12,6 +12,7 @@ use kode_model::{Message, Model, ModelRequest, ResponseAccumulator, StreamEvent,
 use kode_tools::registry::ToolRuntime;
 use kode_tools::{RequiredPermission, ToolContext, ToolError};
 use prompt_budget::PromptBudget;
+use tokio::sync::mpsc;
 
 const MAX_TOOL_LABEL_CHARS: usize = 240;
 
@@ -176,6 +177,22 @@ impl Agent {
         truncated: bool,
         ctx: &ToolContext,
     ) -> Result<AgentOutcome> {
+        self.run_with_context_and_steering(task, context, history, truncated, ctx, None)
+            .await
+    }
+
+    /// Runs an agent turn while accepting additional user messages through
+    /// `steering`. Steering is serialized into the same message history at
+    /// model/tool boundaries; it never starts a concurrent agent.
+    pub async fn run_with_context_and_steering(
+        &self,
+        task: &str,
+        context: Option<&str>,
+        history: &[HistoryTurn],
+        truncated: bool,
+        ctx: &ToolContext,
+        mut steering: Option<&mut mpsc::UnboundedReceiver<String>>,
+    ) -> Result<AgentOutcome> {
         self.events.emit(KodeEvent::AgentStarted);
 
         let mut messages = vec![Message::System(system_prompt())];
@@ -203,10 +220,22 @@ impl Agent {
         let mut last_call: Option<(String, String)> = None;
         let mut repeat_count: u32 = 0;
         let mut mutated = false;
+        let mut steering_open = steering.is_some();
 
         for iteration in 1..=self.max_iterations {
             if ctx.cancel.is_cancelled() {
                 return Err(AgentError::Cancelled);
+            }
+
+            if steering_open && let Some(receiver) = steering.as_deref_mut() {
+                while let Ok(message) = receiver.try_recv() {
+                    if !message.trim().is_empty() {
+                        self.events.emit(KodeEvent::SteeringAccepted {
+                            message: message.clone(),
+                        });
+                        messages.push(Message::User(message));
+                    }
+                }
             }
 
             self.events.emit(KodeEvent::ModelStarted);
@@ -224,11 +253,34 @@ impl Agent {
                 .await?;
 
             let mut acc = ResponseAccumulator::new();
+            let mut steers_after_response = Vec::new();
             let response = loop {
+                let steer = async {
+                    if steering_open {
+                        match steering.as_deref_mut() {
+                            Some(receiver) => receiver.recv().await,
+                            None => std::future::pending::<Option<String>>().await,
+                        }
+                    } else {
+                        std::future::pending::<Option<String>>().await
+                    }
+                };
                 tokio::select! {
                     biased;
                     _ = ctx.cancel.cancelled() => {
                         return Err(AgentError::Cancelled);
+                    }
+                    message = steer => {
+                        match message {
+                            Some(message) if !message.trim().is_empty() => {
+                                self.events.emit(KodeEvent::SteeringAccepted {
+                                    message: message.clone(),
+                                });
+                                steers_after_response.push(message);
+                            }
+                            Some(_) => {}
+                            None => steering_open = false,
+                        }
                     }
                     item = stream.next() => {
                         match item {
@@ -245,9 +297,28 @@ impl Agent {
                 }
             };
 
+            if steering_open && let Some(receiver) = steering.as_deref_mut() {
+                while let Ok(message) = receiver.try_recv() {
+                    if !message.trim().is_empty() {
+                        self.events.emit(KodeEvent::SteeringAccepted {
+                            message: message.clone(),
+                        });
+                        steers_after_response.push(message);
+                    }
+                }
+            }
+
             usage += response.usage.unwrap_or_default();
 
             if response.tool_calls.is_empty() {
+                if !steers_after_response.is_empty() {
+                    messages.push(Message::Assistant {
+                        content: response.content,
+                        tool_calls: vec![],
+                    });
+                    messages.extend(steers_after_response.into_iter().map(Message::User));
+                    continue;
+                }
                 self.events.emit(KodeEvent::AgentFinished);
                 return Ok(AgentOutcome {
                     final_text: response.content,
@@ -331,6 +402,8 @@ impl Agent {
                     }
                 }
             }
+
+            messages.extend(steers_after_response.into_iter().map(Message::User));
         }
 
         Err(AgentError::IterationLimit(self.max_iterations))
@@ -342,9 +415,13 @@ mod tests {
     use super::*;
     use kode_core::CancellationToken;
     use kode_core::config::PermissionMode;
-    use kode_model::{FinishReason, MockModel};
+    use kode_model::{
+        FinishReason, MockModel, Model, ModelCapabilities, ModelRequest, ModelStream,
+    };
     use kode_tools::permission::{AutoApprove, AutoDeny};
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -416,6 +493,79 @@ mod tests {
         assert_eq!(
             tool_event_label("read_file", &serde_json::json!({"path": "large.rs"})),
             "read_file"
+        );
+    }
+
+    struct DelayedSteeringModel {
+        calls: AtomicUsize,
+        requests: Mutex<Vec<ModelRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Model for DelayedSteeringModel {
+        async fn stream(&self, request: ModelRequest) -> kode_model::Result<ModelStream> {
+            self.requests.lock().unwrap().push(request);
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let text = if call == 0 { "first" } else { "steered" };
+            let stream = futures::stream::once(async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                Ok(StreamEvent::TextDelta(text.to_string()))
+            })
+            .chain(futures::stream::iter([Ok(StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: None,
+            })]));
+            Ok(Box::pin(stream))
+        }
+
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities {
+                id: "delayed-steering-test".to_string(),
+                supports_tools: true,
+                supports_streaming: true,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn steering_during_stream_becomes_next_user_message() {
+        let model = Arc::new(DelayedSteeringModel {
+            calls: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
+        });
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let agent = Agent::new(
+            model.clone(),
+            tools,
+            EventBus::new(64),
+            &AgentConfig::default(),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let dir = temp_dir();
+        let tool_ctx = ctx(dir);
+        let run = agent.run_with_context_and_steering(
+            "original",
+            None,
+            &[],
+            false,
+            &tool_ctx,
+            Some(&mut rx),
+        );
+        let send = async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            tx.send("new direction".to_string()).unwrap();
+        };
+
+        let (outcome, ()) = tokio::join!(run, send);
+        assert_eq!(outcome.unwrap().final_text, "steered");
+
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1]
+                .messages
+                .iter()
+                .any(|message| matches!(message, Message::User(text) if text == "new direction"))
         );
     }
 

@@ -16,3 +16,4 @@ kode-tools = { path = "../kode-tools" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+async-trait = { workspace = true }
