@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::custom_commands;
-use crossterm::event::{KeyCode, KeyModifiers, MouseEventKind};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use kode_context::git::{NumstatRow, RepoState};
 use kode_core::config::KodeConfig;
 use kode_core::event::{KodeEvent, NoteSource, TaskStep};
@@ -2668,6 +2668,73 @@ fn bracketed_paste_preserves_multiline_text_as_one_input_buffer() {
 
     assert_eq!(s.input, "prefix\n# Title\nline one\nline two");
     assert!(s.pasted_attachments.is_empty());
+}
+
+#[test]
+fn windows_multiline_key_burst_is_recovered_as_one_paste() {
+    let events = vec![
+        Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+        Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        )),
+        // Some Windows terminals incorrectly retain Ctrl on pasted newlines
+        // while bracketed paste mode is enabled.
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)),
+    ];
+
+    assert_eq!(windows_paste_text(&events).as_deref(), Some("a\nb"));
+}
+
+#[test]
+fn windows_long_multiline_key_burst_becomes_compact_attachment() {
+    let pasted = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8";
+    let events = pasted
+        .chars()
+        .map(|character| {
+            let code = if character == '\n' {
+                KeyCode::Enter
+            } else {
+                KeyCode::Char(character)
+            };
+            Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+        })
+        .collect::<Vec<_>>();
+
+    let recovered = windows_paste_text(&events).expect("multiline burst should be a paste");
+    let mut s = state();
+    append_paste(&mut s, &recovered);
+
+    assert!(s.input.is_empty());
+    assert_eq!(s.pasted_attachments.len(), 1);
+    assert_eq!(s.pasted_attachments[0].content, pasted);
+}
+
+#[test]
+fn windows_single_physical_key_is_not_misclassified_as_paste() {
+    let events = vec![
+        Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+        Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        )),
+    ];
+
+    assert_eq!(windows_paste_text(&events), None);
+}
+
+#[test]
+fn windows_control_shortcut_is_not_misclassified_as_paste() {
+    let events = vec![
+        Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    ];
+
+    assert_eq!(windows_paste_text(&events), None);
 }
 
 #[test]

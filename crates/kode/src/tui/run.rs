@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::Stdout;
 use std::path::Path;
 use std::sync::Arc;
@@ -81,6 +82,122 @@ impl Drop for TerminalGuard {
 
 pub(crate) fn append_paste(state: &mut AppState, pasted: &str) {
     state.add_paste(pasted);
+}
+
+#[cfg(windows)]
+const WINDOWS_PASTE_IDLE: Duration = Duration::from_millis(12);
+
+/// Crossterm's native Windows input backend exposes clipboard paste as a burst
+/// of ordinary key events, including `Enter` for every newline. Collecting the
+/// burst before dispatch keeps those newlines from submitting partial prompts.
+async fn next_terminal_event(
+    events: &mut EventStream,
+    pending: &mut VecDeque<Event>,
+) -> Option<std::io::Result<Event>> {
+    if let Some(event) = pending.pop_front() {
+        return Some(Ok(event));
+    }
+
+    let first = events.next().await?;
+
+    #[cfg(not(windows))]
+    {
+        Some(first)
+    }
+
+    #[cfg(windows)]
+    {
+        let first = match first {
+            Ok(event) => event,
+            Err(error) => return Some(Err(error)),
+        };
+        let mut batch = vec![first];
+        let can_start_paste = matches!(
+            batch.first(),
+            Some(Event::Key(key))
+                if key.kind == KeyEventKind::Press
+                    && match key.code {
+                        KeyCode::Char(_) | KeyCode::Tab => !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT),
+                        KeyCode::Enter => true,
+                        _ => false,
+                    }
+        );
+        if !can_start_paste {
+            return Some(Ok(batch.pop().expect("batch contains the first event")));
+        }
+
+        loop {
+            match tokio::time::timeout(WINDOWS_PASTE_IDLE, events.next()).await {
+                Ok(Some(Ok(event))) => {
+                    let is_key_event = matches!(&event, Event::Key(_));
+                    batch.push(event);
+                    if !is_key_event {
+                        break;
+                    }
+                }
+                Ok(Some(Err(error))) => return Some(Err(error)),
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        if let Some(pasted) = windows_paste_text(&batch) {
+            return Some(Ok(Event::Paste(pasted)));
+        }
+
+        let first = batch.remove(0);
+        pending.extend(batch);
+        Some(Ok(first))
+    }
+}
+
+/// Recover a Windows clipboard burst as text. A real key press may be followed
+/// immediately by its release event, so the classifier requires either a
+/// multiline burst or at least 32 text key presses. Ctrl/Alt character chords
+/// remain normal shortcuts; Ctrl+Enter is accepted because terminals are known
+/// to attach Ctrl to pasted newlines while bracketed paste mode is enabled.
+#[cfg(any(windows, test))]
+pub(crate) fn windows_paste_text(events: &[Event]) -> Option<String> {
+    let mut text = String::new();
+    let mut text_press_count = 0usize;
+    let mut has_newline = false;
+
+    for event in events {
+        let Event::Key(key) = event else {
+            return None;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        match key.code {
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                text.push(character);
+                text_press_count += 1;
+            }
+            KeyCode::Enter => {
+                text.push('\n');
+                text_press_count += 1;
+                has_newline = true;
+            }
+            KeyCode::Tab
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                text.push('\t');
+                text_press_count += 1;
+            }
+            _ => return None,
+        }
+    }
+
+    ((has_newline && text_press_count >= 2) || text_press_count >= 32).then_some(text)
 }
 
 /// Best-effort current branch via `git branch --show-current`. `None` when
@@ -304,6 +421,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
     let mut event_rx = events.subscribe();
 
     let mut key_events = EventStream::new();
+    let mut pending_terminal_events = VecDeque::new();
     let mut current_cancel: Option<CancellationToken> = None;
     let mut current_steering: Option<mpsc::UnboundedSender<String>> = None;
     let mut queued_followup: Option<String> = None;
@@ -320,7 +438,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
         tokio::select! {
             biased;
 
-            maybe_key = key_events.next() => {
+            maybe_key = next_terminal_event(&mut key_events, &mut pending_terminal_events) => {
                 match maybe_key {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                         if state.picker.open {
