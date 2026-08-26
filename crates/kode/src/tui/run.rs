@@ -27,7 +27,7 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::{mpsc, oneshot};
 
 use super::commands::*;
-use super::draw::{aperture_should_collapse, draw};
+use super::draw::draw;
 use super::events::{apply_event, flush_model_stream};
 use super::state::*;
 use crate::custom_commands;
@@ -83,6 +83,7 @@ impl Drop for TerminalGuard {
 }
 
 pub(crate) fn append_paste_at(state: &mut AppState, cwd: &Path, pasted: &str) {
+    state.begin_composing();
     if !pasted.contains(['\r', '\n']) && crate::attachments::looks_like_image_path(pasted) {
         if let Err(err) = state.add_image_path(cwd, pasted) {
             state.transcript.push(TranscriptLine::new(
@@ -476,7 +477,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
     let mut current_cancel: Option<CancellationToken> = None;
     let mut current_steering: Option<mpsc::UnboundedSender<UserInput>> = None;
     let mut queued_followup: Option<UserInput> = None;
-    let mut aperture_tick = tokio::time::interval(Duration::from_millis(100));
+    let mut ui_tick = tokio::time::interval(Duration::from_millis(100));
     // Tracks whether the terminal currently has mouse capture enabled, so
     // Ctrl+T (`state.select_mode`) is synced to the real terminal mode at
     // most once per toggle rather than issuing the escape sequence every
@@ -674,6 +675,9 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                 current_steering = Some(submitted.steering);
                             }
                         } else if is_agent_error {
+                            // Preserve a truthful recovery surface: an agent
+                            // may have edited files before it stopped.
+                            spawn_git_poll(cwd.to_path_buf(), git_tx.clone());
                             state.pending_task = None;
                             current_cancel = None;
                             current_steering = None;
@@ -722,16 +726,11 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                 }
             }
 
-            _ = aperture_tick.tick() => {
+            _ = ui_tick.tick() => {
                 // Also the render-tick clock for the knowledge-band
                 // dim→normal fade (item 3) — a new evidence row is dim for
                 // its first 2 of these ~100ms ticks.
                 state.render_tick = state.render_tick.wrapping_add(1);
-                if let Some(ap) = &state.aperture
-                    && aperture_should_collapse(ap.received_at, Instant::now(), ap.trigger_seen)
-                {
-                    state.aperture = None;
-                }
             }
         }
 
@@ -766,8 +765,38 @@ pub(crate) fn handle_key(
     modifiers: KeyModifiers,
     current_cancel: &Option<CancellationToken>,
 ) -> bool {
+    if state.shortcuts_open {
+        if code == KeyCode::Esc || code == KeyCode::Char('?') {
+            state.shortcuts_open = false;
+        }
+        return false;
+    }
+    if state.attachments_open {
+        if code == KeyCode::Esc
+            || (modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('a'))
+        {
+            state.attachments_open = false;
+        }
+        return false;
+    }
+
     if code != KeyCode::Esc {
         state.interrupt_armed_at = None;
+    }
+
+    if code == KeyCode::Char('?') && state.input.is_empty() && state.pending.is_empty() {
+        state.shortcuts_open = true;
+        return false;
+    }
+
+    if modifiers.contains(KeyModifiers::CONTROL)
+        && code == KeyCode::Char('a')
+        && state.pending.is_empty()
+    {
+        if !state.pasted_attachments.is_empty() || !state.image_attachments.is_empty() {
+            state.attachments_open = true;
+        }
+        return false;
     }
 
     if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
@@ -851,12 +880,22 @@ pub(crate) fn handle_key(
         {
             return true;
         }
-        KeyCode::Char('y') if !state.pending.is_empty() => {
+        KeyCode::Char('y') if modifiers == KeyModifiers::NONE && !state.pending.is_empty() => {
             if let Some(req) = state.pop_permission() {
                 let _ = req.responder.send(true);
             }
         }
-        KeyCode::Char('n') if !state.pending.is_empty() => {
+        KeyCode::Char('n') if modifiers == KeyModifiers::NONE && !state.pending.is_empty() => {
+            if let Some(req) = state.pop_permission() {
+                let _ = req.responder.send(false);
+            }
+        }
+        KeyCode::Char('a') if modifiers == KeyModifiers::NONE && !state.pending.is_empty() => {
+            if let Some(req) = state.pop_permission() {
+                let _ = req.responder.send(true);
+            }
+        }
+        KeyCode::Char('d') if modifiers == KeyModifiers::NONE && !state.pending.is_empty() => {
             if let Some(req) = state.pop_permission() {
                 let _ = req.responder.send(false);
             }
@@ -868,15 +907,14 @@ pub(crate) fn handle_key(
             state.input = format!("{name} ");
             state.slash_selected = 0;
         }
-        KeyCode::Char(c) => {
+        KeyCode::Char(c) if state.pending.is_empty() => {
+            state.begin_composing();
             state.input.push(c);
             state.slash_selected = 0;
         }
         KeyCode::Backspace => {
             if state.input.is_empty() {
-                if state.image_attachments.pop().is_none() {
-                    state.pasted_attachments.pop();
-                }
+                state.remove_last_attachment();
             } else {
                 state.input.pop();
             }

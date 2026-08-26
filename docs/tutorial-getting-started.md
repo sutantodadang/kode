@@ -75,7 +75,9 @@ From inside a git repo, launch the interactive TUI:
 kode
 ```
 
-Type a task at the `›` prompt, for example "explain how the config loader works." Watch the knowledge band above the transcript: `Z` shows top graph facts pulled from zindeks, `I` shows recalled memory from Ingat, `G` shows git impact. These are only shown when Kode actually has real data behind them: never faked.
+Type a task in the composer, for example "explain how the config loader works." Kode keeps three stable regions on screen: the scope rail tells you which repo, branch, and authority mode you are using; the transcript records what happened; and the contextual work surface shows the one thing that needs attention now.
+
+When Kode gathers context, the work surface shows a compact `CONTEXT` receipt. Press `Ctrl+K` to inspect its evidence: `Z` is code-graph context from zindeks, `I` is recalled memory from Ingat, and `G` is git context. The receipt and evidence rows only appear when real data exists. During a tool call the same surface becomes a live tool receipt; after the run it becomes a completion or recovery receipt.
 
 After the agent finishes, a verification stage runs (tests, lint, whatever the project defines) and reports results honestly: passed, failed, or skipped.
 
@@ -89,7 +91,7 @@ kode exec "add a doc comment to the config loader"
 
 Add `--model` or `--effort minimal|low|medium|high|xhigh|max|ultra` to override the configured model or reasoning depth for that one run. Add `-c`/`--continue` to append the task to your latest session instead of starting fresh.
 
-To include a screenshot, use `kode exec --image screenshot.png "explain this error"`. In the TUI, run `/image <path>` or paste/drag the image path into the composer; the image appears as a compact attachment.
+To include a screenshot, use `kode exec --image screenshot.png "explain this error"`. In the TUI, run `/image <path>` or paste/drag the image path into the composer; the two newest attachments stay visible and `Ctrl+A` opens the complete attachment inspector.
 
 ## What you built
 

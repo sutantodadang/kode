@@ -34,6 +34,12 @@ impl PastedAttachment {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentKind {
+    Text,
+    Image,
+}
+
 /// The agent run's current phase, shown in the breadcrumb/spinner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
@@ -41,17 +47,6 @@ pub enum RunState {
     Thinking,
     Tool,
     Verify,
-}
-
-impl RunState {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            RunState::Idle => "idle",
-            RunState::Thinking => "thinking",
-            RunState::Tool => "tool",
-            RunState::Verify => "verify",
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +124,12 @@ pub struct TranscriptLine {
     /// to show its stacked children — toggled by left-clicking the header
     /// (see `run::handle_mouse`). Ignored when `tool_children` is empty.
     pub expanded: bool,
+    /// Aggregate duration of the completed tool call(s) represented by this
+    /// receipt. Kept separate from `text` so grouping remains stable.
+    pub tool_duration_ms: Option<u128>,
+    /// `None` while the represented tool group is active, otherwise the
+    /// aggregate outcome used by the transcript receipt suffix.
+    pub tool_ok: Option<bool>,
 }
 
 impl TranscriptLine {
@@ -140,6 +141,8 @@ impl TranscriptLine {
             spans: None,
             tool_children: Vec::new(),
             expanded: false,
+            tool_duration_ms: None,
+            tool_ok: None,
         }
     }
 
@@ -158,6 +161,63 @@ impl TranscriptLine {
             spans: Some(spans),
             tool_children: Vec::new(),
             expanded: false,
+            tool_duration_ms: None,
+            tool_ok: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionReceipt {
+    pub iterations: u32,
+    pub tool_calls: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub elapsed_ms: u128,
+    pub verify_steps: Vec<(String, StepStatusLite)>,
+    pub numstat: Vec<NumstatRow>,
+}
+
+impl CompletionReceipt {
+    pub(crate) fn verification_label(&self) -> &'static str {
+        if self
+            .verify_steps
+            .iter()
+            .any(|(_, status)| *status == StepStatusLite::Failed)
+        {
+            "DONE · FAILED VERIFICATION"
+        } else if self.verify_steps.is_empty()
+            || self
+                .verify_steps
+                .iter()
+                .all(|(_, status)| *status == StepStatusLite::Skipped)
+        {
+            "DONE · UNVERIFIED"
+        } else {
+            "DONE · VERIFIED"
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposerMode {
+    Ask,
+    Steer,
+    Queue,
+    Decision,
+    Recover,
+    FollowUp,
+}
+
+impl ComposerMode {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Ask => "ASK KODE",
+            Self::Steer => "STEER ACTIVE RUN",
+            Self::Queue => "QUEUE NEXT TASK",
+            Self::Decision => "DECISION REQUIRED",
+            Self::Recover => "RECOVER OR ASK AGAIN",
+            Self::FollowUp => "ASK A FOLLOW-UP",
         }
     }
 }
@@ -195,18 +255,6 @@ pub enum StepStatusLite {
 pub enum WhySource {
     Zindeks,
     Ingat,
-}
-
-/// The Knowledge Aperture's data — set when a `Knowledge` event arrives for
-/// the current run, cleared once it contracts. `trigger_seen` flips true on
-/// the first `ToolStarted`/`ModelToken` after it appeared; the aperture
-/// only actually contracts once `aperture_should_collapse` (900ms floor)
-/// says so.
-#[derive(Debug, Clone)]
-pub struct ApertureState {
-    pub received_at: Instant,
-    pub knowledge: KnowledgeState,
-    pub trigger_seen: bool,
 }
 
 /// The Ledger view's (Ctrl+L) data — derived entirely from real events, no
@@ -320,6 +368,9 @@ pub struct AppState {
     /// Image files attached to the next user turn. Binary data stays outside
     /// the visible composer and is sent as structured provider content.
     pub image_attachments: Vec<ImageAttachment>,
+    /// Cross-type insertion order so rendering and Backspace both operate
+    /// on the actual latest attachment, not "images before text".
+    pub attachment_order: Vec<AttachmentKind>,
     pub(crate) next_paste_id: u64,
     pub picker: PickerState,
     /// Last received Knowledge digest; `None` until the first context
@@ -349,9 +400,6 @@ pub struct AppState {
     /// `INTERRUPT_CONFIRM_WINDOW` performs the cancellation; any other key
     /// disarms it.
     pub interrupt_armed_at: Option<Instant>,
-    /// The Knowledge Aperture's data, `Some` from the current run's
-    /// `Knowledge` event until it contracts back to the normal band.
-    pub aperture: Option<ApertureState>,
     /// Whether the Ledger view (Ctrl+L) is showing instead of the
     /// transcript.
     pub ledger_open: bool,
@@ -397,13 +445,23 @@ pub struct AppState {
     pub session_id: Option<String>,
     /// Task text of the in-flight run; consumed when TaskFinished arrives.
     pub pending_task: Option<UserInput>,
+    /// Stable receipt for the most recently completed run. Cleared as soon
+    /// as the user begins composing the next instruction.
+    pub completion: Option<CompletionReceipt>,
+    /// Last terminal agent error, rendered as a recovery surface until the
+    /// user begins composing again.
+    pub last_error: Option<String>,
+    /// Full shortcut sheet (`?`) and attachment inspector (`Ctrl+A`) are
+    /// transient overlays, never permanent chrome.
+    pub shortcuts_open: bool,
+    pub attachments_open: bool,
     /// `[ui].reduced_motion` from config. When true: spinner glyph is
-    /// static, knowledge-band evidence rows skip the dim→normal fade, and
-    /// the Ledger active marker doesn't pulse. Streaming coalescing stays
+    /// static, context-evidence rows skip the dim→normal fade, and
+    /// the Run Map active marker doesn't pulse. Streaming coalescing stays
     /// active regardless — it's buffering, not motion.
     pub reduced_motion: bool,
     /// Monotonic counter bumped once per ~100ms UI tick (see `run`'s
-    /// `aperture_tick`), used only to timestamp when a knowledge-band
+    /// `ui_tick`), used only to timestamp when a context-evidence
     /// evidence row first appeared, for the dim→normal fade.
     pub render_tick: u64,
     /// Buffered `ModelToken` deltas not yet flushed into `current_stream`
@@ -453,10 +511,11 @@ impl AppState {
             input: String::new(),
             pasted_attachments: Vec::new(),
             image_attachments: Vec::new(),
+            attachment_order: Vec::new(),
             next_paste_id: 1,
             picker: PickerState::default(),
             knowledge: None,
-            knowledge_band_open: true,
+            knowledge_band_open: false,
             repo_dir: String::new(),
             branch: None,
             dirty: false,
@@ -464,7 +523,6 @@ impl AppState {
             current_tool: None,
             tool_started: None,
             interrupt_armed_at: None,
-            aperture: None,
             ledger_open: false,
             ledger: LedgerState::default(),
             decide_marked_this_run: false,
@@ -480,6 +538,10 @@ impl AppState {
             history: Vec::new(),
             session_id: None,
             pending_task: None,
+            completion: None,
+            last_error: None,
+            shortcuts_open: false,
+            attachments_open: false,
             reduced_motion: false,
             render_tick: 0,
             stream_pending: String::new(),
@@ -497,9 +559,9 @@ impl AppState {
         self.pending.pop_front()
     }
 
-    /// Resets per-run state for a freshly submitted task: the Ledger
+    /// Resets per-run state for a freshly submitted task: the Run Map
     /// (objective + steps, with a leading Plan step when `plan_mode` is on),
-    /// the Decide-derivation flag, and any leftover Aperture from a prior
+    /// the Decide-derivation flag, and transient receipts from a prior
     /// run. Pure — the caller still owns emitting the actual task to the
     /// pipeline.
     pub fn start_new_task(&mut self, task: impl Into<UserInput>, plan_mode: bool) {
@@ -507,7 +569,6 @@ impl AppState {
         self.ledger = LedgerState::new(ledger_objective(&task.text), plan_mode);
         self.steering_active = true;
         self.decide_marked_this_run = false;
-        self.aperture = None;
         self.tool_started = None;
         self.interrupt_armed_at = None;
         self.response_buf.clear();
@@ -515,6 +576,31 @@ impl AppState {
         self.stream_pending.clear();
         self.stream_last_flush = None;
         self.pending_task = Some(task);
+        self.completion = None;
+        self.last_error = None;
+        self.shortcuts_open = false;
+        self.attachments_open = false;
+    }
+
+    pub(crate) fn composer_mode(&self) -> ComposerMode {
+        if !self.pending.is_empty() {
+            ComposerMode::Decision
+        } else if self.running && self.steering_active {
+            ComposerMode::Steer
+        } else if self.running {
+            ComposerMode::Queue
+        } else if self.last_error.is_some() {
+            ComposerMode::Recover
+        } else if self.completion.is_some() {
+            ComposerMode::FollowUp
+        } else {
+            ComposerMode::Ask
+        }
+    }
+
+    pub(crate) fn begin_composing(&mut self) {
+        self.completion = None;
+        self.last_error = None;
     }
 
     pub(crate) fn append_pending_steering(&mut self, message: &UserInput) {
@@ -537,6 +623,7 @@ impl AppState {
     }
 
     pub(crate) fn add_paste(&mut self, pasted: &str) {
+        self.begin_composing();
         let normalized = pasted.replace("\r\n", "\n").replace('\r', "\n");
         let normalized: String = normalized
             .chars()
@@ -557,6 +644,7 @@ impl AppState {
             line_count,
             char_count,
         });
+        self.attachment_order.push(AttachmentKind::Text);
     }
 
     pub(crate) fn add_image_path(&mut self, cwd: &Path, path: &str) -> anyhow::Result<()> {
@@ -573,8 +661,69 @@ impl AppState {
         if total > crate::attachments::MAX_TOTAL_IMAGE_BYTES {
             anyhow::bail!("images exceed the 20 MiB total limit");
         }
+        self.begin_composing();
         self.image_attachments.push(image);
+        self.attachment_order.push(AttachmentKind::Image);
         Ok(())
+    }
+
+    pub(crate) fn attachment_rows(&self) -> Vec<(AttachmentKind, String)> {
+        let mut text_index = 0usize;
+        let mut image_index = 0usize;
+        let mut rows =
+            Vec::with_capacity(self.pasted_attachments.len() + self.image_attachments.len());
+        for kind in &self.attachment_order {
+            match kind {
+                AttachmentKind::Text => {
+                    if let Some(attachment) = self.pasted_attachments.get(text_index) {
+                        rows.push((AttachmentKind::Text, attachment.summary()));
+                        text_index += 1;
+                    }
+                }
+                AttachmentKind::Image => {
+                    if let Some(image) = self.image_attachments.get(image_index) {
+                        rows.push((
+                            AttachmentKind::Image,
+                            format!(
+                                "{} · {} · {:.1} KiB",
+                                image.name,
+                                image.media_type,
+                                image.size_bytes as f64 / 1024.0
+                            ),
+                        ));
+                        image_index += 1;
+                    }
+                }
+            }
+        }
+        for attachment in &self.pasted_attachments[text_index..] {
+            rows.push((AttachmentKind::Text, attachment.summary()));
+        }
+        for image in &self.image_attachments[image_index..] {
+            rows.push((
+                AttachmentKind::Image,
+                format!(
+                    "{} · {} · {:.1} KiB",
+                    image.name,
+                    image.media_type,
+                    image.size_bytes as f64 / 1024.0
+                ),
+            ));
+        }
+        rows
+    }
+
+    pub(crate) fn remove_last_attachment(&mut self) -> bool {
+        let removed = match self.attachment_order.pop() {
+            Some(AttachmentKind::Text) => self.pasted_attachments.pop().is_some(),
+            Some(AttachmentKind::Image) => self.image_attachments.pop().is_some(),
+            None if !self.image_attachments.is_empty() => self.image_attachments.pop().is_some(),
+            None => self.pasted_attachments.pop().is_some(),
+        };
+        if removed {
+            self.attachments_open = false;
+        }
+        removed
     }
 
     pub(crate) fn take_composer_submission(&mut self) -> UserInput {
@@ -593,6 +742,7 @@ impl AppState {
             }
             task.push_str("</pasted_text>");
         }
+        self.attachment_order.clear();
         UserInput {
             text: task,
             images: std::mem::take(&mut self.image_attachments),
@@ -796,7 +946,10 @@ pub(crate) fn ledger_objective(task: &str) -> String {
 /// rows. Pure — no I/O, called from the `git_rx` arm of the event loop.
 pub(crate) fn apply_repo_state(state: &mut AppState, repo: RepoState) {
     state.dirty = repo.dirty;
-    state.ledger.numstat = repo.numstat;
+    state.ledger.numstat = repo.numstat.clone();
+    if let Some(receipt) = &mut state.completion {
+        receipt.numstat = repo.numstat;
+    }
 }
 
 /// The Ledger's Change-step inline caption: `"{n} files changed"` when the

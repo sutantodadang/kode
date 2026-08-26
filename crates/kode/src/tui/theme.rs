@@ -20,7 +20,9 @@ pub const T: Color = Color::Rgb(0x8C, 0x9B, 0xAB);
 pub const OK: Color = Color::Rgb(0x74, 0xB8, 0x8A);
 /// failure.
 pub const ERR: Color = Color::Rgb(0xD1, 0x6D, 0x72);
+/// caution / skipped / permission attention.
+pub const WARN: Color = Color::Rgb(0xF2, 0xC1, 0x4E);
 /// muted text.
-pub const MUTED: Color = Color::Rgb(0x7C, 0x87, 0x93);
+pub const MUTED: Color = Color::Rgb(0x87, 0x91, 0x9C);
 /// dim structure (rules, spacers).
-pub const DIM: Color = Color::Rgb(0x52, 0x5C, 0x66);
+pub const DIM: Color = Color::Rgb(0x41, 0x49, 0x53);

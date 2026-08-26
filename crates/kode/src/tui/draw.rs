@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -19,6 +19,7 @@ use crate::custom_commands;
 /// Renders an 8-cell (by default) meter string: `▓` for filled cells,
 /// `░` for empty ones. `budget == 0` yields an all-empty meter (no
 /// division by zero). Pure — the caller applies Z/DIM coloring per cell.
+#[cfg(test)]
 pub fn meter(used: usize, budget: usize, cells: usize) -> String {
     let filled = if budget == 0 {
         0
@@ -37,6 +38,7 @@ pub fn meter(used: usize, budget: usize, cells: usize) -> String {
 /// it (Ctrl+K), a `Knowledge` event has arrived, and at least one source
 /// has data. Per `DESIGN.md`: never fake provenance — the band is hidden
 /// entirely when a source is unavailable/empty, never shown padded/empty.
+#[cfg(test)]
 pub fn knowledge_band_visible(state: &AppState) -> bool {
     state.knowledge_band_open
         && state
@@ -86,11 +88,13 @@ pub fn engine_status(enabled: bool, source_seen: bool) -> EngineStatus {
 /// `Knowledge` event has arrived this session, else the `/help` hint. Pure
 /// decision — sizing and rendering both derive from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub enum InputSuffix {
     Counts { z: usize, i: usize, g: usize },
     Help,
 }
 
+#[cfg(test)]
 impl InputSuffix {
     /// Plain-text rendering, used to size the row for right-alignment.
     pub(crate) fn plain_text(&self) -> String {
@@ -99,26 +103,11 @@ impl InputSuffix {
             InputSuffix::Help => "/help".to_string(),
         }
     }
-
-    /// Styled spans, colored per source (`ctx` label DIM, counts in source
-    /// colors) or a plain DIM `/help`.
-    pub(crate) fn spans(&self) -> Vec<Span<'static>> {
-        match self {
-            InputSuffix::Counts { z, i, g } => vec![
-                Span::styled("ctx ", Style::default().fg(theme::DIM)),
-                Span::styled(format!("Z:{z}"), Style::default().fg(theme::Z)),
-                Span::raw(" "),
-                Span::styled(format!("I:{i}"), Style::default().fg(theme::I)),
-                Span::raw(" "),
-                Span::styled(format!("G:{g}"), Style::default().fg(theme::G)),
-            ],
-            InputSuffix::Help => vec![Span::styled("/help", Style::default().fg(theme::DIM))],
-        }
-    }
 }
 
 /// Decides the input line's suffix from the session's last Knowledge
 /// digest (`None` until the first context compilation of the session).
+#[cfg(test)]
 pub fn input_suffix(knowledge: Option<&KnowledgeState>) -> InputSuffix {
     match knowledge {
         Some(ks) => InputSuffix::Counts {
@@ -164,58 +153,68 @@ pub(crate) fn empty_state_lines(state: &AppState) -> Vec<Line<'static>> {
         .knowledge
         .as_ref()
         .is_some_and(|k| !k.ingat.is_empty());
-    vec![
+    let repo = if state.repo_dir.is_empty() {
+        "this repository"
+    } else {
+        state.repo_dir.as_str()
+    };
+    let dirty = if state.dirty {
+        "worktree has changes"
+    } else {
+        "worktree clean"
+    };
+    let mut lines = vec![
         Line::default(),
-        Line::from(vec![
-            Span::styled(" kode", Style::default().add_modifier(Modifier::BOLD)),
-            Span::styled(
-                format!(" v{} — calm instrument", env!("CARGO_PKG_VERSION")),
-                Style::default().fg(theme::MUTED),
-            ),
-        ]),
-        engine_status_line(
-            "code intelligence",
-            state.zindeks_enabled,
-            zindeks_seen,
-            theme::Z,
-        ),
-        engine_status_line(
-            "engineering memory",
-            state.ingat_enabled,
-            ingat_seen,
-            theme::I,
-        ),
-        Line::default(),
-        Line::from(vec![
-            Span::styled(" › ", Style::default().fg(theme::MUTED)),
-            Span::styled(
-                "type a task and press enter",
-                Style::default().fg(theme::MUTED),
-            ),
-        ]),
         Line::from(Span::styled(
-            " /provider · /model · /effort · /help · ctrl+k band · ctrl+l ledger",
+            format!(" Ready in {repo}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        engine_status_line("code graph", state.zindeks_enabled, zindeks_seen, theme::Z),
+        engine_status_line("memory", state.ingat_enabled, ingat_seen, theme::I),
+        Line::from(vec![
+            Span::styled(" git: ", Style::default().fg(theme::MUTED)),
+            Span::styled(dirty, Style::default().fg(theme::G)),
+        ]),
+        Line::default(),
+        Line::from(Span::styled(
+            " Start from here",
+            Style::default()
+                .fg(theme::MUTED)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(" › Review the current diff"),
+        Line::from(" › Explain this repository"),
+        Line::from(" › Attach a screenshot and describe the problem"),
+        Line::default(),
+        Line::from(Span::styled(
+            " Type a task, paste an image path, or press / for actions.",
             Style::default().fg(theme::DIM),
         )),
-    ]
-}
-
-/// Formats a token count compactly: `<1000` verbatim, else `"{n:.1}k"`.
-pub(crate) fn format_k(n: usize) -> String {
-    if n < 1000 {
-        n.to_string()
-    } else {
-        format!("{:.1}k", n as f64 / 1000.0)
+    ];
+    if !state.status.model.is_empty() {
+        return lines;
     }
+    lines.push(Line::from(Span::styled(
+        " Pick a model with /model before submitting.",
+        Style::default().fg(theme::WARN),
+    )));
+    lines
 }
 
 pub(crate) const SPINNER_FRAMES: [char; 4] = ['·', '•', '●', '•'];
 
-/// The single spinner instance's frame for `elapsed_ms`, cycling at 4 Hz
-/// (one of the 4 frames every 250ms). Per `DESIGN.md`: ONE moving region
-/// max, exactly these frames.
+fn compact_tokens(tokens: usize) -> String {
+    if tokens < 1000 {
+        tokens.to_string()
+    } else {
+        format!("{:.1}k", tokens as f64 / 1000.0)
+    }
+}
+
+/// The single heartbeat advances at 1 Hz. Faster pulses read as anxiety in
+/// a long-running engineering task and compete with streamed prose.
 pub(crate) fn spinner_frame(elapsed_ms: u128) -> char {
-    let idx = ((elapsed_ms / 250) % 4) as usize;
+    let idx = ((elapsed_ms / 1000) % 4) as usize;
     SPINNER_FRAMES[idx]
 }
 
@@ -265,29 +264,15 @@ pub(crate) fn evidence_row_dim(
     }
 }
 
-/// The Ledger's active-step marker glyph: alternates `●`/`◉` at 4 Hz
-/// (250ms period) while a task is running; static `●` when idle or
-/// `reduced_motion` is on. Per `DESIGN.md`: active-step marker `●/◉` at
-/// 4 Hz (item 4).
+/// The Run Map's active-step marker alternates at 1 Hz while a task is
+/// running; static `●` when idle or
+/// `reduced_motion` is on. Per `DESIGN.md`, motion stays below 2 Hz.
 pub(crate) fn ledger_pulse_glyph(elapsed_ms: u128, running: bool, reduced_motion: bool) -> char {
-    if running && !reduced_motion && !(elapsed_ms / 250).is_multiple_of(2) {
+    if running && !reduced_motion && !(elapsed_ms / 1000).is_multiple_of(2) {
         '◉'
     } else {
         '●'
     }
-}
-
-/// Aperture's contraction decision: it never collapses before a
-/// `ToolStarted`/`ModelToken` trigger has been seen, and — per `DESIGN.md`
-/// motion rules — never earlier than 900ms after it appeared, so it's
-/// perceivable even when the trigger fires almost instantly. Pure, so the
-/// tick loop's timing behavior is unit-testable without a real clock race.
-pub(crate) fn aperture_should_collapse(
-    received: Instant,
-    now: Instant,
-    trigger_seen: bool,
-) -> bool {
-    trigger_seen && now.saturating_duration_since(received) >= Duration::from_millis(900)
 }
 
 /// Maps a `Gutter` to its fixed 2-col glyph prefix and color, per
@@ -397,72 +382,84 @@ pub(crate) fn transcript_line_to_ratatui(line: &TranscriptLine) -> Line<'static>
             spans.push(Span::styled(line.text.clone(), style));
         }
     }
+    if line.gutter == Gutter::Tool
+        && let Some(ok) = line.tool_ok
+    {
+        let duration = line.tool_duration_ms.unwrap_or(0) as f64 / 1000.0;
+        let (mark, color) = if ok {
+            ("✓", theme::OK)
+        } else {
+            ("×", theme::ERR)
+        };
+        spans.push(Span::styled(
+            format!(" · {duration:.1}s {mark}"),
+            Style::default().fg(color),
+        ));
+    }
     Line::from(spans)
 }
 
-/// Builds the breadcrumb row: `kode  {repo} · {branch} · {provider}/{model}
-/// · effort:{e} · ctx ▓▓░░ {used}/{budget}`. `kode` renders dim/lowercase,
-/// the rest normal; when no model is selected, a dim ` — /model` nudge is
-/// appended after the provider/model cell. The context meter is omitted
-/// until the first `Knowledge` event of the session.
-pub(crate) fn breadcrumb_line(state: &AppState) -> Line<'static> {
+/// Builds the stable scope rail. It answers where the user is and what
+/// authority the next submission has; configuration detail belongs in
+/// `/status`, not permanent chrome.
+pub(crate) fn scope_line(state: &AppState, width: u16) -> Line<'static> {
     let branch = state.branch.clone().unwrap_or_else(|| "no git".to_string());
-    let effort = if state.status.effort.is_empty() {
-        "-".to_string()
+    let mode = if state.plan_mode {
+        "PLAN"
+    } else if state.auto_mode {
+        "AUTO"
     } else {
-        state.status.effort.clone()
+        "BUILD"
     };
     let model_set = !state.status.model.is_empty();
     let model = if model_set {
         state.status.model.clone()
     } else {
-        "(no model)".to_string()
+        "pick model".to_string()
     };
+    let repo = if state.repo_dir.is_empty() {
+        "."
+    } else {
+        state.repo_dir.as_str()
+    };
+    let left_plain = format!(
+        " KODE / {repo}  {branch}{}",
+        if state.dirty { "*" } else { "" }
+    );
+    let right_plain = if width >= 72 {
+        format!("{mode} · {model}")
+    } else {
+        mode.to_string()
+    };
+    let pad = (width as usize)
+        .saturating_sub(left_plain.chars().count() + right_plain.chars().count() + 1);
     let mut spans = vec![
-        Span::styled(" kode", Style::default().fg(theme::DIM)),
-        Span::raw(format!("  {} · {branch}", state.repo_dir)),
+        Span::styled(" KODE / ", Style::default().fg(theme::DIM)),
+        Span::styled(
+            repo.to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::raw(branch),
     ];
     if state.dirty {
-        spans.push(Span::styled("*", Style::default().fg(theme::DIM)));
+        spans.push(Span::styled("*", Style::default().fg(theme::G)));
     }
-    spans.push(Span::raw(format!(
-        " · {}/{model} · effort:{effort}",
-        state.status.provider
-    )));
-    if !model_set {
-        spans.push(Span::styled(" — /model", Style::default().fg(theme::DIM)));
-    }
-    if state.auto_mode {
-        spans.push(Span::styled(
-            " · auto",
-            Style::default().fg(theme::T).add_modifier(Modifier::BOLD),
-        ));
-    }
-    if state.plan_mode {
-        spans.push(Span::styled(
-            " · plan",
-            Style::default().fg(theme::T).add_modifier(Modifier::BOLD),
-        ));
-    }
-    if let Some(ks) = &state.knowledge {
-        let bar = meter(ks.context_tokens, ks.budget_tokens, 8);
-        let filled = bar.chars().filter(|c| *c == '▓').count();
-        spans.push(Span::raw(" · ctx "));
-        spans.push(Span::styled(
-            bar.chars().take(filled).collect::<String>(),
-            Style::default().fg(theme::Z),
-        ));
-        spans.push(Span::styled(
-            bar.chars().skip(filled).collect::<String>(),
-            Style::default().fg(theme::DIM),
-        ));
-        spans.push(Span::raw(format!(
-            " {}/{}",
-            format_k(ks.context_tokens),
-            format_k(ks.budget_tokens)
-        )));
-    }
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(Span::styled(
+        right_plain,
+        Style::default().fg(if state.auto_mode {
+            theme::WARN
+        } else {
+            theme::MUTED
+        }),
+    ));
     Line::from(spans)
+}
+
+#[cfg(test)]
+pub(crate) fn breadcrumb_line(state: &AppState) -> Line<'static> {
+    scope_line(state, 120)
 }
 
 /// Builds the Knowledge Band's content lines (not including the trailing
@@ -571,111 +568,6 @@ pub(crate) fn knowledge_band_lines(
     lines
 }
 
-/// One `aperture_lines` row: (source glyph, optional lead-in label, text,
-/// text style, optional dim confidence suffix — ingat only).
-pub(crate) type ApertureRow = (
-    &'static str,
-    Option<&'static str>,
-    String,
-    Style,
-    Option<String>,
-);
-
-/// Builds the Knowledge Aperture's content lines (not including the
-/// trailing rule): a bold header, a request tree of up to the first 2
-/// zindeks facts + first ingat memory + first git line (tree connectors
-/// `─┬─`/`├─`/`└─`, last present row gets `└─`), then a context summary
-/// row. Rows are skipped for empty sources — never a decorative fake.
-pub(crate) fn aperture_lines(ks: &KnowledgeState) -> Vec<Line<'static>> {
-    let mut rows: Vec<ApertureRow> = Vec::new();
-    for z in ks.zindeks.iter().take(2) {
-        rows.push(("Z", None, z.clone(), Style::default().fg(theme::Z), None));
-    }
-    if let Some(entry) = ks.ingat.first() {
-        let (text, confidence) = split_ingat_confidence(entry);
-        rows.push((
-            "I",
-            Some("recalled: "),
-            format!("\u{201c}{text}\u{201d}"),
-            Style::default().fg(theme::I).add_modifier(Modifier::ITALIC),
-            confidence.map(|s| s.to_string()),
-        ));
-    }
-    if let Some(git_line) = ks.git.first() {
-        rows.push((
-            "G",
-            None,
-            git_line.clone(),
-            Style::default().fg(theme::G),
-            None,
-        ));
-    }
-
-    let mut lines = vec![Line::from(Span::styled(
-        " KNOWLEDGE APERTURE",
-        Style::default()
-            .fg(theme::MUTED)
-            .add_modifier(Modifier::BOLD),
-    ))];
-
-    let last = rows.len().saturating_sub(1);
-    for (idx, (src, label, text, style, confidence)) in rows.into_iter().enumerate() {
-        let (lead, connector) = if idx == 0 {
-            (" request ", "─┬─ ")
-        } else if idx == last {
-            ("          ", "└─ ")
-        } else {
-            ("          ", "├─ ")
-        };
-        let mut row_spans = vec![
-            Span::styled(lead, Style::default().fg(theme::MUTED)),
-            Span::styled(connector, Style::default().fg(theme::DIM)),
-            Span::styled(format!("{src} "), style.add_modifier(Modifier::BOLD)),
-        ];
-        if let Some(label) = label {
-            row_spans.push(Span::styled(label, Style::default().fg(theme::MUTED)));
-        }
-        row_spans.push(Span::styled(text, style));
-        if let Some(score) = confidence {
-            row_spans.push(Span::styled(
-                format!(" \u{2504} {score}"),
-                Style::default().fg(theme::DIM),
-            ));
-        }
-        lines.push(Line::from(row_spans));
-    }
-
-    lines.push(Line::from(vec![
-        Span::styled(" context  ", Style::default().fg(theme::MUTED)),
-        Span::raw(format!(
-            "{} of {} tokens · Z:{} I:{} G:{}",
-            format_k(ks.context_tokens),
-            format_k(ks.budget_tokens),
-            ks.zindeks.len(),
-            ks.ingat.len(),
-            ks.git.len(),
-        )),
-    ]));
-
-    lines
-}
-
-/// Renders the Knowledge Band into `area`: `lines`' content plus a
-/// trailing DIM `─` rule spanning `area`'s full width — the only
-/// horizontal rule besides the one above the input box.
-pub(crate) fn draw_knowledge_band(
-    f: &mut ratatui::Frame,
-    area: ratatui::layout::Rect,
-    mut lines: Vec<Line<'static>>,
-) {
-    let rule: String = "─".repeat(area.width as usize);
-    lines.push(Line::from(Span::styled(
-        rule,
-        Style::default().fg(theme::DIM),
-    )));
-    f.render_widget(Paragraph::new(lines), area);
-}
-
 /// Clamps a scroll offset to `[0, total_lines.saturating_sub(viewport_height)]`
 /// — the largest offset that still keeps rendered content filling the
 /// viewport. Content that fits within the viewport (or a zero-height
@@ -762,45 +654,468 @@ pub(crate) fn total_wrapped_rows(lines: &[Line<'static>], width: u16) -> usize {
 }
 
 pub(crate) const MAX_INPUT_LINES: usize = 6;
-pub(crate) const MAX_VISIBLE_PASTE_ATTACHMENTS: usize = 3;
+pub(crate) const MAX_VISIBLE_PASTE_ATTACHMENTS: usize = 2;
 
 pub(crate) fn input_height(input: &str) -> u16 {
     let lines = input.split('\n').count().clamp(1, MAX_INPUT_LINES);
-    (lines + 1) as u16
+    (lines + 3) as u16
 }
 
 pub(crate) fn composer_height(state: &AppState) -> u16 {
-    input_height(&state.input).saturating_add(
-        (state.pasted_attachments.len() + state.image_attachments.len())
-            .min(MAX_VISIBLE_PASTE_ATTACHMENTS) as u16,
-    )
+    let total = state.pasted_attachments.len() + state.image_attachments.len();
+    let attachment_rows = total.min(MAX_VISIBLE_PASTE_ATTACHMENTS) + usize::from(total > 2);
+    input_height(&state.input).saturating_add(attachment_rows as u16)
+}
+
+fn compact_run_map_line(state: &AppState) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (index, (step, done)) in state.ledger.steps.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled("  ", Style::default().fg(theme::DIM)));
+        }
+        let active = !*done
+            && state
+                .ledger
+                .steps
+                .iter()
+                .take(index)
+                .all(|(_, prior_done)| *prior_done);
+        let (mark, color) = if *done {
+            ("✓", theme::OK)
+        } else if active {
+            ("●", theme::MUTED)
+        } else {
+            ("○", theme::DIM)
+        };
+        spans.push(Span::styled(
+            format!(
+                "{:02} {} {mark}",
+                index + 1,
+                task_step_label(*step).to_ascii_titlecase()
+            ),
+            Style::default().fg(color).add_modifier(if active {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            }),
+        ));
+    }
+    Line::from(spans)
+}
+
+trait AsciiTitleCase {
+    fn to_ascii_titlecase(&self) -> String;
+}
+
+impl AsciiTitleCase for str {
+    fn to_ascii_titlecase(&self) -> String {
+        let mut chars = self.to_ascii_lowercase().chars().collect::<Vec<_>>();
+        if let Some(first) = chars.first_mut() {
+            first.make_ascii_uppercase();
+        }
+        chars.into_iter().collect()
+    }
+}
+
+fn context_receipt_line(state: &AppState) -> Option<Line<'static>> {
+    let knowledge = state.knowledge.as_ref()?;
+    let total = knowledge.zindeks.len() + knowledge.ingat.len() + knowledge.git.len();
+    if total == 0 {
+        return None;
+    }
+    Some(Line::from(vec![
+        Span::styled(
+            if state.knowledge_band_open {
+                " ▾ CONTEXT  "
+            } else {
+                " ▸ CONTEXT  "
+            },
+            Style::default()
+                .fg(theme::MUTED)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{} code facts", knowledge.zindeks.len()),
+            Style::default().fg(theme::Z),
+        ),
+        Span::raw(" · "),
+        Span::styled(
+            format!("{} memories", knowledge.ingat.len()),
+            Style::default().fg(theme::I),
+        ),
+        Span::raw(" · "),
+        Span::styled(
+            format!("{} git facts", knowledge.git.len()),
+            Style::default().fg(theme::G),
+        ),
+        Span::styled(
+            format!(
+                " · {}/{} tokens",
+                compact_tokens(knowledge.context_tokens),
+                compact_tokens(knowledge.budget_tokens)
+            ),
+            Style::default().fg(theme::DIM),
+        ),
+        Span::styled("   Ctrl+K", Style::default().fg(theme::DIM)),
+    ]))
+}
+
+pub(crate) fn focus_surface_lines(state: &AppState) -> Vec<Line<'static>> {
+    if let Some(permission) = state.pending.front() {
+        return vec![
+            Line::from(Span::styled(
+                " PERMISSION REQUIRED",
+                Style::default()
+                    .fg(theme::WARN)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!(" {}", permission.summary),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(vec![
+                Span::styled(" Scope  ", Style::default().fg(theme::MUTED)),
+                Span::raw("this invocation only"),
+            ]),
+            Line::from(vec![
+                Span::styled(" [A]", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" Allow once   "),
+                Span::styled("[D]", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" Deny"),
+            ]),
+        ];
+    }
+
+    if state.running {
+        let elapsed = state
+            .run_started
+            .map(|started| started.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        let mut lines = match state.status.state {
+            RunState::Tool => {
+                let tool = state.current_tool.as_deref().unwrap_or("tool");
+                let tool_elapsed = state
+                    .tool_started
+                    .map(|started| started.elapsed().as_secs_f64())
+                    .unwrap_or(elapsed);
+                let frame = spinner_glyph((elapsed * 1000.0) as u128, state.reduced_motion, false);
+                vec![
+                    Line::from(Span::styled(
+                        format!(" {frame} RUNNING"),
+                        Style::default()
+                            .fg(theme::MUTED)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(vec![
+                        Span::styled(" TOOL  ", Style::default().fg(theme::T)),
+                        Span::styled(
+                            truncate_chars(tool, 160),
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ),
+                    ]),
+                    Line::from(Span::styled(
+                        format!("       elapsed {tool_elapsed:05.1}s · Esc twice to interrupt"),
+                        Style::default().fg(theme::MUTED),
+                    )),
+                    compact_run_map_line(state),
+                ]
+            }
+            RunState::Verify => {
+                let mut lines = vec![
+                    Line::from(Span::styled(
+                        " VERIFYING",
+                        Style::default()
+                            .fg(theme::MUTED)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    compact_run_map_line(state),
+                ];
+                for (name, status) in state.ledger.verify_steps.iter().rev().take(2).rev() {
+                    let (mark, color) = match status {
+                        StepStatusLite::Passed => ("✓", theme::OK),
+                        StepStatusLite::Failed => ("×", theme::ERR),
+                        StepStatusLite::Skipped => ("–", theme::WARN),
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(" VERIFY  ", Style::default().fg(color)),
+                        Span::raw(name.clone()),
+                        Span::styled(format!(" {mark}"), Style::default().fg(color)),
+                    ]));
+                }
+                lines.push(Line::from(Span::styled(
+                    " Type now to queue the next task.",
+                    Style::default().fg(theme::DIM),
+                )));
+                lines
+            }
+            RunState::Thinking | RunState::Idle => vec![
+                Line::from(vec![
+                    Span::styled(
+                        " UNDERSTANDING  ",
+                        Style::default()
+                            .fg(theme::MUTED)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(
+                            "{} {elapsed:05.1}s",
+                            spinner_glyph(
+                                (elapsed * 1000.0) as u128,
+                                state.reduced_motion,
+                                !state.current_stream.is_empty()
+                                    || !state.stream_pending.is_empty(),
+                            )
+                        ),
+                        Style::default().fg(theme::T),
+                    ),
+                ]),
+                compact_run_map_line(state),
+            ],
+        };
+        if let Some(context) = context_receipt_line(state) {
+            lines.push(context);
+        }
+        if state.knowledge_band_open
+            && let Some(knowledge) = &state.knowledge
+        {
+            for line in knowledge_band_lines(knowledge, state.render_tick, state.reduced_motion) {
+                lines.push(line);
+            }
+        }
+        return lines;
+    }
+
+    if let Some(error) = &state.last_error {
+        let mut lines = vec![
+            Line::from(Span::styled(
+                " STOPPED",
+                Style::default().fg(theme::ERR).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(vec![
+                Span::styled(" ERROR  ", Style::default().fg(theme::ERR)),
+                Span::raw(truncate_chars(error, 180)),
+            ]),
+        ];
+        for row in state.ledger.numstat.iter().take(2) {
+            lines.push(Line::from(vec![
+                Span::styled(" GIT    ", Style::default().fg(theme::G)),
+                Span::raw(row.path.clone()),
+                Span::styled(
+                    format!("  +{} -{}", row.added, row.deleted),
+                    Style::default().fg(theme::MUTED),
+                ),
+            ]));
+        }
+        lines.push(Line::from(Span::styled(
+            " Edit the task and press Enter to try again.",
+            Style::default().fg(theme::DIM),
+        )));
+        return lines;
+    }
+
+    if let Some(receipt) = &state.completion {
+        let failed = receipt
+            .verify_steps
+            .iter()
+            .any(|(_, status)| *status == StepStatusLite::Failed);
+        let unverified = receipt.verify_steps.is_empty()
+            || receipt
+                .verify_steps
+                .iter()
+                .all(|(_, status)| *status == StepStatusLite::Skipped);
+        let heading_color = if failed {
+            theme::ERR
+        } else if unverified {
+            theme::WARN
+        } else {
+            theme::OK
+        };
+        let additions = receipt.numstat.iter().map(|row| row.added).sum::<u32>();
+        let deletions = receipt.numstat.iter().map(|row| row.deleted).sum::<u32>();
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    format!(" {}", receipt.verification_label()),
+                    Style::default()
+                        .fg(heading_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("   {:.1}s", receipt.elapsed_ms as f64 / 1000.0),
+                    Style::default().fg(theme::MUTED),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled(" GIT     ", Style::default().fg(theme::G)),
+                Span::raw(format!(
+                    "{} files changed · +{additions} -{deletions}",
+                    receipt.numstat.len()
+                )),
+            ]),
+        ];
+        for (name, status) in receipt.verify_steps.iter().take(2) {
+            let (mark, color) = match status {
+                StepStatusLite::Passed => ("✓", theme::OK),
+                StepStatusLite::Failed => ("×", theme::ERR),
+                StepStatusLite::Skipped => ("–", theme::WARN),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(" VERIFY  ", Style::default().fg(color)),
+                Span::raw(name.clone()),
+                Span::styled(format!(" {mark}"), Style::default().fg(color)),
+            ]));
+        }
+        lines.push(Line::from(Span::styled(
+            format!(
+                " {} iterations · {} tools · {}→{} tokens",
+                receipt.iterations, receipt.tool_calls, receipt.input_tokens, receipt.output_tokens
+            ),
+            Style::default().fg(theme::MUTED),
+        )));
+        lines.push(Line::from(Span::styled(
+            " Ctrl+L Run Map · Ctrl+Y copy · type a follow-up",
+            Style::default().fg(theme::DIM),
+        )));
+        return lines;
+    }
+
+    let mut lines: Vec<Line<'static>> = context_receipt_line(state).into_iter().collect();
+    if state.knowledge_band_open
+        && let Some(knowledge) = &state.knowledge
+    {
+        lines.extend(knowledge_band_lines(
+            knowledge,
+            state.render_tick,
+            state.reduced_motion,
+        ));
+    }
+    lines
+}
+
+pub(crate) fn focus_surface_height(state: &AppState) -> u16 {
+    focus_surface_lines(state).len().min(8) as u16
+}
+
+fn draw_focus_surface(
+    f: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    lines: Vec<Line<'static>>,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let mut rendered = vec![Line::from(Span::styled(
+        "─".repeat(area.width as usize),
+        Style::default().fg(theme::DIM),
+    ))];
+    rendered.extend(
+        lines
+            .into_iter()
+            .take(area.height.saturating_sub(1) as usize),
+    );
+    f.render_widget(Paragraph::new(rendered).wrap(Wrap { trim: false }), area);
+}
+
+fn centered_overlay(area: ratatui::layout::Rect, width: u16, height: u16) -> ratatui::layout::Rect {
+    let width = width.min(area.width.saturating_sub(2)).max(1);
+    let height = height.min(area.height.saturating_sub(2)).max(1);
+    ratatui::layout::Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+pub(crate) fn shortcut_sheet_lines(state: &AppState) -> Vec<Line<'static>> {
+    let enter = match state.composer_mode() {
+        ComposerMode::Ask => "send task",
+        ComposerMode::Steer => "steer active run",
+        ComposerMode::Queue => "queue next task",
+        ComposerMode::Decision => "choose permission action",
+        ComposerMode::Recover => "retry with a revised task",
+        ComposerMode::FollowUp => "review diff or send follow-up",
+    };
+    vec![
+        Line::from(Span::styled(
+            " SHORTCUTS",
+            Style::default()
+                .fg(theme::MUTED)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::default(),
+        Line::from(format!(" Enter        {enter}")),
+        Line::from(" Shift+Enter  newline"),
+        Line::from(" /            actions and commands"),
+        Line::from(" Ctrl+K       expand evidence"),
+        Line::from(" Ctrl+L       open Run Map"),
+        Line::from(" Ctrl+A       inspect attachments"),
+        Line::from(" Ctrl+Y       copy last response"),
+        Line::from(" Ctrl+T       terminal select mode"),
+        Line::from(" Shift+Tab    toggle auto mode"),
+        Line::from(" Esc Esc      interrupt active run"),
+        Line::default(),
+        Line::from(Span::styled(
+            " ? or Esc closes this sheet",
+            Style::default().fg(theme::DIM),
+        )),
+    ]
+}
+
+pub(crate) fn attachment_inspector_lines(state: &AppState) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            " ATTACHMENTS",
+            Style::default()
+                .fg(theme::MUTED)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::default(),
+    ];
+    for (kind, summary) in state.attachment_rows() {
+        let label = match kind {
+            AttachmentKind::Text => " TXT  ",
+            AttachmentKind::Image => " IMG  ",
+        };
+        lines.push(Line::from(vec![
+            Span::styled(label, Style::default().fg(theme::Z)),
+            Span::raw(summary),
+        ]));
+    }
+    if state.pasted_attachments.is_empty() && state.image_attachments.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " No attachments in the composer.",
+            Style::default().fg(theme::DIM),
+        )));
+    } else {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            " Backspace on empty input removes the latest · Ctrl+A or Esc closes",
+            Style::default().fg(theme::DIM),
+        )));
+    }
+    lines
+}
+
+fn draw_sheet(f: &mut ratatui::Frame, lines: Vec<Line<'static>>) {
+    let height = (lines.len() as u16 + 2).min(f.area().height.saturating_sub(2));
+    let popup = centered_overlay(f.area(), 72, height);
+    f.render_widget(Clear, popup);
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), popup);
 }
 
 pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
-    let band_lines = if state.ledger_open {
-        // The Ledger view replaces the band + transcript area entirely.
-        None
-    } else if let Some(ap) = &state.aperture {
-        Some(aperture_lines(&ap.knowledge))
-    } else if knowledge_band_visible(state) {
-        state
-            .knowledge
-            .as_ref()
-            .map(|ks| knowledge_band_lines(ks, state.render_tick, state.reduced_motion))
+    let focus_lines = if state.ledger_open {
+        Vec::new()
     } else {
-        None
+        focus_surface_lines(state)
     };
-    let band_height = band_lines.as_ref().map(|l| l.len() as u16 + 1).unwrap_or(0);
+    let focus_height = focus_surface_height(state).saturating_add(1);
 
-    let has_pending = !state.pending.is_empty();
-
-    let mut constraints = vec![Constraint::Length(1)]; // breadcrumb
-    if band_height > 0 {
-        constraints.push(Constraint::Length(band_height));
-    }
+    let mut constraints = vec![Constraint::Length(2)]; // scope rail + rule
     constraints.push(Constraint::Min(1)); // transcript
-    if has_pending {
-        constraints.push(Constraint::Length(3));
+    if !focus_lines.is_empty() {
+        constraints.push(Constraint::Length(focus_height));
     }
     let hint_items = if !state.picker.open
         && state.pending.is_empty()
@@ -822,13 +1137,17 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
     let areas = Layout::vertical(constraints).split(f.area());
     let mut idx = 0;
 
-    f.render_widget(Paragraph::new(breadcrumb_line(state)), areas[idx]);
+    f.render_widget(
+        Paragraph::new(vec![
+            scope_line(state, areas[idx].width),
+            Line::from(Span::styled(
+                "─".repeat(areas[idx].width as usize),
+                Style::default().fg(theme::DIM),
+            )),
+        ]),
+        areas[idx],
+    );
     idx += 1;
-
-    if let Some(lines) = band_lines {
-        draw_knowledge_band(f, areas[idx], lines);
-        idx += 1;
-    }
 
     let elapsed_ms = state
         .run_started
@@ -877,31 +1196,6 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
                     Gutter::Prose,
                     state.current_stream.clone(),
                 )),
-                None,
-            ));
-        }
-        if state.running {
-            let elapsed = state.run_started.map(|t| t.elapsed()).unwrap_or_default();
-            let streaming = !state.current_stream.is_empty() || !state.stream_pending.is_empty();
-            let frame = spinner_glyph(elapsed.as_millis(), state.reduced_motion, streaming);
-            let secs = elapsed.as_secs_f64();
-            let (label, color) = if state.interrupt_confirmation_active() {
-                ("× press Esc again to interrupt".to_string(), theme::ERR)
-            } else {
-                let label = match &state.current_tool {
-                    Some(tool) => {
-                        let tool_secs = state
-                            .tool_started
-                            .map(|t| t.elapsed().as_secs_f64())
-                            .unwrap_or(secs);
-                        format!("▸ {tool} · {tool_secs:.1}s")
-                    }
-                    None => format!("{frame} {} · {secs:.1}s", state.status.state.label()),
-                };
-                (label, theme::T)
-            };
-            entries.push((
-                Line::from(Span::styled(label, Style::default().fg(color))),
                 None,
             ));
         }
@@ -976,31 +1270,17 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
     }
     idx += 1;
 
-    let next_area = if has_pending {
-        let req_line = state
-            .pending
-            .front()
-            .map(|r| format!("allow: {}  [y]es / [n]o", r.summary))
-            .unwrap_or_default();
-        f.render_widget(
-            Paragraph::new(Span::styled(
-                req_line,
-                Style::default().fg(theme::T).add_modifier(Modifier::BOLD),
-            )),
-            areas[idx],
-        );
+    if !focus_lines.is_empty() {
+        draw_focus_surface(f, areas[idx], focus_lines);
         idx += 1;
-        areas[idx]
-    } else {
-        areas[idx]
-    };
+    }
 
     let input_area = if hint_items.is_empty() {
-        next_area
+        areas[idx]
     } else {
         f.render_widget(
             Paragraph::new(slash_hint_lines(&hint_items, state.slash_selected)),
-            next_area,
+            areas[idx],
         );
         idx += 1;
         areas[idx]
@@ -1010,6 +1290,10 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
 
     if state.picker.open {
         draw_picker(f, &state.picker);
+    } else if state.shortcuts_open {
+        draw_sheet(f, shortcut_sheet_lines(state));
+    } else if state.attachments_open {
+        draw_sheet(f, attachment_inspector_lines(state));
     }
 }
 
@@ -1045,11 +1329,6 @@ pub(crate) fn slash_hint_lines(items: &[(String, String)], selected: usize) -> V
 
 /// Renders the input form: a DIM full-width rule, then up to six editable
 /// lines. `Shift+Enter` inserts a newline; overflow keeps the newest lines
-/// visible. The suffix sits on the final visible row.
-/// Right-edge input-line indicator while Ctrl+T select mode is on (mouse
-/// released to the terminal so native drag-select/copy works).
-pub(crate) const SELECT_MODE_HINT: &str = "select · Ctrl+T to exit  ";
-
 pub(crate) fn draw_input(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &AppState) {
     if area.height == 0 {
         return;
@@ -1072,35 +1351,53 @@ pub(crate) fn draw_input(f: &mut ratatui::Frame, area: ratatui::layout::Rect, st
         ..area
     };
 
-    let attachment_summaries: Vec<String> = state
-        .pasted_attachments
-        .iter()
-        .map(PastedAttachment::summary)
-        .chain(state.image_attachments.iter().map(|image| {
-            format!(
-                "{} · {} · {:.1} KiB",
-                image.name,
-                image.media_type,
-                image.size_bytes as f64 / 1024.0
+    let mut rendered = vec![Line::from(Span::styled(
+        format!(" {}", state.composer_mode().label()),
+        Style::default()
+            .fg(theme::MUTED)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    let attachment_summaries: Vec<(&str, String)> = state
+        .attachment_rows()
+        .into_iter()
+        .map(|(kind, summary)| {
+            (
+                match kind {
+                    AttachmentKind::Text => "TXT",
+                    AttachmentKind::Image => "IMG",
+                },
+                summary,
             )
-        }))
+        })
         .collect();
     let attachment_count = attachment_summaries
         .len()
         .min(MAX_VISIBLE_PASTE_ATTACHMENTS)
-        .min(composer_area.height as usize);
+        .min(composer_area.height.saturating_sub(2) as usize);
     let attachment_start = attachment_summaries.len().saturating_sub(attachment_count);
-    let mut rendered = Vec::new();
-    for summary in &attachment_summaries[attachment_start..] {
+    for (kind, summary) in &attachment_summaries[attachment_start..] {
         rendered.push(Line::from(vec![
-            Span::styled(" + ", Style::default().fg(theme::T)),
+            Span::styled(
+                format!(" {kind:<4}"),
+                Style::default().fg(theme::Z).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(summary, Style::default().fg(theme::MUTED)),
         ]));
     }
+    let overflow = attachment_summaries.len().saturating_sub(attachment_count);
+    if overflow > 0 {
+        rendered.push(Line::from(Span::styled(
+            format!("      +{overflow} more · Ctrl+A inspect all"),
+            Style::default().fg(theme::DIM),
+        )));
+    }
 
     let input_area = ratatui::layout::Rect {
-        y: composer_area.y + attachment_count as u16,
-        height: composer_area.height.saturating_sub(attachment_count as u16),
+        y: composer_area.y + rendered.len() as u16,
+        height: composer_area
+            .height
+            .saturating_sub(rendered.len() as u16)
+            .saturating_sub(1),
         ..composer_area
     };
     if input_area.height == 0 {
@@ -1108,12 +1405,6 @@ pub(crate) fn draw_input(f: &mut ratatui::Frame, area: ratatui::layout::Rect, st
         return;
     }
 
-    let suffix = input_suffix(state.knowledge.as_ref());
-    let select_text = if state.select_mode {
-        SELECT_MODE_HINT
-    } else {
-        ""
-    };
     let all_lines: Vec<&str> = state.input.split('\n').collect();
     let visible_count = all_lines.len().min(input_area.height as usize);
     let visible_start = all_lines.len().saturating_sub(visible_count);
@@ -1121,26 +1412,49 @@ pub(crate) fn draw_input(f: &mut ratatui::Frame, area: ratatui::layout::Rect, st
     for (visible_index, text) in visible.iter().enumerate() {
         let actual_index = visible_start + visible_index;
         let prefix = if actual_index == 0 { " › " } else { " │ " };
-        let is_last = visible_index + 1 == visible.len();
-        let mut spans = vec![
+        let spans = vec![
             Span::styled(prefix, Style::default().fg(theme::MUTED)),
             Span::raw((*text).to_string()),
         ];
-        if is_last {
-            let suffix_len = suffix.plain_text().chars().count() + select_text.chars().count();
-            let used = 3 + text.chars().count();
-            let pad = (input_area.width as usize).saturating_sub(used + suffix_len);
-            spans.push(Span::raw(" ".repeat(pad)));
-            if state.select_mode {
-                spans.push(Span::styled(select_text, Style::default().fg(theme::T)));
-            }
-            spans.extend(suffix.spans());
-        }
         rendered.push(Line::from(spans));
     }
+
+    let hints = if state.select_mode {
+        "Ctrl+T exit select mode".to_string()
+    } else if !state.pending.is_empty() {
+        "A allow once · D deny".to_string()
+    } else if !attachment_summaries.is_empty() {
+        match state.composer_mode() {
+            ComposerMode::Steer => {
+                "Enter steer · Backspace remove last · Ctrl+A inspect".to_string()
+            }
+            ComposerMode::Queue => {
+                "Enter queue · Backspace remove last · Ctrl+A inspect".to_string()
+            }
+            _ => "Enter send · Backspace remove last · Ctrl+A inspect".to_string(),
+        }
+    } else {
+        match state.composer_mode() {
+            ComposerMode::Ask => "Enter send · / actions · ? shortcuts",
+            ComposerMode::Steer => "Enter steer · Esc twice interrupt · ? shortcuts",
+            ComposerMode::Queue => "Enter queue · Ctrl+L Run Map · ? shortcuts",
+            ComposerMode::Decision => "A allow once · D deny",
+            ComposerMode::Recover => "Enter retry · Ctrl+L Run Map · ? shortcuts",
+            ComposerMode::FollowUp => "Ctrl+L Run Map · Ctrl+Y copy · ? shortcuts",
+        }
+        .to_string()
+    };
+    rendered.push(Line::from(Span::styled(
+        format!(" {hints}"),
+        Style::default().fg(theme::DIM),
+    )));
     f.render_widget(Paragraph::new(rendered), composer_area);
 
-    if !state.picker.open && state.pending.is_empty() {
+    if !state.picker.open
+        && !state.shortcuts_open
+        && !state.attachments_open
+        && state.pending.is_empty()
+    {
         let last_len = all_lines.last().map_or(0, |line| line.chars().count());
         let cursor_x = (input_area.x as usize + 3 + last_len)
             .min((input_area.x + input_area.width).saturating_sub(1) as usize)
@@ -1160,7 +1474,7 @@ pub(crate) fn task_step_label(step: TaskStep) -> &'static str {
     }
 }
 
-/// Renders the Ledger view (Ctrl+L): OBJECTIVE, the 4 numbered steps
+/// Renders the Run Map view (Ctrl+L): OBJECTIVE and real task progress.
 /// (`✓` done / `●`/`◉` active pulse / `○` pending — no borders, DIM rule
 /// spacing only), CURRENT CHANGE, and WHY. Every row traces to a real
 /// event; no invented captions. `running`/`elapsed_ms`/`reduced_motion`
@@ -1174,6 +1488,14 @@ pub(crate) fn draw_ledger(
     reduced_motion: bool,
 ) {
     let mut lines: Vec<Line<'static>> = Vec::new();
+
+    lines.push(Line::from(Span::styled(
+        " RUN MAP",
+        Style::default()
+            .fg(theme::MUTED)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::default());
 
     lines.push(Line::from(vec![
         Span::styled(

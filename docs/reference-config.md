@@ -75,7 +75,7 @@ autostart = true
 | `max_iterations` | integer | `80` | Upper bound on agent loop iterations per task, as a runaway guard. |
 | `max_tool_calls` | integer | `100` | Upper bound on total tool calls per task. |
 | `max_context_tokens` | integer | `100000` | Upper bound on the model's total context window Kode will fill, across system prompt, history, and compiled knowledge context. |
-| `context_budget_tokens` | integer | `16000` | Token budget for knowledge context compiled each turn from zindeks (code graph) and Ingat (memory). This is what the TUI breadcrumb's `ctx X/Yk` meter tracks: it is not the model's context window, which is `max_context_tokens`. |
+| `context_budget_tokens` | integer | `16000` | Token budget for knowledge context compiled each turn from zindeks (code graph) and Ingat (memory). It is distinct from the model's context window, which is `max_context_tokens`; real evidence counts are available from the TUI's contextual receipt. |
 | `history_budget_tokens` | integer | `6000` | Token budget for replaying prior session turns when resuming (`--continue`/`-c`, `/resume`). Oldest turns are dropped first if history doesn't fit, with a truncation marker shown in the transcript. |
 
 ```toml
@@ -136,7 +136,7 @@ required = true
 
 | Key | Type | Default | Effect |
 |---|---|---|---|
-| `reduced_motion` | bool | `false` | When `true`, kills the TUI's motion set: spinner glyph animation (static frame instead), the knowledge-band evidence-row dim→normal fade, and the Ledger active-marker pulse. Streaming coalescing (buffering model output before it hits the transcript) stays active regardless — it's buffering, not motion. |
+| `reduced_motion` | bool | `false` | When `true`, freezes the TUI's low-frequency spinner, evidence-row fade, and Run Map active-marker pulse. Streaming coalescing (buffering model output before it hits the transcript) stays active regardless — it is buffering, not motion. |
 
 ```toml
 [ui]

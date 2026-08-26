@@ -192,9 +192,11 @@ Available inside the interactive `kode` TUI, with a live hint menu as you type `
 | `/help` | Show available commands. |
 | `/name [args]` | Custom command — expands the `.kode/commands/name.md` or `~/.kode/commands/name.md` template and submits it as a task. See [howto-custom-commands.md](./howto-custom-commands.md). |
 
-The breadcrumb at the top of the TUI shows the current provider/model/effort and a context meter (`ctx X/Yk`), which tracks the knowledge-context budget (`[agent] context_budget_tokens`), not the model's context window.
+The scope rail at the top of the TUI shows the repo, branch, dirty state, authority mode (`BUILD`, `PLAN`, or `AUTO`), and model. Provider, effort, and token-budget detail remain available through status/config commands instead of occupying permanent chrome.
 
-Images are validated by file content, shown as compact composer attachments, sent to the provider as native multimodal input, and retained when a session is resumed. Each image is limited to 7 MiB; a turn may contain up to 20 images and 20 MiB total.
+The contextual work surface changes with the run: context receipt, active tool or verification, permission decision, completion receipt, or recovery receipt. `Ctrl+K` expands real context evidence, `Ctrl+L` opens the full **Run Map**, `?` opens the shortcut sheet, and `Esc` closes an overlay. During a run, the first `Esc` arms interruption and the second interrupts it.
+
+The composer label states what Enter will do (`ASK KODE`, `STEER ACTIVE RUN`, `QUEUE NEXT TASK`, or `ASK A FOLLOW-UP`). `Shift+Enter` inserts a newline. Images are validated by file content, shown as compact composer attachments, sent to the provider as native multimodal input, and retained when a session is resumed. The two newest text/image attachments are shown inline; `Ctrl+A` opens the complete attachment inspector. Each image is limited to 7 MiB; a turn may contain up to 20 images and 20 MiB total.
 
 ## Related
 

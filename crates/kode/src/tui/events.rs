@@ -80,9 +80,6 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
                 state.stream_last_flush = Some(Instant::now());
             }
             state.stream_pending.push_str(&text);
-            if let Some(ap) = &mut state.aperture {
-                ap.trigger_seen = true;
-            }
             let elapsed = state
                 .stream_last_flush
                 .map(|t| t.elapsed())
@@ -109,6 +106,7 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
                     }
                     last.tool_children.push(name.clone());
                     last.text = tool_group_summary(&last.tool_children);
+                    last.tool_ok = None;
                 }
                 _ => {
                     state
@@ -120,9 +118,6 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             state.status.state = RunState::Tool;
             state.current_tool = Some(name);
             state.tool_started = Some(Instant::now());
-            if let Some(ap) = &mut state.aperture {
-                ap.trigger_seen = true;
-            }
             if !state.decide_marked_this_run {
                 state.decide_marked_this_run = true;
                 if let Some(entry) = state
@@ -136,6 +131,25 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             }
         }
         KodeEvent::ToolFinished { name, ok, error } => {
+            let elapsed_ms = state
+                .tool_started
+                .take()
+                .map(|started| started.elapsed().as_millis())
+                .unwrap_or(0);
+            if let Some(receipt) = state
+                .transcript
+                .iter_mut()
+                .rev()
+                .find(|line| line.gutter == Gutter::Tool && line.tool_ok.is_none())
+            {
+                receipt.tool_duration_ms = Some(
+                    receipt
+                        .tool_duration_ms
+                        .unwrap_or(0)
+                        .saturating_add(elapsed_ms),
+                );
+                receipt.tool_ok = Some(ok);
+            }
             if !ok {
                 let text = match error.as_deref().map(first_line_truncated) {
                     Some(reason) if !reason.is_empty() => format!("{name} failed: {reason}"),
@@ -146,7 +160,6 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
                     .push(TranscriptLine::new(Gutter::ToolFail, text));
             }
             state.current_tool = None;
-            state.tool_started = None;
         }
         KodeEvent::SteeringAccepted { message } => {
             state.append_pending_steering(&message);
@@ -167,6 +180,8 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             state.interrupt_armed_at = None;
         }
         KodeEvent::AgentError { message } => {
+            state.last_error = Some(message.clone());
+            state.completion = None;
             state
                 .transcript
                 .push(TranscriptLine::new(Gutter::Error, message));
@@ -199,12 +214,20 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             input_tokens,
             output_tokens,
         } => {
-            state.transcript.push(TranscriptLine::new(
-                Gutter::Note,
-                format!(
-                    "{iterations} iterations, {tool_calls} tool calls, {input_tokens}→{output_tokens} tokens"
-                ),
-            ));
+            let elapsed_ms = state
+                .run_started
+                .map(|started| started.elapsed().as_millis())
+                .unwrap_or(0);
+            state.completion = Some(CompletionReceipt {
+                iterations,
+                tool_calls,
+                input_tokens,
+                output_tokens,
+                elapsed_ms,
+                verify_steps: state.ledger.verify_steps.clone(),
+                numstat: state.ledger.numstat.clone(),
+            });
+            state.last_error = None;
             state.running = false;
             state.steering_active = false;
             state.status.state = RunState::Idle;
@@ -253,18 +276,6 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
                 ingat_since_tick,
             };
             state.ledger.why = ledger_why_from(&ks);
-            // The Aperture is a code-intelligence moment — it opens only
-            // when a zindeks or ingat engine actually contributed evidence.
-            // Git-only compilations still populate the Knowledge Band, but
-            // git impact alone isn't "intelligence made visible" (DESIGN.md:
-            // absent when engines are absent).
-            if !ks.zindeks.is_empty() || !ks.ingat.is_empty() {
-                state.aperture = Some(ApertureState {
-                    received_at: Instant::now(),
-                    knowledge: ks.clone(),
-                    trigger_seen: false,
-                });
-            }
             state.knowledge = Some(ks);
         }
         KodeEvent::VerifyStep {

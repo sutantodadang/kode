@@ -11,12 +11,71 @@ use kode_context::git::{NumstatRow, RepoState};
 use kode_core::config::KodeConfig;
 use kode_core::event::{KodeEvent, NoteSource, TaskStep};
 use kode_tools::permission::PermissionHandler;
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
 use ratatui::text::Line;
 use tokio::sync::{mpsc, oneshot};
 
 fn state() -> AppState {
     AppState::new("openai".to_string(), "gpt-test".to_string(), String::new())
+}
+
+fn render_at_minimum_size(state: &mut AppState) {
+    let backend = TestBackend::new(60, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| draw(frame, state, std::path::Path::new(".")))
+        .unwrap();
+    assert_eq!(terminal.size().unwrap().width, 60);
+    assert_eq!(terminal.size().unwrap().height, 20);
+}
+
+#[test]
+fn contextual_workbench_renders_major_states_at_60_by_20() {
+    let mut idle = state();
+    render_at_minimum_size(&mut idle);
+
+    let mut running = state();
+    running.start_new_task("inspect the config loader", false);
+    apply_event(&mut running, KodeEvent::AgentStarted);
+    apply_event(
+        &mut running,
+        KodeEvent::Knowledge {
+            zindeks: vec!["crates/kode/src/config.rs".to_string()],
+            ingat: vec!["preserve config comments".to_string()],
+            git: vec!["working tree dirty".to_string()],
+            context_tokens: 800,
+            budget_tokens: 16_000,
+        },
+    );
+    apply_event(
+        &mut running,
+        KodeEvent::ToolStarted {
+            name: "read_file crates/kode/src/config.rs".to_string(),
+        },
+    );
+    render_at_minimum_size(&mut running);
+
+    let mut permission = state();
+    let (tx, _rx) = oneshot::channel();
+    permission.push_permission(PermReq {
+        summary: "run cargo test --workspace".to_string(),
+        responder: tx,
+    });
+    render_at_minimum_size(&mut permission);
+
+    let mut completed = state();
+    apply_event(
+        &mut completed,
+        KodeEvent::TaskFinished {
+            iterations: 3,
+            tool_calls: 5,
+            input_tokens: 100,
+            output_tokens: 50,
+        },
+    );
+    render_at_minimum_size(&mut completed);
 }
 
 #[test]
@@ -141,6 +200,8 @@ fn tool_started_sets_tool_timer_and_finished_clears_it() {
         },
     );
     assert!(s.tool_started.is_none());
+    assert_eq!(s.transcript[0].tool_ok, Some(true));
+    assert!(s.transcript[0].tool_duration_ms.is_some());
 }
 
 #[test]
@@ -296,13 +357,11 @@ fn task_finished_updates_counters_and_ends_run() {
     );
     assert!(!s.running);
     assert_eq!(s.status.state, RunState::Idle);
-    assert_eq!(
-        s.transcript,
-        vec![TranscriptLine::new(
-            Gutter::Note,
-            "3 iterations, 5 tool calls, 100→50 tokens"
-        )]
-    );
+    assert!(s.transcript.is_empty());
+    let receipt = s.completion.as_ref().expect("completion receipt");
+    assert_eq!(receipt.iterations, 3);
+    assert_eq!(receipt.tool_calls, 5);
+    assert_eq!((receipt.input_tokens, receipt.output_tokens), (100, 50));
 }
 
 #[test]
@@ -507,11 +566,11 @@ fn ledger_pulse_glyph_static_when_reduced_motion() {
 }
 
 #[test]
-fn ledger_pulse_glyph_alternates_at_4hz_while_running() {
+fn ledger_pulse_glyph_alternates_at_1hz_while_running() {
     assert_eq!(ledger_pulse_glyph(0, true, false), '●');
-    assert_eq!(ledger_pulse_glyph(250, true, false), '◉');
     assert_eq!(ledger_pulse_glyph(500, true, false), '●');
-    assert_eq!(ledger_pulse_glyph(750, true, false), '◉');
+    assert_eq!(ledger_pulse_glyph(1_000, true, false), '◉');
+    assert_eq!(ledger_pulse_glyph(2_000, true, false), '●');
 }
 
 #[test]
@@ -834,14 +893,6 @@ fn scrollbar_state_visible_reports_length_and_clamped_position() {
 #[test]
 fn handle_key_ctrl_k_toggles_knowledge_band() {
     let mut s = state();
-    assert!(s.knowledge_band_open);
-    handle_key(
-        &mut s,
-        std::path::Path::new("."),
-        KeyCode::Char('k'),
-        KeyModifiers::CONTROL,
-        &None,
-    );
     assert!(!s.knowledge_band_open);
     handle_key(
         &mut s,
@@ -851,6 +902,132 @@ fn handle_key_ctrl_k_toggles_knowledge_band() {
         &None,
     );
     assert!(s.knowledge_band_open);
+    handle_key(
+        &mut s,
+        std::path::Path::new("."),
+        KeyCode::Char('k'),
+        KeyModifiers::CONTROL,
+        &None,
+    );
+    assert!(!s.knowledge_band_open);
+}
+
+#[test]
+fn composer_mode_names_the_next_enter_action() {
+    let mut s = state();
+    assert_eq!(s.composer_mode(), ComposerMode::Ask);
+
+    s.running = true;
+    s.steering_active = true;
+    assert_eq!(s.composer_mode(), ComposerMode::Steer);
+    s.steering_active = false;
+    assert_eq!(s.composer_mode(), ComposerMode::Queue);
+
+    s.running = false;
+    apply_event(
+        &mut s,
+        KodeEvent::AgentError {
+            message: "network stopped".to_string(),
+        },
+    );
+    assert_eq!(s.composer_mode(), ComposerMode::Recover);
+    s.begin_composing();
+
+    apply_event(
+        &mut s,
+        KodeEvent::TaskFinished {
+            iterations: 1,
+            tool_calls: 0,
+            input_tokens: 5,
+            output_tokens: 2,
+        },
+    );
+    assert_eq!(s.composer_mode(), ComposerMode::FollowUp);
+
+    let (tx, _rx) = oneshot::channel();
+    s.push_permission(PermReq {
+        summary: "run cargo test".to_string(),
+        responder: tx,
+    });
+    assert_eq!(s.composer_mode(), ComposerMode::Decision);
+}
+
+#[test]
+fn typing_dismisses_completion_and_recovery_receipts() {
+    let mut s = state();
+    apply_event(
+        &mut s,
+        KodeEvent::TaskFinished {
+            iterations: 1,
+            tool_calls: 0,
+            input_tokens: 5,
+            output_tokens: 2,
+        },
+    );
+    assert!(s.completion.is_some());
+    handle_key(
+        &mut s,
+        std::path::Path::new("."),
+        KeyCode::Char('x'),
+        KeyModifiers::NONE,
+        &None,
+    );
+    assert!(s.completion.is_none());
+
+    apply_event(
+        &mut s,
+        KodeEvent::AgentError {
+            message: "stopped".to_string(),
+        },
+    );
+    assert!(s.last_error.is_some());
+    handle_key(
+        &mut s,
+        std::path::Path::new("."),
+        KeyCode::Char('y'),
+        KeyModifiers::NONE,
+        &None,
+    );
+    assert!(s.last_error.is_none());
+}
+
+#[test]
+fn shortcut_and_attachment_sheets_are_keyboard_reachable() {
+    let mut s = state();
+    handle_key(
+        &mut s,
+        std::path::Path::new("."),
+        KeyCode::Char('?'),
+        KeyModifiers::NONE,
+        &None,
+    );
+    assert!(s.shortcuts_open);
+    handle_key(
+        &mut s,
+        std::path::Path::new("."),
+        KeyCode::Esc,
+        KeyModifiers::NONE,
+        &None,
+    );
+    assert!(!s.shortcuts_open);
+
+    s.add_paste(&"line\n".repeat(8));
+    handle_key(
+        &mut s,
+        std::path::Path::new("."),
+        KeyCode::Char('a'),
+        KeyModifiers::CONTROL,
+        &None,
+    );
+    assert!(s.attachments_open);
+    handle_key(
+        &mut s,
+        std::path::Path::new("."),
+        KeyCode::Esc,
+        KeyModifiers::NONE,
+        &None,
+    );
+    assert!(!s.attachments_open);
 }
 
 // -- knowledge band visibility ----------------------------------------
@@ -875,6 +1052,7 @@ fn knowledge_band_visible_true_when_a_source_has_data() {
         zindeks: vec!["src/foo.rs".to_string()],
         ..Default::default()
     });
+    s.knowledge_band_open = true;
     assert!(knowledge_band_visible(&s));
 }
 
@@ -1668,6 +1846,35 @@ fn apply_repo_state_sets_dirty_and_ledger_numstat() {
 }
 
 #[test]
+fn apply_repo_state_refreshes_completion_receipt_numstat() {
+    let mut s = state();
+    apply_event(
+        &mut s,
+        KodeEvent::TaskFinished {
+            iterations: 1,
+            tool_calls: 2,
+            input_tokens: 10,
+            output_tokens: 4,
+        },
+    );
+    apply_repo_state(
+        &mut s,
+        RepoState {
+            dirty: true,
+            numstat: vec![NumstatRow {
+                path: "src/workbench.rs".to_string(),
+                added: 12,
+                deleted: 3,
+            }],
+        },
+    );
+
+    let receipt = s.completion.as_ref().expect("completion receipt");
+    assert_eq!(receipt.numstat.len(), 1);
+    assert_eq!(receipt.numstat[0].path, "src/workbench.rs");
+}
+
+#[test]
 fn numstat_caption_none_when_empty_some_with_file_count() {
     assert_eq!(numstat_caption(&[]), None);
     let rows = vec![
@@ -1775,10 +1982,10 @@ fn knowledge_event_sets_ledger_why_from_first_zindeks_and_ingat() {
     );
 }
 
-// -- knowledge aperture ---------------------------------------------------
+// -- contextual evidence seam --------------------------------------------
 
 #[test]
-fn knowledge_event_with_data_opens_aperture() {
+fn knowledge_event_with_data_populates_context_receipt() {
     let mut s = state();
     apply_event(
         &mut s,
@@ -1790,12 +1997,14 @@ fn knowledge_event_with_data_opens_aperture() {
             budget_tokens: 16_000,
         },
     );
-    assert!(s.aperture.is_some());
-    assert!(!s.aperture.as_ref().unwrap().trigger_seen);
+    let lines = focus_surface_lines(&s);
+    assert_eq!(lines.len(), 1);
+    assert!(line_text(&lines[0]).contains("1 code facts"));
+    assert!(!s.knowledge_band_open);
 }
 
 #[test]
-fn knowledge_event_with_no_data_does_not_open_aperture() {
+fn knowledge_event_with_no_data_has_no_context_receipt() {
     let mut s = state();
     apply_event(
         &mut s,
@@ -1807,11 +2016,39 @@ fn knowledge_event_with_no_data_does_not_open_aperture() {
             budget_tokens: 16_000,
         },
     );
-    assert!(s.aperture.is_none());
+    assert!(focus_surface_lines(&s).is_empty());
 }
 
 #[test]
-fn knowledge_event_git_only_does_not_open_aperture() {
+fn expanded_idle_context_shows_real_evidence_rows() {
+    let mut s = state();
+    apply_event(
+        &mut s,
+        KodeEvent::Knowledge {
+            zindeks: vec!["src/context.rs".to_string()],
+            ingat: vec!["preserve provenance".to_string()],
+            git: vec![],
+            context_tokens: 100,
+            budget_tokens: 16_000,
+        },
+    );
+    s.knowledge_band_open = true;
+
+    let lines = focus_surface_lines(&s);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line_text(line).contains("src/context.rs"))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line_text(line).contains("preserve provenance"))
+    );
+}
+
+#[test]
+fn knowledge_event_git_only_has_truthful_context_receipt() {
     let mut s = state();
     apply_event(
         &mut s,
@@ -1823,8 +2060,9 @@ fn knowledge_event_git_only_does_not_open_aperture() {
             budget_tokens: 16_000,
         },
     );
-    assert!(s.aperture.is_none());
-    // The Band still gets the git fact — only the Aperture is gated.
+    assert_eq!(focus_surface_lines(&s).len(), 1);
+    assert!(line_text(&focus_surface_lines(&s)[0]).contains("1 git facts"));
+    // The receipt reports git evidence without implying an engine source.
     assert_eq!(
         s.knowledge.as_ref().unwrap().git,
         vec!["3 files changed".to_string()]
@@ -1832,8 +2070,9 @@ fn knowledge_event_git_only_does_not_open_aperture() {
 }
 
 #[test]
-fn model_token_after_knowledge_marks_aperture_trigger_seen() {
+fn model_token_after_knowledge_keeps_context_receipt_visible() {
     let mut s = state();
+    s.running = true;
     apply_event(
         &mut s,
         KodeEvent::Knowledge {
@@ -1845,12 +2084,18 @@ fn model_token_after_knowledge_marks_aperture_trigger_seen() {
         },
     );
     apply_event(&mut s, KodeEvent::ModelToken { text: "hi".into() });
-    assert!(s.aperture.as_ref().unwrap().trigger_seen);
+    assert!(s.running);
+    assert!(
+        focus_surface_lines(&s)
+            .iter()
+            .any(|line| line_text(line).contains("CONTEXT"))
+    );
 }
 
 #[test]
-fn tool_started_after_knowledge_marks_aperture_trigger_seen() {
+fn tool_started_after_knowledge_prioritizes_tool_surface() {
     let mut s = state();
+    s.running = true;
     apply_event(
         &mut s,
         KodeEvent::Knowledge {
@@ -1867,11 +2112,16 @@ fn tool_started_after_knowledge_marks_aperture_trigger_seen() {
             name: "read_file".into(),
         },
     );
-    assert!(s.aperture.as_ref().unwrap().trigger_seen);
+    assert_eq!(s.current_tool.as_deref(), Some("read_file"));
+    assert!(
+        focus_surface_lines(&s)
+            .iter()
+            .any(|line| line_text(line).contains("TOOL"))
+    );
 }
 
 #[test]
-fn start_new_task_clears_leftover_aperture() {
+fn start_new_task_collapses_expanded_evidence() {
     let mut s = state();
     apply_event(
         &mut s,
@@ -1883,34 +2133,39 @@ fn start_new_task_clears_leftover_aperture() {
             budget_tokens: 16_000,
         },
     );
-    assert!(s.aperture.is_some());
+    assert!(s.knowledge.is_some());
     s.start_new_task("next task", false);
-    assert!(s.aperture.is_none());
+    assert!(!s.knowledge_band_open);
 }
 
-// -- aperture_should_collapse (pure decision fn) -------------------------
+// -- low-frequency motion contract ---------------------------------------
 
 #[test]
-fn aperture_never_collapses_before_trigger_seen() {
-    let received = Instant::now();
-    let now = received + Duration::from_secs(5);
-    assert!(!aperture_should_collapse(received, now, false));
-}
-
-#[test]
-fn aperture_does_not_collapse_before_900ms_even_with_trigger() {
-    let received = Instant::now();
-    let now = received + Duration::from_millis(500);
-    assert!(!aperture_should_collapse(received, now, true));
+fn spinner_holds_frame_below_one_second() {
+    assert_eq!(
+        spinner_glyph(0, false, false),
+        spinner_glyph(500, false, false)
+    );
 }
 
 #[test]
-fn aperture_collapses_at_or_after_900ms_with_trigger() {
-    let received = Instant::now();
-    let now = received + Duration::from_millis(900);
-    assert!(aperture_should_collapse(received, now, true));
-    let later = received + Duration::from_secs(3);
-    assert!(aperture_should_collapse(received, later, true));
+fn run_map_pulse_holds_frame_below_one_second() {
+    assert_eq!(
+        ledger_pulse_glyph(0, true, false),
+        ledger_pulse_glyph(500, true, false)
+    );
+}
+
+#[test]
+fn run_map_pulse_changes_each_second_unless_reduced_motion() {
+    assert_ne!(
+        ledger_pulse_glyph(0, true, false),
+        ledger_pulse_glyph(1_000, true, false)
+    );
+    assert_eq!(
+        ledger_pulse_glyph(0, true, true),
+        ledger_pulse_glyph(1_000, true, true)
+    );
 }
 
 // -- gutter mapping (extended) --------------------------------------------
@@ -2005,13 +2260,13 @@ fn input_suffix_counts_when_knowledge_present() {
 
 #[test]
 fn multiline_input_height_grows_and_caps() {
-    assert_eq!(input_height(""), 2);
-    assert_eq!(input_height("one\ntwo"), 3);
-    assert_eq!(input_height("1\n2\n3\n4\n5\n6\n7"), 7);
+    assert_eq!(input_height(""), 4);
+    assert_eq!(input_height("one\ntwo"), 5);
+    assert_eq!(input_height("1\n2\n3\n4\n5\n6\n7"), 9);
 
     let mut s = state();
     s.add_paste("1\n2\n3\n4\n5\n6\n7\n8");
-    assert_eq!(composer_height(&s), 3);
+    assert_eq!(composer_height(&s), 5);
 }
 
 // -- breadcrumb model nudge -------------------------------------------
@@ -2023,13 +2278,13 @@ fn line_text(line: &Line) -> String {
 #[test]
 fn breadcrumb_line_nudges_when_model_unset() {
     let s = state_no_model();
-    assert!(line_text(&breadcrumb_line(&s)).contains("— /model"));
+    assert!(line_text(&breadcrumb_line(&s)).contains("BUILD · pick model"));
 }
 
 #[test]
 fn breadcrumb_line_omits_nudge_when_model_set() {
     let s = state();
-    assert!(!line_text(&breadcrumb_line(&s)).contains("— /model"));
+    assert!(!line_text(&breadcrumb_line(&s)).contains("pick model"));
 }
 
 fn state_no_model() -> AppState {
@@ -2070,17 +2325,17 @@ fn backtab_toggles_auto_mode_and_shared_flag() {
 #[test]
 fn breadcrumb_line_shows_auto_badge_only_when_on() {
     let mut s = state();
-    assert!(!line_text(&breadcrumb_line(&s)).contains("auto"));
+    assert!(!line_text(&breadcrumb_line(&s)).contains("AUTO"));
     s.auto_mode = true;
-    assert!(line_text(&breadcrumb_line(&s)).contains("· auto"));
+    assert!(line_text(&breadcrumb_line(&s)).contains("AUTO ·"));
 }
 
 #[test]
 fn breadcrumb_line_shows_plan_badge_only_when_on() {
     let mut s = state();
-    assert!(!line_text(&breadcrumb_line(&s)).contains("plan"));
+    assert!(!line_text(&breadcrumb_line(&s)).contains("PLAN"));
     s.plan_mode = true;
-    assert!(line_text(&breadcrumb_line(&s)).contains("· plan"));
+    assert!(line_text(&breadcrumb_line(&s)).contains("PLAN ·"));
 }
 
 #[tokio::test]
@@ -2162,9 +2417,11 @@ fn handle_slash_command_help_mentions_new_shortcuts() {
 
     handle_slash_command(&mut s, &dir, &mut cfg, &tx, SlashCommand::Help);
     assert!(s.transcript.iter().any(|l| l.text.contains("shift+tab")));
-    assert!(s.transcript.iter().any(|l| l.text.contains("ctrl+y")));
+    assert!(s.transcript.iter().any(|l| l.text.contains("Ctrl+Y")));
     assert!(s.transcript.iter().any(|l| l.text.contains("/copy")));
     assert!(s.transcript.iter().any(|l| l.text.contains("Ctrl+T")));
+    assert!(s.transcript.iter().any(|l| l.text.contains("Ctrl+A")));
+    assert!(s.transcript.iter().any(|l| l.text.contains("Run Map")));
 }
 
 // -- /resume picker ----------------------------------------------------
@@ -3001,6 +3258,47 @@ fn pasted_image_path_becomes_structured_attachment() {
     assert!(s.image_attachments.is_empty());
     let transcript = user_input_transcript_lines(&input);
     assert!(transcript[0].text.contains("screen.png"));
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn mixed_attachments_preserve_chronology_and_backspace_removes_latest() {
+    let dir = std::env::temp_dir().join(format!(
+        "kode-mixed-attachments-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("context.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+
+    let mut s = state();
+    s.add_paste(&"first\n".repeat(8));
+    s.add_image_path(&dir, "context.png").unwrap();
+    s.add_paste(&"last\n".repeat(8));
+
+    let kinds = s
+        .attachment_rows()
+        .into_iter()
+        .map(|(kind, _)| kind)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec![
+            AttachmentKind::Text,
+            AttachmentKind::Image,
+            AttachmentKind::Text
+        ]
+    );
+
+    assert!(s.remove_last_attachment());
+    assert_eq!(s.pasted_attachments.len(), 1);
+    assert_eq!(s.image_attachments.len(), 1);
+    assert!(s.remove_last_attachment());
+    assert!(s.image_attachments.is_empty());
 
     std::fs::remove_dir_all(dir).unwrap();
 }
