@@ -13,6 +13,8 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+#[cfg(any(windows, test))]
+use futures::Stream;
 use futures::StreamExt;
 use kode_context::git::RepoState;
 use kode_core::CancellationToken;
@@ -84,8 +86,10 @@ pub(crate) fn append_paste(state: &mut AppState, pasted: &str) {
     state.add_paste(pasted);
 }
 
-#[cfg(windows)]
-const WINDOWS_PASTE_IDLE: Duration = Duration::from_millis(12);
+#[cfg(any(windows, test))]
+pub(crate) const WINDOWS_PASTE_PROBE: Duration = Duration::from_millis(3);
+#[cfg(any(windows, test))]
+pub(crate) const WINDOWS_PASTE_IDLE: Duration = Duration::from_millis(12);
 
 /// Crossterm's native Windows input backend exposes clipboard paste as a burst
 /// of ordinary key events, including `Enter` for every newline. Collecting the
@@ -111,45 +115,75 @@ async fn next_terminal_event(
             Ok(event) => event,
             Err(error) => return Some(Err(error)),
         };
-        let mut batch = vec![first];
-        let can_start_paste = matches!(
-            batch.first(),
-            Some(Event::Key(key))
-                if key.kind == KeyEventKind::Press
-                    && match key.code {
-                        KeyCode::Char(_) | KeyCode::Tab => !key
-                            .modifiers
-                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT),
-                        KeyCode::Enter => true,
-                        _ => false,
-                    }
-        );
-        if !can_start_paste {
-            return Some(Ok(batch.pop().expect("batch contains the first event")));
-        }
-
-        loop {
-            match tokio::time::timeout(WINDOWS_PASTE_IDLE, events.next()).await {
-                Ok(Some(Ok(event))) => {
-                    let is_key_event = matches!(&event, Event::Key(_));
-                    batch.push(event);
-                    if !is_key_event {
-                        break;
-                    }
-                }
-                Ok(Some(Err(error))) => return Some(Err(error)),
-                Ok(None) | Err(_) => break,
-            }
-        }
-
-        if let Some(pasted) = windows_paste_text(&batch) {
-            return Some(Ok(Event::Paste(pasted)));
-        }
-
-        let first = batch.remove(0);
-        pending.extend(batch);
-        Some(Ok(first))
+        Some(coalesce_windows_terminal_event(first, events, pending).await)
     }
+}
+
+#[cfg(any(windows, test))]
+fn can_be_windows_paste_key(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(key)
+            if key.kind == KeyEventKind::Press
+                && match key.code {
+                    KeyCode::Char(_) | KeyCode::Tab => !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT),
+                    KeyCode::Enter => true,
+                    _ => false,
+                }
+    )
+}
+
+/// Probe briefly for a second printable key before paying the full paste idle
+/// window. Human typing normally has no second press within this probe, so the
+/// first character reaches the composer without the old 12 ms delay. Clipboard
+/// injection arrives as queued press events and still enters paste collection.
+#[cfg(any(windows, test))]
+pub(crate) async fn coalesce_windows_terminal_event<S>(
+    first: Event,
+    events: &mut S,
+    pending: &mut VecDeque<Event>,
+) -> std::io::Result<Event>
+where
+    S: Stream<Item = std::io::Result<Event>> + Unpin,
+{
+    if !can_be_windows_paste_key(&first) {
+        return Ok(first);
+    }
+
+    let second = match tokio::time::timeout(WINDOWS_PASTE_PROBE, events.next()).await {
+        Ok(Some(Ok(event))) => event,
+        Ok(Some(Err(error))) => return Err(error),
+        Ok(None) | Err(_) => return Ok(first),
+    };
+    if !can_be_windows_paste_key(&second) {
+        pending.push_back(second);
+        return Ok(first);
+    }
+
+    let mut batch = vec![first, second];
+    loop {
+        match tokio::time::timeout(WINDOWS_PASTE_IDLE, events.next()).await {
+            Ok(Some(Ok(event))) => {
+                let is_key_event = matches!(&event, Event::Key(_));
+                batch.push(event);
+                if !is_key_event {
+                    break;
+                }
+            }
+            Ok(Some(Err(error))) => return Err(error),
+            Ok(None) | Err(_) => break,
+        }
+    }
+
+    if let Some(pasted) = windows_paste_text(&batch) {
+        return Ok(Event::Paste(pasted));
+    }
+
+    let first = batch.remove(0);
+    pending.extend(batch);
+    Ok(first)
 }
 
 /// Recover a Windows clipboard burst as text. A real key press may be followed

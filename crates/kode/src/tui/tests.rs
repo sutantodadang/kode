@@ -1,5 +1,6 @@
 use super::*;
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -2670,6 +2671,26 @@ fn bracketed_paste_preserves_multiline_text_as_one_input_buffer() {
     assert!(s.pasted_attachments.is_empty());
 }
 
+#[tokio::test]
+async fn windows_lone_printable_key_returns_after_short_probe() {
+    assert!(WINDOWS_PASTE_PROBE < WINDOWS_PASTE_IDLE);
+
+    let first = Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    let mut later_events = futures::stream::pending::<std::io::Result<Event>>();
+    let mut pending = VecDeque::new();
+
+    let returned = tokio::time::timeout(
+        Duration::from_millis(10),
+        coalesce_windows_terminal_event(first.clone(), &mut later_events, &mut pending),
+    )
+    .await
+    .expect("normal typing must not wait for the paste idle window")
+    .expect("input stream should remain valid");
+
+    assert_eq!(returned, first);
+    assert!(pending.is_empty());
+}
+
 #[test]
 fn windows_multiline_key_burst_is_recovered_as_one_paste() {
     let events = vec![
@@ -2688,10 +2709,10 @@ fn windows_multiline_key_burst_is_recovered_as_one_paste() {
     assert_eq!(windows_paste_text(&events).as_deref(), Some("a\nb"));
 }
 
-#[test]
-fn windows_long_multiline_key_burst_becomes_compact_attachment() {
+#[tokio::test]
+async fn windows_long_multiline_key_burst_becomes_compact_attachment() {
     let pasted = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8";
-    let events = pasted
+    let mut events = pasted
         .chars()
         .map(|character| {
             let code = if character == '\n' {
@@ -2703,27 +2724,42 @@ fn windows_long_multiline_key_burst_becomes_compact_attachment() {
         })
         .collect::<Vec<_>>();
 
-    let recovered = windows_paste_text(&events).expect("multiline burst should be a paste");
+    let first = events.remove(0);
+    let mut later_events =
+        futures::stream::iter(events.into_iter().map(Ok::<Event, std::io::Error>));
+    let mut pending = VecDeque::new();
+    let recovered = coalesce_windows_terminal_event(first, &mut later_events, &mut pending)
+        .await
+        .expect("input stream should remain valid");
+    let Event::Paste(recovered) = recovered else {
+        panic!("multiline burst should be a paste");
+    };
     let mut s = state();
     append_paste(&mut s, &recovered);
 
+    assert!(pending.is_empty());
     assert!(s.input.is_empty());
     assert_eq!(s.pasted_attachments.len(), 1);
     assert_eq!(s.pasted_attachments[0].content, pasted);
 }
 
-#[test]
-fn windows_single_physical_key_is_not_misclassified_as_paste() {
-    let events = vec![
-        Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
-        Event::Key(KeyEvent::new_with_kind(
-            KeyCode::Char('a'),
-            KeyModifiers::NONE,
-            KeyEventKind::Release,
-        )),
-    ];
+#[tokio::test]
+async fn windows_single_physical_key_is_not_misclassified_as_paste() {
+    let first = Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    let release = Event::Key(KeyEvent::new_with_kind(
+        KeyCode::Char('a'),
+        KeyModifiers::NONE,
+        KeyEventKind::Release,
+    ));
+    let mut later_events = futures::stream::iter([Ok::<Event, std::io::Error>(release.clone())]);
+    let mut pending = VecDeque::new();
 
-    assert_eq!(windows_paste_text(&events), None);
+    let returned = coalesce_windows_terminal_event(first.clone(), &mut later_events, &mut pending)
+        .await
+        .expect("input stream should remain valid");
+
+    assert_eq!(returned, first);
+    assert_eq!(pending.pop_front(), Some(release));
 }
 
 #[test]
