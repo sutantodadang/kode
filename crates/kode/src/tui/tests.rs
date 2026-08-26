@@ -3004,6 +3004,46 @@ async fn windows_long_multiline_key_burst_becomes_compact_attachment() {
 }
 
 #[tokio::test]
+async fn windows_interleaved_key_releases_still_become_compact_attachment() {
+    let pasted = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8";
+    let mut events = pasted
+        .chars()
+        .flat_map(|character| {
+            let code = if character == '\n' {
+                KeyCode::Enter
+            } else {
+                KeyCode::Char(character)
+            };
+            [
+                Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new_with_kind(
+                    code,
+                    KeyModifiers::NONE,
+                    KeyEventKind::Release,
+                )),
+            ]
+        })
+        .collect::<Vec<_>>();
+
+    let first = events.remove(0);
+    let mut later_events =
+        futures::stream::iter(events.into_iter().map(Ok::<Event, std::io::Error>));
+    let mut pending = VecDeque::new();
+    let recovered = coalesce_windows_terminal_event(first, &mut later_events, &mut pending)
+        .await
+        .expect("input stream should remain valid");
+    let Event::Paste(recovered) = recovered else {
+        panic!("interleaved release events must not split a clipboard paste");
+    };
+
+    let mut s = state();
+    append_paste(&mut s, &recovered);
+    assert!(pending.is_empty());
+    assert_eq!(s.pasted_attachments.len(), 1);
+    assert_eq!(s.pasted_attachments[0].content, pasted);
+}
+
+#[tokio::test]
 async fn windows_single_physical_key_is_not_misclassified_as_paste() {
     let first = Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
     let release = Event::Key(KeyEvent::new_with_kind(

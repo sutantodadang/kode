@@ -151,6 +151,11 @@ fn can_be_windows_paste_key(event: &Event) -> bool {
     )
 }
 
+#[cfg(any(windows, test))]
+fn is_windows_key_release(event: &Event) -> bool {
+    matches!(event, Event::Key(key) if key.kind == KeyEventKind::Release)
+}
+
 /// Probe briefly for a second printable key before paying the full paste idle
 /// window. Human typing normally has no second press within this probe, so the
 /// first character reaches the composer without the old 12 ms delay. Clipboard
@@ -168,17 +173,28 @@ where
         return Ok(first);
     }
 
-    let second = match tokio::time::timeout(WINDOWS_PASTE_PROBE, events.next()).await {
-        Ok(Some(Ok(event))) => event,
-        Ok(Some(Err(error))) => return Err(error),
-        Ok(None) | Err(_) => return Ok(first),
+    let mut between = Vec::new();
+    let second = loop {
+        match tokio::time::timeout(WINDOWS_PASTE_PROBE, events.next()).await {
+            Ok(Some(Ok(event))) if is_windows_key_release(&event) => between.push(event),
+            Ok(Some(Ok(event))) => break Some(event),
+            Ok(Some(Err(error))) => return Err(error),
+            Ok(None) | Err(_) => break None,
+        }
+    };
+    let Some(second) = second else {
+        pending.extend(between);
+        return Ok(first);
     };
     if !can_be_windows_paste_key(&second) {
+        pending.extend(between);
         pending.push_back(second);
         return Ok(first);
     }
 
-    let mut batch = vec![first, second];
+    let mut batch = vec![first];
+    batch.extend(between);
+    batch.push(second);
     loop {
         match tokio::time::timeout(WINDOWS_PASTE_IDLE, events.next()).await {
             Ok(Some(Ok(event))) => {
