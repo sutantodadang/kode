@@ -9,6 +9,7 @@ const CONTEXT_TRUNCATED: &str = "\n[repository context truncated to fit context 
 const TASK_TRUNCATED: &str = "\n[user task truncated to fit context window]";
 const HISTORY_DROPPED: &str = "(older conversation dropped to fit context window)";
 const TOOL_ROUNDS_DROPPED: &str = "(older agent tool interactions dropped to fit context window)";
+const IMAGE_TOKEN_ESTIMATE: usize = 1600;
 
 /// Applies a conservative, provider-independent context-window budget.
 ///
@@ -127,7 +128,7 @@ impl PromptBudget {
             &mut prepared,
             tools,
             input_budget,
-            |message| matches!(message, Message::User(_)),
+            |message| matches!(message, Message::User(_) | Message::UserWithImages { .. }),
             TASK_TRUNCATED,
         );
 
@@ -160,6 +161,9 @@ fn estimate_request(messages: &[Message], tools: &[ToolSpec]) -> usize {
 fn estimate_message(message: &Message) -> usize {
     let content = match message {
         Message::System(content) | Message::User(content) => estimate_text(content),
+        Message::UserWithImages { content, images } => {
+            estimate_text(content) + images.len() * IMAGE_TOKEN_ESTIMATE
+        }
         Message::Assistant {
             content,
             tool_calls,
@@ -213,7 +217,7 @@ fn completed_tool_rounds(messages: &[Message]) -> Vec<(usize, usize)> {
 
 fn oldest_history_turn(messages: &[Message]) -> Option<(usize, usize)> {
     messages.windows(2).enumerate().find_map(|(index, pair)| {
-        if matches!(pair[0], Message::User(_))
+        if matches!(pair[0], Message::User(_) | Message::UserWithImages { .. })
             && matches!(pair[1], Message::Assistant { ref tool_calls, .. } if tool_calls.is_empty())
             && index + 2 < messages.len()
         {
@@ -249,6 +253,7 @@ fn shrink_matching_message(
         };
         let content = match message {
             Message::System(content) | Message::User(content) => content,
+            Message::UserWithImages { content, .. } => content,
             _ => break,
         };
         let current = estimate_text(content);

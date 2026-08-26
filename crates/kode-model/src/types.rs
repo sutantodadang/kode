@@ -1,9 +1,15 @@
 use std::ops::AddAssign;
 
+use kode_core::ImageAttachment;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
     System(String),
     User(String),
+    UserWithImages {
+        content: String,
+        images: Vec<ImageAttachment>,
+    },
     Assistant {
         content: String,
         tool_calls: Vec<ToolCall>,
@@ -12,6 +18,23 @@ pub enum Message {
         tool_call_id: String,
         content: String,
     },
+}
+
+impl Message {
+    pub fn user(input: kode_core::UserInput) -> Self {
+        if input.images.is_empty() {
+            Self::User(input.text)
+        } else {
+            Self::UserWithImages {
+                content: input.text,
+                images: input.images,
+            }
+        }
+    }
+}
+
+pub(crate) fn image_data_url(image: &ImageAttachment) -> String {
+    format!("data:{};base64,{}", image.media_type, image.data)
 }
 
 #[derive(Debug, Clone, PartialEq)]

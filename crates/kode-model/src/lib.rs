@@ -14,6 +14,7 @@ pub use anthropic::{AnthropicAuth, AnthropicModel};
 pub use antigravity::{AntigravityAuth, AntigravityModel};
 pub use codex::{CodexAuth, CodexModel};
 pub use error::{ModelError, Result};
+pub use kode_core::{ImageAttachment, UserInput};
 pub use mock::MockModel;
 pub use openai::{OpenAiModel, OpenAiOptions};
 pub use stream::{ResponseAccumulator, collect_response};

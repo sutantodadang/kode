@@ -514,6 +514,26 @@ fn build_body(model: &str, request: &ModelRequest) -> Value {
                     "content": [{"type": "input_text", "text": content}],
                 }));
             }
+            Message::UserWithImages { content, images } => {
+                let mut parts: Vec<Value> = images
+                    .iter()
+                    .map(|image| {
+                        serde_json::json!({
+                            "type": "input_image",
+                            "image_url": crate::types::image_data_url(image),
+                            "detail": "auto",
+                        })
+                    })
+                    .collect();
+                if !content.is_empty() {
+                    parts.push(serde_json::json!({"type": "input_text", "text": content}));
+                }
+                input.push(serde_json::json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": parts,
+                }));
+            }
             Message::Assistant {
                 content,
                 tool_calls,
@@ -695,6 +715,32 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn build_body_maps_image_attachment() {
+        let request = ModelRequest {
+            messages: vec![Message::UserWithImages {
+                content: "describe this".into(),
+                images: vec![kode_core::ImageAttachment {
+                    name: "pixel.png".into(),
+                    media_type: "image/png".into(),
+                    data: "AA==".into(),
+                    size_bytes: 1,
+                }],
+            }],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            effort: None,
+        };
+        let body = build_body("gpt-5-codex", &request);
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_image");
+        assert_eq!(
+            body["input"][0]["content"][0]["image_url"],
+            "data:image/png;base64,AA=="
+        );
+        assert_eq!(body["input"][0]["content"][1]["text"], "describe this");
+    }
 
     fn temp_file(name_hint: &str, contents: &str) -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);

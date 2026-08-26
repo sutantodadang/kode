@@ -38,6 +38,7 @@ kode auth login codex        # authenticate with a provider
 kode setup                   # install zindeks + Ingat, consent-gated
 kode                         # launch the TUI
 kode exec "explain the auth flow in this repo"   # one-shot agentic task
+kode exec --image screenshot.png "fix this UI bug" # attach an image
 kode --continue               # resume your last session
 ```
 

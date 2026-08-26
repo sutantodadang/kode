@@ -23,6 +23,8 @@ pub enum SlashCommand {
     Resume,
     /// `/plan` — toggles plan mode (session-only; see `AppState::plan_mode`).
     Plan,
+    /// `/image <path>` — attaches an image file to the next user turn.
+    Image(String),
     Help,
     /// `/name [args]` where `name` isn't a builtin. Resolved against
     /// discovered custom commands at handle time (not parse time) — an
@@ -39,7 +41,7 @@ pub enum SlashCommand {
 /// [`SLASH_COMMANDS`]. Custom commands never shadow these; discovery
 /// filters them out up front.
 pub const BUILTIN_COMMAND_NAMES: &[&str] = &[
-    "model", "effort", "provider", "copy", "resume", "plan", "help",
+    "model", "effort", "provider", "copy", "resume", "plan", "image", "help",
 ];
 
 /// The providers `/provider` accepts, in picker display order.
@@ -61,6 +63,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/provider", "pick provider"),
     ("/copy", "copy last response to clipboard"),
     ("/resume", "resume a previous session"),
+    ("/image", "attach PNG, JPEG, GIF, or WebP"),
     (
         "/plan",
         "toggle plan mode (plan first, then approve to run)",
@@ -119,6 +122,7 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "/copy" => SlashCommand::Copy,
         "/resume" => SlashCommand::Resume,
         "/plan" => SlashCommand::Plan,
+        "/image" => SlashCommand::Image(rest.to_string()),
         "/help" => SlashCommand::Help,
         other => {
             let name = other.trim_start_matches('/').to_lowercase();
@@ -543,13 +547,31 @@ pub(crate) fn handle_slash_command(
                 .transcript
                 .push(TranscriptLine::new(Gutter::Note, text));
         }
+        SlashCommand::Image(path) => {
+            if path.is_empty() {
+                state
+                    .transcript
+                    .push(TranscriptLine::new(Gutter::Note, "usage: /image <path>"));
+            } else {
+                match state.add_image_path(cwd, &path) {
+                    Ok(()) => state.transcript.push(TranscriptLine::new(
+                        Gutter::Note,
+                        "image attached to the next message",
+                    )),
+                    Err(err) => state.transcript.push(TranscriptLine::new(
+                        Gutter::Error,
+                        format!("image attachment failed: {err}"),
+                    )),
+                }
+            }
+        }
         SlashCommand::Help => {
             state.transcript.push(TranscriptLine::new(
                 Gutter::Note,
                 "commands: /model [name], /effort <minimal|low|medium|high|xhigh|max|ultra>, \
-                 /provider [name], /copy, /plan, /help · shift+tab toggles auto mode (tools run \
+                 /provider [name], /image <path>, /copy, /plan, /help · shift+tab toggles auto mode (tools run \
                  without asking) · shift+enter adds a newline · long paste becomes a compact \
-                 attachment · Enter during a run steers the active agent · ctrl+y copies the last response · Ctrl+T toggles select mode \
+                 attachment; paste or drag an image path to attach it · Enter during a run steers the active agent · ctrl+y copies the last response · Ctrl+T toggles select mode \
                  (releases mouse capture for native text selection) · Ctrl+K toggles the \
                  Knowledge Band, Ctrl+L opens the Ledger, Esc closes the Ledger or press Esc \
                  twice to interrupt a run · skills are auto-discovered; name one as $skill · \

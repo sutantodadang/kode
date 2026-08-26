@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use kode_agent::Agent;
 use kode_context::{CompiledContext, ContextCompiler, ContextRequest, ContextSource};
-use kode_core::CancellationToken;
 use kode_core::config::{AgentConfig, IngatConfig, KodeConfig, PermissionMode};
 use kode_core::event::{EventBus, KodeEvent, NoteSource, TaskStep};
+use kode_core::{CancellationToken, UserInput};
 use kode_intel::{CodeIntelligence, ZindeksAdapter};
 use kode_memory::{EngineeringMemory, IngatAdapter, RememberTool};
 use kode_model::{OpenAiModel, OpenAiOptions, Usage};
@@ -200,6 +200,7 @@ impl ModelFactory {
 /// shared by `kode exec` (headless) and the TUI — it communicates *only*
 /// through `events`, never via stdout/stderr directly.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub async fn run_task(
     task: &str,
     cwd: &Path,
@@ -209,7 +210,33 @@ pub async fn run_task(
     cancel: CancellationToken,
     history: &[kode_agent::HistoryTurn],
     plan_mode: bool,
-    mut steering: Option<mpsc::UnboundedReceiver<String>>,
+    steering: Option<mpsc::UnboundedReceiver<UserInput>>,
+) -> anyhow::Result<TaskOutcome> {
+    run_task_with_input(
+        &UserInput::text(task),
+        cwd,
+        config,
+        events,
+        handler,
+        cancel,
+        history,
+        plan_mode,
+        steering,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_task_with_input(
+    input: &UserInput,
+    cwd: &Path,
+    config: &KodeConfig,
+    events: EventBus,
+    handler: Arc<dyn PermissionHandler>,
+    cancel: CancellationToken,
+    history: &[kode_agent::HistoryTurn],
+    plan_mode: bool,
+    mut steering: Option<mpsc::UnboundedReceiver<UserInput>>,
 ) -> anyhow::Result<TaskOutcome> {
     let model = ModelFactory::create(config)?;
 
@@ -325,7 +352,7 @@ pub async fn run_task(
     let compiled = compiler
         .compile(
             &ContextRequest {
-                task: task.to_string(),
+                task: input.text.clone(),
                 working_set: vec![],
             },
             cwd,
@@ -360,7 +387,7 @@ pub async fn run_task(
 
     // The prompt actually sent to the exec turn below: the original `task`
     // unless plan mode swaps in the approved-plan-injected version.
-    let mut exec_task = task.to_string();
+    let mut exec_task = input.clone();
 
     if plan_mode {
         let plan_result = run_plan_phase(
@@ -369,7 +396,7 @@ pub async fn run_task(
             handler.clone(),
             &config.agent,
             effort.clone(),
-            task,
+            input,
             initial_context.as_deref(),
             kept_history,
             history_truncated,
@@ -450,11 +477,14 @@ pub async fn run_task(
             events.emit(KodeEvent::Note {
                 text: "verification failed — asking agent to fix".to_string(),
             });
-            let retry_task = format!(
-                "Verification failed after your previous changes. Fix the failures, then stop.\n\n{}\n\nOriginal task: {}",
-                report.render(),
-                task
-            );
+            let retry_task = UserInput {
+                text: format!(
+                    "Verification failed after your previous changes. Fix the failures, then stop.\n\n{}\n\nOriginal task: {}",
+                    report.render(),
+                    input.text
+                ),
+                images: input.images.clone(),
+            };
 
             // Repair must see the workspace produced by the first run, not
             // the pre-edit snapshot. Refresh code intelligence first (even
@@ -476,7 +506,7 @@ pub async fn run_task(
             let repair_context = compiler
                 .compile(
                     &ContextRequest {
-                        task: retry_task.clone(),
+                        task: retry_task.text.clone(),
                         working_set: vec![],
                     },
                     cwd,
@@ -578,7 +608,7 @@ pub async fn run_task(
 
 fn close_and_defer_steering(
     events: &EventBus,
-    steering: &mut Option<mpsc::UnboundedReceiver<String>>,
+    steering: &mut Option<mpsc::UnboundedReceiver<UserInput>>,
 ) {
     let Some(receiver) = steering.as_mut() else {
         return;
@@ -586,7 +616,7 @@ fn close_and_defer_steering(
     receiver.close();
     let mut messages = Vec::new();
     while let Ok(message) = receiver.try_recv() {
-        if !message.trim().is_empty() {
+        if !message.is_empty() {
             messages.push(message);
         }
     }
@@ -612,7 +642,7 @@ enum PlanOutcome {
     Approved {
         /// The exec-turn prompt: the approved plan text followed by the
         /// original task, per the "Follow this approved plan:" template.
-        effective_task: String,
+        effective_task: UserInput,
     },
     Rejected {
         outcome: kode_agent::AgentOutcome,
@@ -634,12 +664,12 @@ async fn run_plan_phase(
     handler: Arc<dyn PermissionHandler>,
     agent_cfg: &AgentConfig,
     effort: Option<String>,
-    task: &str,
+    task: &UserInput,
     context: Option<&str>,
     history: &[kode_agent::HistoryTurn],
     history_truncated: bool,
     ctx: &ToolContext,
-    steering: Option<&mut mpsc::UnboundedReceiver<String>>,
+    steering: Option<&mut mpsc::UnboundedReceiver<UserInput>>,
     skills: Option<Arc<SkillCatalog>>,
 ) -> anyhow::Result<PlanOutcome> {
     // No implementation tools are offered on this turn. `Deny` still permits
@@ -651,7 +681,10 @@ async fn run_plan_phase(
     let tools = ToolRuntime::new(registry, PermissionMode::Deny, handler.clone());
     let plan_agent = Agent::new(model, tools, events.clone(), agent_cfg).with_effort(effort);
 
-    let plan_prompt = format!("{task}\n\n{PLAN_INSTRUCTION}");
+    let plan_prompt = UserInput {
+        text: format!("{}\n\n{PLAN_INSTRUCTION}", task.text),
+        images: task.images.clone(),
+    };
     let outcome = plan_agent
         .run_with_context_and_steering(
             &plan_prompt,
@@ -667,7 +700,13 @@ async fn run_plan_phase(
     let approved = handler.confirm("execute this plan?").await;
     if approved {
         let plan_text = outcome.final_text.trim().to_string();
-        let effective_task = format!("Follow this approved plan:\n{plan_text}\n\nTask: {task}");
+        let effective_task = UserInput {
+            text: format!(
+                "Follow this approved plan:\n{plan_text}\n\nTask: {}",
+                task.text
+            ),
+            images: task.images.clone(),
+        };
         Ok(PlanOutcome::Approved { effective_task })
     } else {
         Ok(PlanOutcome::Rejected { outcome })
@@ -1008,16 +1047,16 @@ mod plan_phase_tests {
         let events = EventBus::new(8);
         let mut event_rx = events.subscribe();
         let (tx, rx) = mpsc::unbounded_channel();
-        tx.send("late direction".to_string()).unwrap();
+        tx.send(UserInput::text("late direction")).unwrap();
         let mut steering = Some(rx);
 
         close_and_defer_steering(&events, &mut steering);
 
-        assert!(tx.send("too late".to_string()).is_err());
+        assert!(tx.send(UserInput::text("too late")).is_err());
         assert!(matches!(
             event_rx.try_recv().unwrap(),
             KodeEvent::SteeringDeferred { messages }
-                if messages == vec!["late direction".to_string()]
+                if messages == vec![UserInput::text("late direction")]
         ));
     }
 
@@ -1063,7 +1102,7 @@ mod plan_phase_tests {
             Arc::new(AutoApprove),
             &AgentConfig::default(),
             None,
-            "add a widget",
+            &UserInput::text("add a widget"),
             None,
             &[],
             false,
@@ -1076,9 +1115,17 @@ mod plan_phase_tests {
 
         match outcome {
             PlanOutcome::Approved { effective_task } => {
-                assert!(effective_task.starts_with("Follow this approved plan:\n"));
-                assert!(effective_task.contains("1. do the thing\n2. verify it"));
-                assert!(effective_task.ends_with("\n\nTask: add a widget"));
+                assert!(
+                    effective_task
+                        .text
+                        .starts_with("Follow this approved plan:\n")
+                );
+                assert!(
+                    effective_task
+                        .text
+                        .contains("1. do the thing\n2. verify it")
+                );
+                assert!(effective_task.text.ends_with("\n\nTask: add a widget"));
             }
             PlanOutcome::Rejected { .. } => panic!("expected Approved"),
         }
@@ -1106,7 +1153,7 @@ mod plan_phase_tests {
             Arc::new(AutoDeny),
             &AgentConfig::default(),
             None,
-            "add a widget",
+            &UserInput::text("add a widget"),
             None,
             &[],
             false,

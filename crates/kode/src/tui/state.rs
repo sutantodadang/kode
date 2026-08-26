@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use kode_context::git::{NumstatRow, RepoState};
 use kode_core::event::TaskStep;
+use kode_core::{ImageAttachment, UserInput};
 use tokio::sync::oneshot;
 
 use super::markdown;
@@ -316,6 +317,9 @@ pub struct AppState {
     /// They are materialized into the submitted task only when Enter is
     /// pressed, so the composer stays compact.
     pub pasted_attachments: Vec<PastedAttachment>,
+    /// Image files attached to the next user turn. Binary data stays outside
+    /// the visible composer and is sent as structured provider content.
+    pub image_attachments: Vec<ImageAttachment>,
     pub(crate) next_paste_id: u64,
     pub picker: PickerState,
     /// Last received Knowledge digest; `None` until the first context
@@ -392,7 +396,7 @@ pub struct AppState {
     /// Active session file id; created lazily on first completed task.
     pub session_id: Option<String>,
     /// Task text of the in-flight run; consumed when TaskFinished arrives.
-    pub pending_task: Option<String>,
+    pub pending_task: Option<UserInput>,
     /// `[ui].reduced_motion` from config. When true: spinner glyph is
     /// static, knowledge-band evidence rows skip the dim→normal fade, and
     /// the Ledger active marker doesn't pulse. Streaming coalescing stays
@@ -448,6 +452,7 @@ impl AppState {
             follow: true,
             input: String::new(),
             pasted_attachments: Vec::new(),
+            image_attachments: Vec::new(),
             next_paste_id: 1,
             picker: PickerState::default(),
             knowledge: None,
@@ -497,8 +502,9 @@ impl AppState {
     /// the Decide-derivation flag, and any leftover Aperture from a prior
     /// run. Pure — the caller still owns emitting the actual task to the
     /// pipeline.
-    pub fn start_new_task(&mut self, task: &str, plan_mode: bool) {
-        self.ledger = LedgerState::new(ledger_objective(task), plan_mode);
+    pub fn start_new_task(&mut self, task: impl Into<UserInput>, plan_mode: bool) {
+        let task = task.into();
+        self.ledger = LedgerState::new(ledger_objective(&task.text), plan_mode);
         self.steering_active = true;
         self.decide_marked_this_run = false;
         self.aperture = None;
@@ -508,13 +514,14 @@ impl AppState {
         self.md_in_code_block = false;
         self.stream_pending.clear();
         self.stream_last_flush = None;
-        self.pending_task = Some(task.to_string());
+        self.pending_task = Some(task);
     }
 
-    pub(crate) fn append_pending_steering(&mut self, message: &str) {
+    pub(crate) fn append_pending_steering(&mut self, message: &UserInput) {
         if let Some(task) = self.pending_task.as_mut() {
-            task.push_str("\n\n[Steering]\n");
-            task.push_str(message);
+            let mut steering = message.clone();
+            steering.text = format!("[Steering]\n{}", steering.text);
+            task.append(steering);
         }
     }
 
@@ -524,7 +531,9 @@ impl AppState {
     }
 
     pub(crate) fn composer_has_content(&self) -> bool {
-        !self.input.trim().is_empty() || !self.pasted_attachments.is_empty()
+        !self.input.trim().is_empty()
+            || !self.pasted_attachments.is_empty()
+            || !self.image_attachments.is_empty()
     }
 
     pub(crate) fn add_paste(&mut self, pasted: &str) {
@@ -550,7 +559,25 @@ impl AppState {
         });
     }
 
-    pub(crate) fn take_composer_submission(&mut self) -> String {
+    pub(crate) fn add_image_path(&mut self, cwd: &Path, path: &str) -> anyhow::Result<()> {
+        if self.image_attachments.len() >= crate::attachments::MAX_IMAGES {
+            anyhow::bail!("too many images; maximum is 20 per turn");
+        }
+        let image = crate::attachments::load_image(cwd, path)?;
+        let total = self
+            .image_attachments
+            .iter()
+            .map(|image| image.size_bytes)
+            .sum::<usize>()
+            .saturating_add(image.size_bytes);
+        if total > crate::attachments::MAX_TOTAL_IMAGE_BYTES {
+            anyhow::bail!("images exceed the 20 MiB total limit");
+        }
+        self.image_attachments.push(image);
+        Ok(())
+    }
+
+    pub(crate) fn take_composer_submission(&mut self) -> UserInput {
         let mut task = std::mem::take(&mut self.input);
         for attachment in std::mem::take(&mut self.pasted_attachments) {
             if !task.is_empty() {
@@ -566,7 +593,10 @@ impl AppState {
             }
             task.push_str("</pasted_text>");
         }
-        task
+        UserInput {
+            text: task,
+            images: std::mem::take(&mut self.image_attachments),
+        }
     }
 }
 
@@ -625,6 +655,27 @@ pub(crate) fn user_transcript_lines(task: &str) -> Vec<TranscriptLine> {
     rendered
 }
 
+pub(crate) fn user_input_transcript_lines(input: &UserInput) -> Vec<TranscriptLine> {
+    let mut rendered = user_transcript_lines(&input.text);
+    for image in &input.images {
+        let gutter = if rendered.is_empty() {
+            Gutter::User
+        } else {
+            Gutter::None
+        };
+        rendered.push(TranscriptLine::new(
+            gutter,
+            format!(
+                "+ {} · {} · {:.1} KiB",
+                image.name,
+                image.media_type,
+                image.size_bytes as f64 / 1024.0
+            ),
+        ));
+    }
+    rendered
+}
+
 /// Persists the in-flight task (if any) as a completed `session::Turn`: both
 /// to disk (creating the session lazily on first write) and into
 /// `state.history` for the next task's model replay. No-op when
@@ -637,11 +688,12 @@ pub(crate) fn record_completed_turn(
     model: &str,
     tool_calls: u32,
 ) {
-    if let Some(task_text) = state.pending_task.take() {
+    if let Some(task_input) = state.pending_task.take() {
         let (_, ts) = crate::session::now_utc_stamp();
         let turn = crate::session::Turn {
             ts,
-            task: task_text,
+            task: task_input.text,
+            images: task_input.images,
             response: state.last_response.clone(),
             tool_calls,
         };
@@ -699,7 +751,12 @@ pub(crate) fn restore_session(state: &mut AppState, cwd: &Path, id: &str) -> boo
                 ));
             }
             for t in &turns {
-                state.transcript.extend(user_transcript_lines(&t.task));
+                state
+                    .transcript
+                    .extend(user_input_transcript_lines(&UserInput {
+                        text: t.task.clone(),
+                        images: t.images.clone(),
+                    }));
                 let mut in_code_block = false;
                 for line in t.response.lines() {
                     let rendered = markdown::render_line(line, &mut in_code_block);

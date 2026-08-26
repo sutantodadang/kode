@@ -560,6 +560,25 @@ fn build_body(model: &str, request: &ModelRequest) -> Value {
             Message::User(content) => {
                 messages.push(serde_json::json!({"role": "user", "content": content}));
             }
+            Message::UserWithImages { content, images } => {
+                let mut blocks: Vec<Value> = images
+                    .iter()
+                    .map(|image| {
+                        serde_json::json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": image.media_type,
+                                "data": image.data,
+                            },
+                        })
+                    })
+                    .collect();
+                if !content.is_empty() {
+                    blocks.push(serde_json::json!({"type": "text", "text": content}));
+                }
+                messages.push(serde_json::json!({"role": "user", "content": blocks}));
+            }
             Message::Assistant {
                 content,
                 tool_calls,
@@ -633,6 +652,32 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn build_body_maps_image_attachment() {
+        let request = ModelRequest {
+            messages: vec![Message::UserWithImages {
+                content: "describe this".into(),
+                images: vec![kode_core::ImageAttachment {
+                    name: "pixel.png".into(),
+                    media_type: "image/png".into(),
+                    data: "AA==".into(),
+                    size_bytes: 1,
+                }],
+            }],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            effort: None,
+        };
+        let body = build_body("claude-sonnet-5", &request);
+        let image = &body["messages"][0]["content"][0];
+        assert_eq!(image["type"], "image");
+        assert_eq!(image["source"]["type"], "base64");
+        assert_eq!(image["source"]["media_type"], "image/png");
+        assert_eq!(image["source"]["data"], "AA==");
+        assert_eq!(body["messages"][0]["content"][1]["text"], "describe this");
+    }
 
     fn temp_file(name_hint: &str, contents: &str) -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);

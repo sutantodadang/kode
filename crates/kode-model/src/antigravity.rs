@@ -693,6 +693,23 @@ fn build_body(model: &str, request: &ModelRequest, project: &str) -> Value {
             Message::User(s) => contents.push(serde_json::json!({
                 "role": "user", "parts": [{"text": s}]
             })),
+            Message::UserWithImages { content, images } => {
+                let mut parts: Vec<Value> = images
+                    .iter()
+                    .map(|image| {
+                        serde_json::json!({
+                            "inlineData": {
+                                "mimeType": image.media_type,
+                                "data": image.data,
+                            }
+                        })
+                    })
+                    .collect();
+                if !content.is_empty() {
+                    parts.push(serde_json::json!({"text": content}));
+                }
+                contents.push(serde_json::json!({"role": "user", "parts": parts}));
+            }
             Message::Assistant {
                 content,
                 tool_calls,
@@ -764,6 +781,30 @@ fn build_body(model: &str, request: &ModelRequest, project: &str) -> Value {
 mod tests {
     use super::*;
     use crate::types::{ToolCall, ToolSpec};
+
+    #[test]
+    fn build_body_maps_image_attachment() {
+        let request = ModelRequest {
+            messages: vec![Message::UserWithImages {
+                content: "describe this".into(),
+                images: vec![kode_core::ImageAttachment {
+                    name: "pixel.png".into(),
+                    media_type: "image/png".into(),
+                    data: "AA==".into(),
+                    size_bytes: 1,
+                }],
+            }],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            effort: None,
+        };
+        let body = build_body("gemini-3-flash", &request, "proj");
+        let parts = &body["request"]["contents"][0]["parts"];
+        assert_eq!(parts[0]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(parts[0]["inlineData"]["data"], "AA==");
+        assert_eq!(parts[1]["text"], "describe this");
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

@@ -771,9 +771,7 @@ pub(crate) fn input_height(input: &str) -> u16 {
 
 pub(crate) fn composer_height(state: &AppState) -> u16 {
     input_height(&state.input).saturating_add(
-        state
-            .pasted_attachments
-            .len()
+        (state.pasted_attachments.len() + state.image_attachments.len())
             .min(MAX_VISIBLE_PASTE_ATTACHMENTS) as u16,
     )
 }
@@ -808,6 +806,7 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
         && state.pending.is_empty()
         && !state.ledger_open
         && state.pasted_attachments.is_empty()
+        && state.image_attachments.is_empty()
         && state.input.starts_with('/')
     {
         let custom = custom_commands::discover(cwd, BUILTIN_COMMAND_NAMES);
@@ -1073,20 +1072,29 @@ pub(crate) fn draw_input(f: &mut ratatui::Frame, area: ratatui::layout::Rect, st
         ..area
     };
 
-    let attachment_count = state
+    let attachment_summaries: Vec<String> = state
         .pasted_attachments
+        .iter()
+        .map(PastedAttachment::summary)
+        .chain(state.image_attachments.iter().map(|image| {
+            format!(
+                "{} · {} · {:.1} KiB",
+                image.name,
+                image.media_type,
+                image.size_bytes as f64 / 1024.0
+            )
+        }))
+        .collect();
+    let attachment_count = attachment_summaries
         .len()
         .min(MAX_VISIBLE_PASTE_ATTACHMENTS)
         .min(composer_area.height as usize);
-    let attachment_start = state
-        .pasted_attachments
-        .len()
-        .saturating_sub(attachment_count);
+    let attachment_start = attachment_summaries.len().saturating_sub(attachment_count);
     let mut rendered = Vec::new();
-    for attachment in &state.pasted_attachments[attachment_start..] {
+    for summary in &attachment_summaries[attachment_start..] {
         rendered.push(Line::from(vec![
             Span::styled(" + ", Style::default().fg(theme::T)),
-            Span::styled(attachment.summary(), Style::default().fg(theme::MUTED)),
+            Span::styled(summary, Style::default().fg(theme::MUTED)),
         ]));
     }
 

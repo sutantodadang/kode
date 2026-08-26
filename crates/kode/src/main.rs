@@ -1,3 +1,4 @@
+mod attachments;
 mod auth;
 mod custom_commands;
 mod doctor;
@@ -60,6 +61,9 @@ enum Command {
         /// before running the task. Rejecting exits without running it.
         #[arg(long)]
         plan: bool,
+        /// Attach an image file to the task. May be repeated.
+        #[arg(long = "image", value_name = "PATH")]
+        images: Vec<std::path::PathBuf>,
     },
     /// List available models for the configured provider.
     Models,
@@ -174,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
             effort,
             continue_,
             plan,
+            images,
         }) => {
             if let Some(e) = &effort
                 && !kode_core::config::VALID_EFFORTS.contains(&e.as_str())
@@ -184,7 +189,7 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             let cwd = std::env::current_dir()?;
-            exec::run(&task, &cwd, token, model, effort, continue_, plan).await?;
+            exec::run(&task, &cwd, token, model, effort, continue_, plan, &images).await?;
         }
         Some(Command::Models) => {
             let cwd = std::env::current_dir()?;

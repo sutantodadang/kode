@@ -1,5 +1,7 @@
 use tokio::sync::broadcast;
 
+use crate::UserInput;
+
 /// One step of the Ledger view's task lifecycle. `Plan` only appears when
 /// plan mode is on — it's prepended ahead of the fixed Understand/Decide/
 /// Change/Verify steps and marked done once the user approves the plan (see
@@ -53,12 +55,12 @@ pub enum KodeEvent {
     /// A user steering message was accepted into the active agent's message
     /// history. The TUI uses this acknowledgment when persisting the turn.
     SteeringAccepted {
-        message: String,
+        message: UserInput,
     },
     /// Messages reached the pipeline after its last agent segment. They are
     /// returned to the TUI to run as the next turn instead of being dropped.
     SteeringDeferred {
-        messages: Vec<String>,
+        messages: Vec<UserInput>,
     },
     VerificationStarted,
     VerificationFinished {

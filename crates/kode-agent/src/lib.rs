@@ -8,6 +8,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use kode_core::config::AgentConfig;
 use kode_core::event::{EventBus, KodeEvent};
+use kode_core::{ImageAttachment, UserInput};
 use kode_model::{Message, Model, ModelRequest, ResponseAccumulator, StreamEvent, Usage};
 use kode_tools::registry::ToolRuntime;
 use kode_tools::{RequiredPermission, ToolContext, ToolError};
@@ -109,6 +110,7 @@ pub struct AgentOutcome {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistoryTurn {
     pub task: String,
+    pub images: Vec<ImageAttachment>,
     pub response: String,
 }
 
@@ -121,7 +123,7 @@ pub fn select_history(turns: &[HistoryTurn], budget_tokens: usize) -> (&[History
     let mut used = 0usize;
     while start > 0 {
         let t = &turns[start - 1];
-        let cost = (t.task.len() + t.response.len()) / 4;
+        let cost = (t.task.len() + t.response.len()) / 4 + t.images.len() * 1600;
         if used + cost > budget_tokens && start != turns.len() {
             break;
         }
@@ -179,7 +181,8 @@ impl Agent {
         truncated: bool,
         ctx: &ToolContext,
     ) -> Result<AgentOutcome> {
-        self.run_with_context_and_steering(task, context, history, truncated, ctx, None)
+        let task = UserInput::text(task);
+        self.run_with_context_and_steering(&task, context, history, truncated, ctx, None)
             .await
     }
 
@@ -188,12 +191,12 @@ impl Agent {
     /// model/tool boundaries; it never starts a concurrent agent.
     pub async fn run_with_context_and_steering(
         &self,
-        task: &str,
+        task: &UserInput,
         context: Option<&str>,
         history: &[HistoryTurn],
         truncated: bool,
         ctx: &ToolContext,
-        mut steering: Option<&mut mpsc::UnboundedReceiver<String>>,
+        mut steering: Option<&mut mpsc::UnboundedReceiver<UserInput>>,
     ) -> Result<AgentOutcome> {
         self.events.emit(KodeEvent::AgentStarted);
 
@@ -209,13 +212,16 @@ impl Agent {
             ));
         }
         for turn in history {
-            messages.push(Message::User(turn.task.clone()));
+            messages.push(Message::user(UserInput {
+                text: turn.task.clone(),
+                images: turn.images.clone(),
+            }));
             messages.push(Message::Assistant {
                 content: turn.response.clone(),
                 tool_calls: vec![],
             });
         }
-        messages.push(Message::User(task.to_string()));
+        messages.push(Message::user(task.clone()));
 
         let mut usage = Usage::default();
         let mut total_tool_calls: u32 = 0;
@@ -231,11 +237,11 @@ impl Agent {
 
             if steering_open && let Some(receiver) = steering.as_deref_mut() {
                 while let Ok(message) = receiver.try_recv() {
-                    if !message.trim().is_empty() {
+                    if !message.is_empty() {
                         self.events.emit(KodeEvent::SteeringAccepted {
                             message: message.clone(),
                         });
-                        messages.push(Message::User(message));
+                        messages.push(Message::user(message));
                     }
                 }
             }
@@ -261,10 +267,10 @@ impl Agent {
                     if steering_open {
                         match steering.as_deref_mut() {
                             Some(receiver) => receiver.recv().await,
-                            None => std::future::pending::<Option<String>>().await,
+                            None => std::future::pending::<Option<UserInput>>().await,
                         }
                     } else {
-                        std::future::pending::<Option<String>>().await
+                        std::future::pending::<Option<UserInput>>().await
                     }
                 };
                 tokio::select! {
@@ -274,7 +280,7 @@ impl Agent {
                     }
                     message = steer => {
                         match message {
-                            Some(message) if !message.trim().is_empty() => {
+                            Some(message) if !message.is_empty() => {
                                 self.events.emit(KodeEvent::SteeringAccepted {
                                     message: message.clone(),
                                 });
@@ -301,7 +307,7 @@ impl Agent {
 
             if steering_open && let Some(receiver) = steering.as_deref_mut() {
                 while let Ok(message) = receiver.try_recv() {
-                    if !message.trim().is_empty() {
+                    if !message.is_empty() {
                         self.events.emit(KodeEvent::SteeringAccepted {
                             message: message.clone(),
                         });
@@ -318,7 +324,7 @@ impl Agent {
                         content: response.content,
                         tool_calls: vec![],
                     });
-                    messages.extend(steers_after_response.into_iter().map(Message::User));
+                    messages.extend(steers_after_response.into_iter().map(Message::user));
                     continue;
                 }
                 self.events.emit(KodeEvent::AgentFinished);
@@ -405,7 +411,7 @@ impl Agent {
                 }
             }
 
-            messages.extend(steers_after_response.into_iter().map(Message::User));
+            messages.extend(steers_after_response.into_iter().map(Message::user));
         }
 
         Err(AgentError::IterationLimit(self.max_iterations))
@@ -553,8 +559,9 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let dir = temp_dir();
         let tool_ctx = ctx(dir);
+        let original = UserInput::text("original");
         let run = agent.run_with_context_and_steering(
-            "original",
+            &original,
             None,
             &[],
             false,
@@ -563,7 +570,7 @@ mod tests {
         );
         let send = async move {
             tokio::time::sleep(Duration::from_millis(5)).await;
-            tx.send("new direction".to_string()).unwrap();
+            tx.send(UserInput::text("new direction")).unwrap();
         };
 
         let (outcome, ()) = tokio::join!(run, send);
@@ -1002,10 +1009,12 @@ mod tests {
         let turns = vec![
             HistoryTurn {
                 task: "a".into(),
+                images: Vec::new(),
                 response: "b".into(),
             },
             HistoryTurn {
                 task: "c".into(),
+                images: Vec::new(),
                 response: "d".into(),
             },
         ];
@@ -1020,10 +1029,12 @@ mod tests {
         let turns = vec![
             HistoryTurn {
                 task: big.clone(),
+                images: Vec::new(),
                 response: big.clone(),
             },
             HistoryTurn {
                 task: "new".into(),
+                images: Vec::new(),
                 response: "answer".into(),
             },
         ];
@@ -1038,6 +1049,7 @@ mod tests {
         let big = "x".repeat(40_000);
         let turns = vec![HistoryTurn {
             task: big.clone(),
+            images: Vec::new(),
             response: big,
         }];
         let (kept, truncated) = select_history(&turns, 100);
@@ -1075,6 +1087,7 @@ mod tests {
 
         let history = vec![HistoryTurn {
             task: "t1".into(),
+            images: Vec::new(),
             response: "r1".into(),
         }];
 

@@ -82,6 +82,7 @@ Run an agentic task against the configured model, non-interactively.
 | `--effort <EFFORT>` | Override reasoning effort for this run only. One of: `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`. |
 | `-c`, `--continue` | Send prior session turns as history and append this task to that session, instead of starting fresh. |
 | `--plan` | Plan first: the model produces a numbered plan (no tools) and Kode asks `execute this plan? [y/N]` before running the task. Answering `N` exits without running it. |
+| `--image <PATH>` | Attach a PNG, JPEG, GIF, or WebP image. Repeat the flag to attach more than one image. |
 
 Examples:
 
@@ -90,6 +91,8 @@ kode exec "add a doc comment to the config loader"
 kode exec --model gpt-5.6-sol --effort high "refactor the auth module for testability"
 kode exec -c "now add tests for that refactor"
 kode exec --plan "add pagination to the search endpoint"
+kode exec --image screenshot.png "fix the layout shown here"
+kode exec --image before.png --image after.png "compare these screens"
 ```
 
 `TASK` may also be a custom slash command (`/name [args]`) — see [howto-custom-commands.md](./howto-custom-commands.md). It's expanded from its `.md` template before the task runs; an unrecognized `/name` fails with an error listing the commands discovered in `.kode/commands/` and `~/.kode/commands/`.
@@ -185,10 +188,13 @@ Available inside the interactive `kode` TUI, with a live hint menu as you type `
 | `/provider` | Switch the active provider. |
 | `/copy` | Copy the last response or selection. |
 | `/resume` | Open a picker over sessions in `.kode/sessions/` and resume one. |
+| `/image <path>` | Attach a PNG, JPEG, GIF, or WebP image to the next message. You can also paste or drag an image path into the composer. |
 | `/help` | Show available commands. |
 | `/name [args]` | Custom command — expands the `.kode/commands/name.md` or `~/.kode/commands/name.md` template and submits it as a task. See [howto-custom-commands.md](./howto-custom-commands.md). |
 
 The breadcrumb at the top of the TUI shows the current provider/model/effort and a context meter (`ctx X/Yk`), which tracks the knowledge-context budget (`[agent] context_budget_tokens`), not the model's context window.
+
+Images are validated by file content, shown as compact composer attachments, sent to the provider as native multimodal input, and retained when a session is resumed. Each image is limited to 7 MiB; a turn may contain up to 20 images and 20 MiB total.
 
 ## Related
 

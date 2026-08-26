@@ -2209,6 +2209,7 @@ fn handle_slash_command_resume_with_sessions_opens_picker() {
         &crate::session::Turn {
             ts: "2026-08-17T00:00:00Z".to_string(),
             task: "fix the bug".to_string(),
+            images: Vec::new(),
             response: "done".to_string(),
             tool_calls: 1,
         },
@@ -2446,6 +2447,7 @@ fn restore_session_replays_transcript_and_history() {
         &crate::session::Turn {
             ts: "2026-08-17T00:00:00Z".to_string(),
             task: "first task".to_string(),
+            images: Vec::new(),
             response: "first answer".to_string(),
             tool_calls: 1,
         },
@@ -2457,6 +2459,7 @@ fn restore_session_replays_transcript_and_history() {
         &crate::session::Turn {
             ts: "2026-08-17T00:01:00Z".to_string(),
             task: "second task".to_string(),
+            images: Vec::new(),
             response: "second answer".to_string(),
             tool_calls: 0,
         },
@@ -2838,7 +2841,7 @@ fn multiline_user_transcript_uses_one_user_anchor() {
 fn running_input_routes_to_active_steering_channel() {
     let mut s = state();
     s.steering_active = true;
-    s.pending_task = Some("original".to_string());
+    s.pending_task = Some("original".into());
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut queued = None;
 
@@ -2849,14 +2852,17 @@ fn running_input_routes_to_active_steering_channel() {
         "change direction".to_string(),
     );
 
-    assert_eq!(rx.try_recv().unwrap(), "change direction");
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        kode_core::UserInput::text("change direction")
+    );
     assert!(queued.is_none());
     assert_eq!(s.pending_task.as_deref(), Some("original"));
 
     apply_event(
         &mut s,
         KodeEvent::SteeringAccepted {
-            message: "change direction".to_string(),
+            message: "change direction".into(),
         },
     );
     assert_eq!(
@@ -2960,4 +2966,41 @@ fn slash_hint_lines_marks_selected_row() {
     let lines = slash_hint_lines(&items, 1);
     assert!(!lines[0].spans[0].content.contains('›'));
     assert!(lines[1].spans[0].content.contains('›'));
+}
+
+#[test]
+fn parse_slash_command_image_path() {
+    assert_eq!(
+        parse_slash_command(r#"/image "C:\shots\bug.png""#),
+        Some(SlashCommand::Image(r#""C:\shots\bug.png""#.to_string()))
+    );
+}
+
+#[test]
+fn pasted_image_path_becomes_structured_attachment() {
+    let dir = std::env::temp_dir().join(format!(
+        "kode-image-paste-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("screen.png");
+    std::fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
+
+    let mut s = state();
+    append_paste_at(&mut s, &dir, "screen.png");
+    assert!(s.input.is_empty());
+    assert_eq!(s.image_attachments.len(), 1);
+    assert_eq!(s.image_attachments[0].media_type, "image/png");
+
+    let input = s.take_composer_submission();
+    assert_eq!(input.images.len(), 1);
+    assert!(s.image_attachments.is_empty());
+    let transcript = user_input_transcript_lines(&input);
+    assert!(transcript[0].text.contains("screen.png"));
+
+    std::fs::remove_dir_all(dir).unwrap();
 }

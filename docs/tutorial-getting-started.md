@@ -89,6 +89,8 @@ kode exec "add a doc comment to the config loader"
 
 Add `--model` or `--effort minimal|low|medium|high|xhigh|max|ultra` to override the configured model or reasoning depth for that one run. Add `-c`/`--continue` to append the task to your latest session instead of starting fresh.
 
+To include a screenshot, use `kode exec --image screenshot.png "explain this error"`. In the TUI, run `/image <path>` or paste/drag the image path into the composer; the image appears as a compact attachment.
+
 ## What you built
 
 You installed Kode, authenticated against a real provider, installed its engines, confirmed health with `doctor`, and ran a task both interactively and headlessly. Kode now has a working credential store, a working code graph, and a working memory service behind it.

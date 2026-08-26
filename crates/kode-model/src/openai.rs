@@ -296,6 +296,19 @@ fn message_to_wire(message: &Message) -> serde_json::Value {
     match message {
         Message::System(content) => serde_json::json!({"role": "system", "content": content}),
         Message::User(content) => serde_json::json!({"role": "user", "content": content}),
+        Message::UserWithImages { content, images } => {
+            let mut parts = Vec::new();
+            if !content.is_empty() {
+                parts.push(serde_json::json!({"type": "text", "text": content}));
+            }
+            parts.extend(images.iter().map(|image| {
+                serde_json::json!({
+                    "type": "image_url",
+                    "image_url": {"url": crate::types::image_data_url(image)},
+                })
+            }));
+            serde_json::json!({"role": "user", "content": parts})
+        }
         Message::Assistant {
             content,
             tool_calls,
@@ -334,6 +347,32 @@ fn message_to_wire(message: &Message) -> serde_json::Value {
 mod tests {
     use super::*;
     use crate::types::{ToolCall, ToolSpec};
+
+    #[test]
+    fn build_body_maps_image_attachment() {
+        let request = ModelRequest {
+            messages: vec![Message::UserWithImages {
+                content: "describe this".into(),
+                images: vec![kode_core::ImageAttachment {
+                    name: "pixel.png".into(),
+                    media_type: "image/png".into(),
+                    data: "AA==".into(),
+                    size_bytes: 1,
+                }],
+            }],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            effort: None,
+        };
+        let body = build_body("gpt-4o", &request);
+        assert_eq!(body["messages"][0]["content"][0]["text"], "describe this");
+        assert_eq!(body["messages"][0]["content"][1]["type"], "image_url");
+        assert_eq!(
+            body["messages"][0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,AA=="
+        );
+    }
 
     #[test]
     fn build_body_full_round_trip() {

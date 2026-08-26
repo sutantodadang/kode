@@ -32,6 +32,7 @@ impl PermissionHandler for StdinPermission {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     task: &str,
     cwd: &Path,
@@ -40,6 +41,7 @@ pub async fn run(
     effort_override: Option<String>,
     continue_session: bool,
     plan_mode: bool,
+    image_paths: &[std::path::PathBuf],
 ) -> anyhow::Result<()> {
     let mut config = KodeConfig::load(cwd)?;
     if let Some(model) = model_override {
@@ -70,6 +72,22 @@ pub async fn run(
         task
     };
 
+    if image_paths.len() > crate::attachments::MAX_IMAGES {
+        anyhow::bail!("too many images; maximum is 20 per turn");
+    }
+    let images = image_paths
+        .iter()
+        .map(|path| crate::attachments::load_image(cwd, &path.to_string_lossy()))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let total_image_bytes = images.iter().map(|image| image.size_bytes).sum::<usize>();
+    if total_image_bytes > crate::attachments::MAX_TOTAL_IMAGE_BYTES {
+        anyhow::bail!("images exceed the 20 MiB total limit");
+    }
+    let input = kode_core::UserInput {
+        text: task.to_string(),
+        images,
+    };
+
     let session_id = if continue_session {
         session::latest(cwd)
     } else {
@@ -87,6 +105,7 @@ pub async fn run(
                         .into_iter()
                         .map(|t| kode_agent::HistoryTurn {
                             task: t.task,
+                            images: t.images,
                             response: t.response,
                         })
                         .collect();
@@ -173,8 +192,8 @@ pub async fn run(
         (response_buf, final_tool_calls)
     });
 
-    let result = pipeline::run_task(
-        task,
+    let result = pipeline::run_task_with_input(
+        &input,
         cwd,
         &config,
         events,
@@ -198,7 +217,8 @@ pub async fn run(
             let (_, ts) = session::now_utc_stamp();
             let turn = session::Turn {
                 ts,
-                task: task.to_string(),
+                task: input.text.clone(),
+                images: input.images.clone(),
                 response: final_text,
                 tool_calls,
             };

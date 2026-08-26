@@ -6,6 +6,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use kode_core::ImageAttachment;
 use serde::{Deserialize, Serialize};
 
 /// One completed conversation turn (task in, final answer out).
@@ -13,6 +14,8 @@ use serde::{Deserialize, Serialize};
 pub struct Turn {
     pub ts: String,
     pub task: String,
+    #[serde(default)]
+    pub images: Vec<ImageAttachment>,
     pub response: String,
     pub tool_calls: u32,
 }
@@ -180,6 +183,7 @@ mod tests {
         Turn {
             ts: "2026-08-17T00:00:00Z".to_string(),
             task: task.to_string(),
+            images: Vec::new(),
             response: format!("answer to {task}"),
             tool_calls: 1,
         }
@@ -196,6 +200,23 @@ mod tests {
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].task, "t1");
         assert_eq!(turns[1].response, "answer to t2");
+    }
+
+    #[test]
+    fn image_attachments_round_trip_with_session() {
+        let cwd = temp_cwd();
+        let id = create(&cwd, "codex", "gpt-5.6-sol").unwrap();
+        let mut saved = turn("inspect screenshot");
+        saved.images.push(ImageAttachment {
+            name: "screen.png".into(),
+            media_type: "image/png".into(),
+            data: "iVBORw0KGgo=".into(),
+            size_bytes: 8,
+        });
+        append_turn(&cwd, &id, &saved).unwrap();
+        let (turns, corrupt) = load(&cwd, &id).unwrap();
+        assert_eq!(corrupt, 0);
+        assert_eq!(turns[0].images, saved.images);
     }
 
     #[test]

@@ -17,9 +17,9 @@ use crossterm::terminal::{
 use futures::Stream;
 use futures::StreamExt;
 use kode_context::git::RepoState;
-use kode_core::CancellationToken;
 use kode_core::config::{KodeConfig, PermissionMode};
 use kode_core::event::{EventBus, KodeEvent};
+use kode_core::{CancellationToken, UserInput};
 use kode_memory::EngineeringMemory;
 use kode_tools::permission::PermissionHandler;
 use ratatui::Terminal;
@@ -82,8 +82,23 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub(crate) fn append_paste(state: &mut AppState, pasted: &str) {
+pub(crate) fn append_paste_at(state: &mut AppState, cwd: &Path, pasted: &str) {
+    if !pasted.contains(['\r', '\n']) && crate::attachments::looks_like_image_path(pasted) {
+        if let Err(err) = state.add_image_path(cwd, pasted) {
+            state.transcript.push(TranscriptLine::new(
+                Gutter::Note,
+                format!("image attachment failed: {err}"),
+            ));
+        }
+        return;
+    }
     state.add_paste(pasted);
+}
+
+#[cfg(test)]
+pub(crate) fn append_paste(state: &mut AppState, pasted: &str) {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    append_paste_at(state, &cwd, pasted);
 }
 
 #[cfg(any(windows, test))]
@@ -273,19 +288,23 @@ pub(crate) fn spawn_git_poll(cwd: std::path::PathBuf, tx: mpsc::UnboundedSender<
 /// cancellation token and steering sender for the active run.
 pub(crate) struct SubmittedTask {
     pub cancel: CancellationToken,
-    pub steering: mpsc::UnboundedSender<String>,
+    pub steering: mpsc::UnboundedSender<UserInput>,
 }
 
-pub(crate) fn push_user_transcript(state: &mut AppState, message: &str) {
-    state.transcript.extend(user_transcript_lines(message));
+pub(crate) fn push_user_transcript(state: &mut AppState, message: impl Into<UserInput>) {
+    let message = message.into();
+    state
+        .transcript
+        .extend(user_input_transcript_lines(&message));
 }
 
 pub(crate) fn route_running_input(
     state: &mut AppState,
-    steering_tx: Option<&mpsc::UnboundedSender<String>>,
-    queued_followup: &mut Option<String>,
-    message: String,
+    steering_tx: Option<&mpsc::UnboundedSender<UserInput>>,
+    queued_followup: &mut Option<UserInput>,
+    message: impl Into<UserInput>,
 ) {
+    let message = message.into();
     flush_model_stream(state);
     push_user_transcript(state, &message);
     let sent =
@@ -295,10 +314,7 @@ pub(crate) fn route_running_input(
     }
 
     match queued_followup.as_mut() {
-        Some(queued) => {
-            queued.push_str("\n\n");
-            queued.push_str(&message);
-        }
+        Some(queued) => queued.append(message),
         None => *queued_followup = Some(message),
     }
     state.transcript.push(TranscriptLine::new(
@@ -315,11 +331,11 @@ pub(crate) fn submit_task(
     cancel: &CancellationToken,
     events: &EventBus,
     handler: &Arc<dyn PermissionHandler>,
-    task: String,
+    task: UserInput,
     echo_user: bool,
 ) -> SubmittedTask {
     let plan_mode = state.plan_mode;
-    state.start_new_task(&task, plan_mode);
+    state.start_new_task(task.clone(), plan_mode);
     if echo_user {
         push_user_transcript(state, &task);
     }
@@ -342,12 +358,13 @@ pub(crate) fn submit_task(
         .iter()
         .map(|t| kode_agent::HistoryTurn {
             task: t.task.clone(),
+            images: t.images.clone(),
             response: t.response.clone(),
         })
         .collect();
     let task_child = child.clone();
     tokio::spawn(async move {
-        if let Err(err) = pipeline::run_task(
+        if let Err(err) = pipeline::run_task_with_input(
             &task,
             &task_cwd,
             &task_config,
@@ -457,8 +474,8 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
     let mut key_events = EventStream::new();
     let mut pending_terminal_events = VecDeque::new();
     let mut current_cancel: Option<CancellationToken> = None;
-    let mut current_steering: Option<mpsc::UnboundedSender<String>> = None;
-    let mut queued_followup: Option<String> = None;
+    let mut current_steering: Option<mpsc::UnboundedSender<UserInput>> = None;
+    let mut queued_followup: Option<UserInput> = None;
     let mut aperture_tick = tokio::time::interval(Duration::from_millis(100));
     // Tracks whether the terminal currently has mouse capture enabled, so
     // Ctrl+T (`state.select_mode`) is synced to the real terminal mode at
@@ -536,30 +553,37 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                         steering,
                                     );
                                 } else {
-                                    let had_attachments = !state.pasted_attachments.is_empty();
+                                    let had_attachments = !state.pasted_attachments.is_empty()
+                                        || !state.image_attachments.is_empty();
                                     let mut input = state.take_composer_submission();
                                     let custom = custom_commands::discover(cwd, BUILTIN_COMMAND_NAMES);
                                     let hints = if had_attachments {
                                         Vec::new()
                                     } else {
-                                        slash_hint_items(&input, &custom)
+                                        slash_hint_items(&input.text, &custom)
                                     };
                                     if !hints.is_empty() {
                                         // Enter on a hint row completes to the highlighted command.
-                                        input = hints[state.slash_selected.min(hints.len() - 1)].0.clone();
+                                        input.text = hints[state.slash_selected.min(hints.len() - 1)].0.clone();
                                         state.slash_selected = 0;
                                     }
                                     let command = if had_attachments {
                                         None
                                     } else {
-                                        parse_slash_command(&input)
+                                        parse_slash_command(&input.text)
                                     };
                                     if let Some(cmd) = command {
                                         if let Some(expanded) =
                                             handle_slash_command(&mut state, cwd, &mut config, &picker_tx, cmd)
                                         {
                                             let submitted = submit_task(
-                                                &mut state, cwd, &config, &cancel, &events, &handler, expanded,
+                                                &mut state,
+                                                cwd,
+                                                &config,
+                                                &cancel,
+                                                &events,
+                                                &handler,
+                                                UserInput::text(expanded),
                                                 true,
                                             );
                                             current_cancel = Some(submitted.cancel);
@@ -583,7 +607,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                     }
                     Some(Ok(Event::Paste(pasted))) => {
                         if !state.picker.open {
-                            append_paste(&mut state, &pasted);
+                            append_paste_at(&mut state, cwd, &pasted);
                         }
                     }
                     Some(Ok(Event::Mouse(mouse))) => {
@@ -612,10 +636,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                         if let Some(messages) = deferred_steering {
                             for message in messages {
                                 match queued_followup.as_mut() {
-                                    Some(queued) => {
-                                        queued.push_str("\n\n");
-                                        queued.push_str(&message);
-                                    }
+                                    Some(queued) => queued.append(message),
                                     None => queued_followup = Some(message),
                                 }
                             }
@@ -792,6 +813,7 @@ pub(crate) fn handle_key(
     let hint_count = if state.pending.is_empty()
         && !state.picker.open
         && state.pasted_attachments.is_empty()
+        && state.image_attachments.is_empty()
         && state.input.starts_with('/')
     {
         let custom = custom_commands::discover(cwd, BUILTIN_COMMAND_NAMES);
@@ -822,7 +844,10 @@ pub(crate) fn handle_key(
             }
         }
         KeyCode::Char('q')
-            if !state.running && state.input.is_empty() && state.pasted_attachments.is_empty() =>
+            if !state.running
+                && state.input.is_empty()
+                && state.pasted_attachments.is_empty()
+                && state.image_attachments.is_empty() =>
         {
             return true;
         }
@@ -849,7 +874,9 @@ pub(crate) fn handle_key(
         }
         KeyCode::Backspace => {
             if state.input.is_empty() {
-                state.pasted_attachments.pop();
+                if state.image_attachments.pop().is_none() {
+                    state.pasted_attachments.pop();
+                }
             } else {
                 state.input.pop();
             }
