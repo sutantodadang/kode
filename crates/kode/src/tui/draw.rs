@@ -872,6 +872,19 @@ pub(crate) fn focus_surface_lines(state: &AppState) -> Vec<Line<'static>> {
                 compact_run_map_line(state),
             ],
         };
+        if state.interrupt_confirmation_active() {
+            lines = vec![
+                Line::from(Span::styled(
+                    " × INTERRUPT ARMED",
+                    Style::default().fg(theme::ERR).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    " Esc again within 2s to interrupt · any other key keeps running",
+                    Style::default().fg(theme::ERR),
+                )),
+                compact_run_map_line(state),
+            ];
+        }
         if let Some(context) = context_receipt_line(state) {
             lines.push(context);
         }
@@ -1419,7 +1432,9 @@ pub(crate) fn draw_input(f: &mut ratatui::Frame, area: ratatui::layout::Rect, st
         rendered.push(Line::from(spans));
     }
 
-    let hints = if state.select_mode {
+    let hints = if state.interrupt_confirmation_active() {
+        "Esc again interrupt · any other key keeps running".to_string()
+    } else if state.select_mode {
         "Ctrl+T exit select mode".to_string()
     } else if !state.pending.is_empty() {
         "A allow once · D deny".to_string()

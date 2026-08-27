@@ -2121,6 +2121,24 @@ fn tool_started_after_knowledge_prioritizes_tool_surface() {
 }
 
 #[test]
+fn armed_interrupt_becomes_the_primary_running_action() {
+    let mut s = state();
+    s.running = true;
+    s.status.state = RunState::Tool;
+    s.current_tool = Some("run_command · cargo test".to_string());
+    s.tool_started = Some(Instant::now());
+    s.interrupt_armed_at = Some(Instant::now());
+
+    let lines = focus_surface_lines(&s);
+    let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+    assert!(text.contains("INTERRUPT ARMED"));
+    assert!(text.contains("Esc again"));
+    assert!(text.contains("any other key keeps running"));
+    assert!(!text.contains("Esc twice to interrupt"));
+}
+
+#[test]
 fn start_new_task_collapses_expanded_evidence() {
     let mut s = state();
     apply_event(
@@ -3227,6 +3245,46 @@ fn running_esc_requires_second_press_to_cancel() {
     handle_key(&mut s, &dir, KeyCode::Esc, KeyModifiers::NONE, &current);
     assert!(cancel.is_cancelled());
     assert!(!s.interrupt_confirmation_active());
+}
+
+#[tokio::test]
+async fn running_double_esc_cancels_active_command_end_to_end() {
+    let dir = temp_project_dir();
+    let cancel = kode_core::CancellationToken::new();
+    let tool_ctx = kode_tools::ToolContext {
+        workspace_root: dir.clone(),
+        cancel: cancel.clone(),
+    };
+    let (program, args) = if cfg!(windows) {
+        ("ping", vec!["-n", "30", "127.0.0.1"])
+    } else {
+        ("sleep", vec!["30"])
+    };
+    let tool = kode_tools::tools::RunCommand;
+    let run = kode_tools::Tool::execute(
+        &tool,
+        serde_json::json!({
+            "program": program,
+            "args": args,
+            "timeout_secs": 30
+        }),
+        &tool_ctx,
+    );
+    let cancel_from_ui = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut s = state();
+        s.running = true;
+        let current = Some(cancel.clone());
+        handle_key(&mut s, &dir, KeyCode::Esc, KeyModifiers::NONE, &current);
+        handle_key(&mut s, &dir, KeyCode::Esc, KeyModifiers::NONE, &current);
+    };
+
+    let (result, ()) = tokio::join!(run, cancel_from_ui);
+
+    assert!(matches!(
+        result.unwrap_err(),
+        kode_tools::ToolError::Cancelled
+    ));
 }
 
 #[test]
