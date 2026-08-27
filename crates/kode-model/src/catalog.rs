@@ -4,7 +4,8 @@
 //! strings rather than propagated as hard errors — callers keep working with
 //! free-text model entry when a catalog can't be fetched.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -16,6 +17,8 @@ const OPENAI_MODELS_URL: &str = "https://api.openai.com/v1/models";
 const CODEX_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
 const ANTHROPIC_MODELS_URL: &str = "https://api.anthropic.com/v1/models";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+static CONTEXT_WINDOW_CACHE: OnceLock<Mutex<HashMap<(String, String), u32>>> = OnceLock::new();
 
 /// Static candidates used when no Anthropic API key is available (OAuth-only
 /// auth) or the live `/v1/models` fetch fails.
@@ -40,7 +43,7 @@ const ANTIGRAVITY_FALLBACK_MODELS: &[&str] = &[
 /// models. The ChatGPT backend filters its response by this value — an
 /// outdated version can silently return an empty model list — so this needs
 /// occasional bumping to track the current Codex CLI release.
-const CODEX_CLIENT_VERSION: &str = "0.147.0";
+const CODEX_CLIENT_VERSION: &str = "0.150.0";
 
 /// Static candidates used when the live codex model fetch fails or returns
 /// nothing usable (no auth, network error, parse error, empty list).
@@ -81,6 +84,52 @@ pub async fn list_models(
                 .collect()
         })),
         other => Err(format!("no model catalog for provider '{other}'")),
+    }
+}
+
+/// Resolves the selected model's input context window from the same live
+/// catalogs used by the model picker. Results are cached for the process.
+/// `None` lets callers use a conservative fallback without blocking a run.
+pub async fn context_window_tokens(provider: &str, model: &str) -> Option<u32> {
+    let key = (provider.to_string(), model.to_string());
+    let cache = CONTEXT_WINDOW_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(tokens) = cache.lock().ok()?.get(&key).copied() {
+        return Some(tokens);
+    }
+
+    let detected = match provider {
+        "codex" => fetch_codex_models_json()
+            .await
+            .ok()
+            .and_then(|json| parse_codex_context_window(&json, model)),
+        "openai" | "anthropic" | "opencode-go" | "opencode" | "kilo" => fetch_models_dev_json()
+            .await
+            .ok()
+            .and_then(|json| parse_models_dev_context_window(&json, provider, model)),
+        "antigravity" => inferred_context_window(model),
+        "lmstudio" => None,
+        _ => None,
+    }
+    .or_else(|| inferred_context_window(model));
+
+    if let Some(tokens) = detected
+        && let Ok(mut cache) = cache.lock()
+    {
+        cache.insert(key, tokens);
+    }
+    detected
+}
+
+fn inferred_context_window(model: &str) -> Option<u32> {
+    let model = model.to_ascii_lowercase();
+    if model.starts_with("gemini-3") || model.starts_with("gemini-2.5") {
+        Some(1_000_000)
+    } else if model.starts_with("claude-") {
+        Some(200_000)
+    } else if model.starts_with("gpt-") || model.starts_with('o') {
+        Some(256_000)
+    } else {
+        None
     }
 }
 
@@ -179,6 +228,15 @@ fn parse_anthropic_models(json: &str) -> Result<Vec<String>, String> {
 /// empty filtered list, returns `Err` so the caller falls back to
 /// [`CODEX_FALLBACK_MODELS`].
 async fn fetch_codex_models() -> Result<Vec<String>, String> {
+    let text = fetch_codex_models_json().await?;
+    let models = parse_codex_models(&text)?;
+    if models.is_empty() {
+        return Err("codex models list empty".to_string());
+    }
+    Ok(models)
+}
+
+async fn fetch_codex_models_json() -> Result<String, String> {
     let auth_path =
         crate::codex::default_auth_path().ok_or_else(|| "no codex auth path".to_string())?;
     let auth = crate::codex::load_fresh(&auth_path)
@@ -200,15 +258,9 @@ async fn fetch_codex_models() -> Result<Vec<String>, String> {
     if !resp.status().is_success() {
         return Err(format!("codex models returned {}", resp.status()));
     }
-    let text = resp
-        .text()
+    resp.text()
         .await
-        .map_err(|e| format!("codex models read failed: {e}"))?;
-    let models = parse_codex_models(&text)?;
-    if models.is_empty() {
-        return Err("codex models list empty".to_string());
-    }
-    Ok(models)
+        .map_err(|e| format!("codex models read failed: {e}"))
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -221,6 +273,12 @@ struct CodexModelInfo {
     visibility: Option<String>,
     #[serde(default)]
     priority: Option<i64>,
+    #[serde(default)]
+    context_window: Option<u32>,
+    #[serde(default)]
+    max_context_window: Option<u32>,
+    #[serde(default)]
+    effective_context_window_percent: Option<u32>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -250,7 +308,21 @@ fn parse_codex_models(json: &str) -> Result<Vec<String>, String> {
     Ok(models.into_iter().map(|m| m.slug).collect())
 }
 
-async fn fetch_models_dev(provider: &str) -> Result<Vec<String>, String> {
+fn parse_codex_context_window(json: &str, model: &str) -> Option<u32> {
+    let parsed: CodexModelsResponse = serde_json::from_str(json).ok()?;
+    let info = parsed
+        .models
+        .into_iter()
+        .find(|entry| entry.slug == model)?;
+    let raw = info.max_context_window.or(info.context_window)?;
+    let percent = info
+        .effective_context_window_percent
+        .unwrap_or(100)
+        .min(100);
+    Some((u64::from(raw) * u64::from(percent) / 100).min(u64::from(u32::MAX)) as u32)
+}
+
+async fn fetch_models_dev_json() -> Result<String, String> {
     let client = reqwest::Client::new();
     let resp = client
         .get(MODELS_DEV_URL)
@@ -261,10 +333,25 @@ async fn fetch_models_dev(provider: &str) -> Result<Vec<String>, String> {
     if !resp.status().is_success() {
         return Err(format!("models.dev returned {}", resp.status()));
     }
-    let text = resp
-        .text()
+    resp.text()
         .await
-        .map_err(|e| format!("models.dev read failed: {e}"))?;
+        .map_err(|e| format!("models.dev read failed: {e}"))
+}
+
+fn parse_models_dev_context_window(json: &str, provider: &str, model: &str) -> Option<u32> {
+    let value: Value = serde_json::from_str(json).ok()?;
+    value
+        .get(provider)?
+        .get("models")?
+        .get(model)?
+        .get("limit")?
+        .get("context")?
+        .as_u64()
+        .and_then(|tokens| u32::try_from(tokens).ok())
+}
+
+async fn fetch_models_dev(provider: &str) -> Result<Vec<String>, String> {
+    let text = fetch_models_dev_json().await?;
     parse_models_dev(&text, provider)
 }
 
@@ -449,6 +536,27 @@ mod tests {
     fn parse_codex_models_invalid_json_errors() {
         let err = parse_codex_models("not json").unwrap_err();
         assert!(err.contains("codex models"));
+    }
+
+    #[test]
+    fn codex_context_window_uses_live_max_and_safety_percentage() {
+        let json = r#"{"models": [
+            {"slug": "gpt-5.4", "context_window": 272000,
+             "max_context_window": 1000000,
+             "effective_context_window_percent": 95}
+        ]}"#;
+
+        assert_eq!(parse_codex_context_window(json, "gpt-5.4"), Some(950_000));
+        assert_eq!(parse_codex_context_window(json, "missing"), None);
+    }
+
+    #[test]
+    fn models_dev_context_window_reads_provider_metadata() {
+        let json = r#"{"anthropic":{"models":{"claude-opus-5":{"limit":{"context":256000}}}}}"#;
+        assert_eq!(
+            parse_models_dev_context_window(json, "anthropic", "claude-opus-5"),
+            Some(256_000)
+        );
     }
 
     #[test]

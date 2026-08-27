@@ -74,17 +74,19 @@ autostart = true
 |---|---|---|---|
 | `max_iterations` | integer | `80` | Upper bound on agent loop iterations per task, as a runaway guard. |
 | `max_tool_calls` | integer | `100` | Upper bound on total tool calls per task. |
-| `max_context_tokens` | integer | `100000` | Upper bound on the model's total context window Kode will fill, across system prompt, history, and compiled knowledge context. |
-| `context_budget_tokens` | integer | `16000` | Token budget for knowledge context compiled each turn from zindeks (code graph) and Ingat (memory). It is distinct from the model's context window, which is `max_context_tokens`; real evidence counts are available from the TUI's contextual receipt. |
-| `history_budget_tokens` | integer | `6000` | Token budget for replaying prior session turns when resuming (`--continue`/`-c`, `/resume`). Oldest turns are dropped first if history doesn't fit, with a truncation marker shown in the transcript. |
+| `max_context_tokens` | integer | `0` (auto) | Total model window Kode may use. Auto reads live provider metadata when available, then falls back conservatively. Set a non-zero value to override detection. |
+| `context_budget_tokens` | integer | `0` (auto) | Repository knowledge budget. Auto uses roughly 10% of the resolved model window, bounded to 16k–64k (and never more than a quarter of small windows). |
+| `history_budget_tokens` | integer | `0` (auto) | Verbatim recent-session budget. Auto uses roughly 30% of the resolved window, bounded to 6k–256k. Older turns remain stored in the session even when omitted from verbatim replay. |
+| `auto_compact` | bool | `true` | At 80% of the usable window, ask the selected model for a structured continuation summary, then retain system/repository context, the newest task, and the latest tool protocol in bounded form. Failed compaction falls back to safe truncation instead of failing the task. |
 
 ```toml
 [agent]
 max_iterations = 80
 max_tool_calls = 100
-max_context_tokens = 100000
-context_budget_tokens = 16000
-history_budget_tokens = 6000
+max_context_tokens = 0
+context_budget_tokens = 0
+history_budget_tokens = 0
+auto_compact = true
 ```
 
 ## `[permissions]`
@@ -183,9 +185,10 @@ autostart = true
 [agent]
 max_iterations = 80
 max_tool_calls = 100
-max_context_tokens = 100000
-context_budget_tokens = 16000
-history_budget_tokens = 6000
+max_context_tokens = 0
+context_budget_tokens = 0
+history_budget_tokens = 0
+auto_compact = true
 
 [permissions]
 default = "ask"

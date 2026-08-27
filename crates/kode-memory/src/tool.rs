@@ -7,12 +7,167 @@ use kode_tools::{RequiredPermission, Tool, ToolContext, ToolOutput};
 
 use crate::EngineeringMemory;
 use crate::policy::{self, PolicyDecision};
-use crate::types::{MemoryContext, MemoryKind, NewMemory, Provenance};
+use crate::types::{MemoryContext, MemoryKind, MemoryQuery, NewMemory, Provenance};
 use crate::wire::{self, WireEntry};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Args {
+struct SearchArgs {
+    query: String,
+    kind: Option<String>,
+    repository: Option<String>,
+    limit: Option<u32>,
+}
+
+/// Read-only, agent-facing access to Ingat's ranked engineering-memory search.
+///
+/// Initial task context already includes an automatic memory search. This tool
+/// lets the model issue a more precise query later in the run when code or tool
+/// results reveal a different decision, convention, issue, or prior solution
+/// worth recalling.
+pub struct MemorySearchTool {
+    memory: Arc<dyn EngineeringMemory>,
+    repository: Option<String>,
+}
+
+impl MemorySearchTool {
+    pub fn new(memory: Arc<dyn EngineeringMemory>, repository: Option<String>) -> Self {
+        Self { memory, repository }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for MemorySearchTool {
+    fn name(&self) -> &str {
+        "memory_search"
+    }
+
+    fn description(&self) -> &str {
+        "Search Ingat's durable engineering memory for previous project rules, \
+         conventions, architecture decisions, known issues, build facts, \
+         rejected approaches, user preferences, and historical solutions. Use \
+         this when past project knowledge may affect the task, especially when \
+         new evidence changes what you need to recall during a run."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        let kinds: Vec<&str> = MemoryKind::ALL.iter().map(MemoryKind::as_kebab).collect();
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Natural-language description of the project knowledge to recall"
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": kinds,
+                    "description": "Optional memory-kind filter"
+                },
+                "repository": {
+                    "type": "string",
+                    "description": "Optional repository filter; defaults to the active workspace repository"
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20,
+                    "default": 8
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        })
+    }
+
+    fn required_permission(&self) -> RequiredPermission {
+        RequiredPermission::ReadOnly
+    }
+
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> kode_tools::error::Result<ToolOutput> {
+        if ctx.cancel.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+
+        let args: SearchArgs =
+            serde_json::from_value(args).map_err(|error| ToolError::InvalidArgs {
+                tool: self.name().to_string(),
+                message: error.to_string(),
+            })?;
+        let query = args.query.trim();
+        if query.is_empty() {
+            return Err(ToolError::InvalidArgs {
+                tool: self.name().to_string(),
+                message: "query must not be empty".to_string(),
+            });
+        }
+
+        let kind = args
+            .kind
+            .as_deref()
+            .map(|kind| {
+                MemoryKind::from_kebab(kind).ok_or_else(|| ToolError::InvalidArgs {
+                    tool: self.name().to_string(),
+                    message: format!("invalid memory kind {kind:?}"),
+                })
+            })
+            .transpose()?;
+        let repository = match args.repository {
+            Some(repository) if repository.trim().is_empty() => {
+                return Err(ToolError::InvalidArgs {
+                    tool: self.name().to_string(),
+                    message: "repository must not be empty when provided".to_string(),
+                });
+            }
+            Some(repository) => Some(repository.trim().to_string()),
+            None => self.repository.clone(),
+        };
+        let limit = args.limit.unwrap_or(8).clamp(1, 20);
+
+        let memories = self
+            .memory
+            .search(&MemoryQuery {
+                text: query.to_string(),
+                repository: repository.clone(),
+                kind,
+                limit,
+            })
+            .await
+            .map_err(|error| ToolError::Failed(format!("ingat search failed: {error}")))?
+            .into_iter()
+            .map(|memory| {
+                serde_json::json!({
+                    "id": memory.id,
+                    "kind": memory.kind.map(|kind| kind.as_kebab()),
+                    "summary": memory.summary,
+                    "body": memory.body,
+                    "tags": memory.tags,
+                    "provenance": memory.provenance.map(|provenance| provenance.as_kebab()),
+                    "score": memory.score,
+                    "project": memory.project,
+                    "created_at": memory.created_at,
+                })
+            })
+            .collect::<Vec<_>>();
+        let content = serde_json::to_string_pretty(&serde_json::json!({
+            "query": query,
+            "repository": repository,
+            "kind": kind.map(|kind| kind.as_kebab()),
+            "memories": memories,
+        }))
+        .map_err(|error| ToolError::Failed(error.to_string()))?;
+
+        Ok(ToolOutput { content })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RememberArgs {
     summary: String,
     #[serde(default)]
     body: String,
@@ -99,10 +254,11 @@ impl Tool for RememberTool {
         args: serde_json::Value,
         ctx: &ToolContext,
     ) -> kode_tools::error::Result<ToolOutput> {
-        let args: Args = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
-            tool: self.name().to_string(),
-            message: e.to_string(),
-        })?;
+        let args: RememberArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
+                tool: self.name().to_string(),
+                message: e.to_string(),
+            })?;
 
         let kind = MemoryKind::from_kebab(&args.kind).ok_or_else(|| {
             let valid: Vec<&str> = MemoryKind::ALL.iter().map(MemoryKind::as_kebab).collect();
@@ -167,6 +323,7 @@ impl Tool for RememberTool {
 mod tests {
     use super::*;
     use crate::mock::MockEngineeringMemory;
+    use crate::types::Memory;
     use kode_core::CancellationToken;
 
     fn ctx() -> ToolContext {
@@ -193,6 +350,124 @@ mod tests {
             workspace_root: dir,
             cancel: CancellationToken::new(),
         }
+    }
+
+    fn memory_result() -> Memory {
+        Memory {
+            id: "mem-42".to_string(),
+            kind: Some(MemoryKind::ArchitectureDecision),
+            summary: "Keep the Go backend authoritative".to_string(),
+            body: "Business logic remains in the Go application backend.".to_string(),
+            tags: vec!["architecture".to_string()],
+            provenance: Some(Provenance::ArchitectureDecision),
+            score: 0.94,
+            project: "kode".to_string(),
+            created_at: "2026-08-27T00:00:00Z".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn search_returns_structured_memories_and_forwards_filters() {
+        let mock = Arc::new(MockEngineeringMemory {
+            search_results: vec![memory_result()],
+            ..Default::default()
+        });
+        let tool = MemorySearchTool::new(mock.clone(), Some("kode".to_string()));
+
+        let output = tool
+            .execute(
+                serde_json::json!({
+                    "query": "  backend architecture decision  ",
+                    "kind": "architecture-decision",
+                    "limit": 5
+                }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&output.content).unwrap();
+        assert_eq!(value["query"], "backend architecture decision");
+        assert_eq!(value["repository"], "kode");
+        assert_eq!(value["kind"], "architecture-decision");
+        assert_eq!(value["memories"][0]["id"], "mem-42");
+        assert_eq!(value["memories"][0]["provenance"], "architecture-decision");
+        let score = value["memories"][0]["score"].as_f64().unwrap();
+        assert!((score - 0.94).abs() < 0.000_001);
+
+        let searched = mock.searched_snapshot().await;
+        assert_eq!(
+            searched,
+            vec![MemoryQuery {
+                text: "backend architecture decision".to_string(),
+                repository: Some("kode".to_string()),
+                kind: Some(MemoryKind::ArchitectureDecision),
+                limit: 5,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn search_can_override_repository_and_clamps_limit() {
+        let mock = Arc::new(MockEngineeringMemory::default());
+        let tool = MemorySearchTool::new(mock.clone(), Some("kode".to_string()));
+
+        tool.execute(
+            serde_json::json!({
+                "query": "shared convention",
+                "repository": "other-repo",
+                "limit": 100
+            }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+
+        let searched = mock.searched_snapshot().await;
+        assert_eq!(searched[0].repository.as_deref(), Some("other-repo"));
+        assert_eq!(searched[0].limit, 20);
+    }
+
+    #[tokio::test]
+    async fn search_rejects_empty_query_and_unknown_kind() {
+        let tool = MemorySearchTool::new(
+            Arc::new(MockEngineeringMemory::default()),
+            Some("kode".to_string()),
+        );
+
+        let empty = tool
+            .execute(serde_json::json!({"query": "   "}), &ctx())
+            .await
+            .unwrap_err();
+        assert!(matches!(empty, ToolError::InvalidArgs { .. }));
+
+        let unknown_kind = tool
+            .execute(
+                serde_json::json!({"query": "decision", "kind": "unknown"}),
+                &ctx(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(unknown_kind, ToolError::InvalidArgs { .. }));
+    }
+
+    #[tokio::test]
+    async fn search_is_read_only_and_reports_backend_failure() {
+        let tool = MemorySearchTool::new(
+            Arc::new(MockEngineeringMemory {
+                search_error: Some("index unavailable".to_string()),
+                ..Default::default()
+            }),
+            Some("kode".to_string()),
+        );
+
+        assert_eq!(tool.required_permission(), RequiredPermission::ReadOnly);
+        let error = tool
+            .execute(serde_json::json!({"query": "past solution"}), &ctx())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("ingat search failed"));
+        assert!(error.to_string().contains("index unavailable"));
     }
 
     #[tokio::test]

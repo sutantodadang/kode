@@ -10,6 +10,7 @@ const TASK_TRUNCATED: &str = "\n[user task truncated to fit context window]";
 const HISTORY_DROPPED: &str = "(older conversation dropped to fit context window)";
 const TOOL_ROUNDS_DROPPED: &str = "(older agent tool interactions dropped to fit context window)";
 const IMAGE_TOKEN_ESTIMATE: usize = 1600;
+const AUTO_COMPACT_TRIGGER_PERCENT: usize = 80;
 
 /// Applies a conservative, provider-independent context-window budget.
 ///
@@ -42,6 +43,22 @@ impl PromptBudget {
     pub(crate) fn input_budget(&self) -> usize {
         self.max_context_tokens
             .saturating_sub(self.output_tokens as usize)
+    }
+
+    pub(crate) fn context_window(&self) -> usize {
+        self.max_context_tokens
+    }
+
+    pub(crate) fn estimate(&self, messages: &[Message], tools: &[ToolSpec]) -> usize {
+        estimate_request(messages, tools)
+    }
+
+    pub(crate) fn should_compact(&self, messages: &[Message], tools: &[ToolSpec]) -> bool {
+        self.input_budget() > 0
+            && estimate_request(messages, tools).saturating_mul(100)
+                >= self
+                    .input_budget()
+                    .saturating_mul(AUTO_COMPACT_TRIGGER_PERCENT)
     }
 
     pub(crate) fn prepare(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<Vec<Message>> {
@@ -190,7 +207,7 @@ fn estimate_text(text: &str) -> usize {
     text.len().div_ceil(4)
 }
 
-fn completed_tool_rounds(messages: &[Message]) -> Vec<(usize, usize)> {
+pub(crate) fn completed_tool_rounds(messages: &[Message]) -> Vec<(usize, usize)> {
     let mut rounds = Vec::new();
     let mut index = 0;
     while index < messages.len() {

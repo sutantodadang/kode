@@ -54,15 +54,15 @@ fn default_max_tool_calls() -> u32 {
 }
 
 fn default_max_context_tokens() -> u32 {
-    100_000
+    0
 }
 
 fn default_context_budget_tokens() -> u32 {
-    16_000
+    0
 }
 
 fn default_history_budget_tokens() -> u32 {
-    6000
+    0
 }
 
 fn default_permission_mode() -> PermissionMode {
@@ -303,6 +303,8 @@ pub struct AgentConfig {
     pub context_budget_tokens: u32,
     #[serde(default = "default_history_budget_tokens")]
     pub history_budget_tokens: u32,
+    #[serde(default = "default_true")]
+    pub auto_compact: bool,
 }
 
 impl Default for AgentConfig {
@@ -313,7 +315,39 @@ impl Default for AgentConfig {
             max_context_tokens: default_max_context_tokens(),
             context_budget_tokens: default_context_budget_tokens(),
             history_budget_tokens: default_history_budget_tokens(),
+            auto_compact: true,
         }
+    }
+}
+
+impl AgentConfig {
+    pub const FALLBACK_CONTEXT_WINDOW_TOKENS: u32 = 100_000;
+
+    /// Resolves zero-valued budgets against the selected model's context
+    /// window. Explicit non-zero values remain authoritative.
+    pub fn resolved(&self, detected_context_window: Option<u32>) -> Self {
+        let mut resolved = self.clone();
+        resolved.max_context_tokens = if self.max_context_tokens == 0 {
+            detected_context_window.unwrap_or(Self::FALLBACK_CONTEXT_WINDOW_TOKENS)
+        } else {
+            self.max_context_tokens
+        }
+        .max(8_192);
+
+        if self.context_budget_tokens == 0 {
+            resolved.context_budget_tokens = (resolved.max_context_tokens / 10)
+                .clamp(16_000, 64_000)
+                .min(resolved.max_context_tokens / 4);
+        }
+        if self.history_budget_tokens == 0 {
+            resolved.history_budget_tokens = resolved
+                .max_context_tokens
+                .saturating_mul(3)
+                .saturating_div(10)
+                .clamp(6_000, 256_000)
+                .min(resolved.max_context_tokens / 2);
+        }
+        resolved
     }
 }
 
@@ -471,9 +505,10 @@ mod tests {
         assert!(cfg.ingat.autostart);
         assert_eq!(cfg.agent.max_iterations, 80);
         assert_eq!(cfg.agent.max_tool_calls, 100);
-        assert_eq!(cfg.agent.max_context_tokens, 100_000);
-        assert_eq!(cfg.agent.context_budget_tokens, 16_000);
-        assert_eq!(cfg.agent.history_budget_tokens, 6000);
+        assert_eq!(cfg.agent.max_context_tokens, 0);
+        assert_eq!(cfg.agent.context_budget_tokens, 0);
+        assert_eq!(cfg.agent.history_budget_tokens, 0);
+        assert!(cfg.agent.auto_compact);
         assert_eq!(cfg.permissions.default_mode, PermissionMode::Ask);
         assert!(cfg.mcp.servers.is_empty());
         assert_eq!(cfg.verify.timeout_seconds, 600);
@@ -537,7 +572,7 @@ timeout_seconds = 120
     }
 
     #[test]
-    fn load_without_history_budget_tokens_defaults_to_6000() {
+    fn load_without_history_budget_tokens_defaults_to_auto() {
         let dir = temp_project_dir();
         let kode_dir = dir.join(".kode");
         std::fs::create_dir_all(&kode_dir).unwrap();
@@ -549,7 +584,35 @@ timeout_seconds = 120
 
         let cfg = KodeConfig::load(&dir).unwrap();
         assert_eq!(cfg.agent.max_iterations, 5);
-        assert_eq!(cfg.agent.history_budget_tokens, 6000);
+        assert_eq!(cfg.agent.history_budget_tokens, 0);
+    }
+
+    #[test]
+    fn automatic_agent_budgets_scale_with_model_window() {
+        let cfg = AgentConfig::default();
+
+        let compact = cfg.resolved(Some(256_000));
+        assert_eq!(compact.max_context_tokens, 256_000);
+        assert_eq!(compact.context_budget_tokens, 25_600);
+        assert_eq!(compact.history_budget_tokens, 76_800);
+
+        let long = cfg.resolved(Some(1_000_000));
+        assert_eq!(long.max_context_tokens, 1_000_000);
+        assert_eq!(long.context_budget_tokens, 64_000);
+        assert_eq!(long.history_budget_tokens, 256_000);
+    }
+
+    #[test]
+    fn explicit_agent_budgets_override_detected_window() {
+        let cfg = AgentConfig {
+            max_context_tokens: 128_000,
+            context_budget_tokens: 12_000,
+            history_budget_tokens: 24_000,
+            auto_compact: false,
+            ..Default::default()
+        };
+
+        assert_eq!(cfg.resolved(Some(1_000_000)), cfg);
     }
 
     #[test]

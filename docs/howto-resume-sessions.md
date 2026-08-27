@@ -48,7 +48,9 @@ The prior turns are sent to the model as history, and the new task is appended o
 
 ## History budget
 
-When resuming, Kode replays prior turns to the model under a token budget: `[agent] history_budget_tokens` in `.kode/config.toml`, default `6000`. If the full history doesn't fit, Kode drops the oldest turns first and shows an honest truncation marker in the transcript: it never silently pretends the model saw turns it didn't. Raise this value in config if you need more history replayed; see [reference-config.md](./reference-config.md).
+When resuming, Kode replays prior turns under `[agent] history_budget_tokens`. The default `0` is automatic: roughly 30% of the selected model's resolved context window, capped at 256k tokens. If the full history doesn't fit verbatim, Kode drops the oldest turns first and shows an honest truncation marker; the complete turns remain stored in the session file.
+
+During a long active run, `auto_compact = true` triggers at 80% of the usable model window. Kode asks the selected model for a dense continuation summary, retains system/repository context and the newest task/tool round verbatim, and reports the estimated before/after size in the transcript.
 
 This is a separate budget from `[agent] context_budget_tokens`, which governs how much knowledge-graph and memory context is compiled per turn, not session history.
 

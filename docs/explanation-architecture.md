@@ -11,7 +11,9 @@ Kode treats code intelligence as infrastructure, not something the agent has to 
 - **zindeks**: a local code knowledge graph. Symbols, call graphs, imports, BM25 and semantic search, kept current by a background file watcher.
 - **Ingat**: an engineering memory service. Project rules, architecture decisions, conventions, known issues, and other durable knowledge, recalled by relevance rather than re-explained every time.
 
-Kode never reimplements either. It spawns and talks to them as first-class adapters. A context compiler pulls from both, plus current git state, and assembles a token-budgeted context for the model: bounded by `[agent] context_budget_tokens`, distinct from the model's raw context window (`[agent] max_context_tokens`). See [reference-config.md](./reference-config.md) for the exact keys.
+Kode never reimplements either. It spawns and talks to them as first-class adapters. A context compiler pulls from both, plus current git state, and assembles a token-budgeted context for the model. When zindeks is healthy, the same adapter also registers `code_search` and `file_outline` as read-only agent tools; indexed symbol/concept discovery comes first, while `git grep` remains the exact-literal or unavailable-engine fallback. When Ingat is healthy, Kode registers read-only `memory_search` for targeted recall during a run and mutating `remember` for durable verified knowledge.
+
+By default Kode resolves the selected model's live context-window metadata, allocates proportional budgets for repository evidence and recent raw history, and auto-compacts an active run at 80% into a structured continuation summary. System rules, repository context, and the newest task remain verbatim; the latest tool protocol stays attached with oversized output bounded. Raw session turns remain on disk. Explicit non-zero `[agent]` budgets override the automatic values. See [reference-config.md](./reference-config.md) for the exact keys.
 
 The agent then runs inside a tool sandbox with its own guardrails (`max_iterations`, `max_tool_calls`), and after edits land, a verification pipeline runs the project's real checks: tests, lint, build: and reports each one honestly: passed, failed, or skipped. A skipped check is never reported as passed. This same honesty rule applies to session replay: when you resume a session, truncated history shows a truncation marker rather than silently pretending the model saw turns it didn't.
 
@@ -50,7 +52,7 @@ The task pipeline (`crates/kode/src/pipeline.rs`) communicates with the rest of 
                      pass/fail/skipped)
 ```
 
-zindeks runs as a spawned child process (stdio transport by default, `ZINDEKS_WATCH=1` so the index refreshes itself on a 2-second poll instead of Kode issuing an explicit post-task refresh). Ingat is reached over its REST API. Both are optional per `[zindeks].enabled` / `[ingat].enabled`: the context compiler simply omits a source it can't reach, and the TUI's knowledge band hides that source rather than showing empty or fake data.
+zindeks runs as a spawned child process (stdio transport by default, `ZINDEKS_WATCH=1` so the index refreshes itself on a 2-second poll instead of Kode issuing an explicit post-task refresh). Ingat is reached over its REST API. Both are optional per `[zindeks].enabled` / `[ingat].enabled`: the context compiler simply omits a source it can't reach, their native tools are not registered, and the TUI's knowledge band hides that source rather than showing empty or fake data.
 
 ## Trade-offs
 

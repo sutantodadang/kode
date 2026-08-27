@@ -14,6 +14,8 @@ pub struct MockEngineeringMemory {
     pub health_error: Option<String>,
     pub search_results: Vec<Memory>,
     pub search_error: Option<String>,
+    /// Every query passed to `search`, for inspection in tests.
+    pub searched: Mutex<Vec<MemoryQuery>>,
     pub stats: MemoryStats,
     pub remembered: Mutex<Vec<NewMemory>>,
     /// The id returned by the next `remember` call.
@@ -34,6 +36,7 @@ impl Default for MockEngineeringMemory {
             health_error: None,
             search_results: Vec::new(),
             search_error: None,
+            searched: Mutex::new(Vec::new()),
             stats: MemoryStats {
                 total: 0,
                 version: "mock".to_string(),
@@ -49,6 +52,11 @@ impl Default for MockEngineeringMemory {
 }
 
 impl MockEngineeringMemory {
+    /// Snapshot of all [`MemoryQuery`] values passed to `search` so far.
+    pub async fn searched_snapshot(&self) -> Vec<MemoryQuery> {
+        self.searched.lock().await.clone()
+    }
+
     /// Snapshot of all [`NewMemory`] values passed to `remember` so far.
     pub async fn remembered_snapshot(&self) -> Vec<NewMemory> {
         self.remembered.lock().await.clone()
@@ -64,7 +72,8 @@ impl EngineeringMemory for MockEngineeringMemory {
         }
     }
 
-    async fn search(&self, _query: &MemoryQuery) -> Result<Vec<Memory>> {
+    async fn search(&self, query: &MemoryQuery) -> Result<Vec<Memory>> {
+        self.searched.lock().await.push(query.clone());
         match &self.search_error {
             Some(message) => Err(MemoryError::Unavailable(message.clone())),
             None => Ok(self.search_results.clone()),

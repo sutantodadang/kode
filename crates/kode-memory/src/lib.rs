@@ -9,7 +9,7 @@ pub mod wire;
 pub use error::{MemoryError, Result};
 pub use ingat::IngatAdapter;
 pub use mock::MockEngineeringMemory;
-pub use tool::RememberTool;
+pub use tool::{MemorySearchTool, RememberTool};
 pub use types::{Memory, MemoryContext, MemoryKind, MemoryQuery, NewMemory, Provenance};
 pub use wire::WireEntry;
 

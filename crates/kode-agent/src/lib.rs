@@ -9,13 +9,18 @@ use futures::StreamExt;
 use kode_core::config::AgentConfig;
 use kode_core::event::{EventBus, KodeEvent};
 use kode_core::{ImageAttachment, UserInput};
-use kode_model::{Message, Model, ModelRequest, ResponseAccumulator, StreamEvent, Usage};
+use kode_model::{
+    Message, Model, ModelRequest, ResponseAccumulator, StreamEvent, ToolSpec, Usage,
+    collect_response,
+};
 use kode_tools::registry::ToolRuntime;
 use kode_tools::{RequiredPermission, ToolContext, ToolError};
 use prompt_budget::PromptBudget;
 use tokio::sync::mpsc;
 
 const MAX_TOOL_LABEL_CHARS: usize = 240;
+const COMPACTED_CONTEXT_PREFIX: &str = "Compacted work context:";
+const COMPACTION_PROMPT: &str = "You are compacting an active coding-agent conversation so work can continue without re-reading the full transcript. Produce a dense, factual structured summary. Preserve: the user's objective and corrections; decisions and constraints; exact file paths, symbols, commands, edits, and observed results; failed approaches and error text; repository state; current progress; and remaining work. Distinguish completed from pending work. Never invent facts. Omit pleasantries and repeated tool output. The original session remains stored, but this summary must be sufficient to continue correctly.";
 
 fn display_arg(arg: &str) -> String {
     if !arg.is_empty()
@@ -72,7 +77,7 @@ fn system_prompt() -> String {
     format!(
         "You are Kode, a coding agent operating on the user's repository. Use the provided tools to inspect and modify files and run commands. Prefer reading before writing. When the task is complete, reply with a concise final answer and stop calling tools.
 
-Environment: OS is `{os}`. `run_command` spawns the program directly with NO shell: no pipes, redirects, globs or builtins, and Unix tools such as `rg`, `grep`, `find`, `cat`, `ls`, `sed` are NOT guaranteed to exist (they usually do not on Windows). To search code use `run_command` with program `git` and args like [\"grep\", \"-n\", \"<pattern>\"] — it works on every platform. To read files use `read_file`. Do not retry a program that was reported as not found.
+Environment: OS is `{os}`. `run_command` spawns the program directly with NO shell: no pipes, redirects, globs or builtins, and Unix tools such as `rg`, `grep`, `find`, `cat`, `ls`, `sed` are NOT guaranteed to exist (they usually do not on Windows). When `code_search` and `file_outline` are offered, use them first for conceptual, symbol, implementation, and call-site discovery because they query the indexed code graph. Use `git grep` through `run_command` only for exact literal matching or when code-intelligence tools are unavailable. To read exact file contents use `read_file`. Do not retry a program that was reported as not found.
 
 Skills: when repository context lists available skills, call `use_skill` before taking task actions if the user names a skill (for example `$review`) or the task clearly matches a skill description. Read `SKILL.md` first, then use `use_skill` with a relative `path` for any referenced resource you need. User instructions override skill instructions.",
         os = std::env::consts::OS
@@ -90,6 +95,7 @@ pub struct Agent {
     max_iterations: u32,
     max_tool_calls: u32,
     prompt_budget: PromptBudget,
+    auto_compact: bool,
     effort: Option<String>,
 }
 
@@ -143,6 +149,7 @@ impl Agent {
         events: EventBus,
         agent_cfg: &AgentConfig,
     ) -> Self {
+        let agent_cfg = agent_cfg.resolved(None);
         Self {
             model,
             tools,
@@ -150,8 +157,89 @@ impl Agent {
             max_iterations: agent_cfg.max_iterations,
             max_tool_calls: agent_cfg.max_tool_calls,
             prompt_budget: PromptBudget::new(agent_cfg.max_context_tokens),
+            auto_compact: agent_cfg.auto_compact,
             effort: None,
         }
+    }
+
+    async fn compact_messages(
+        &self,
+        messages: &mut Vec<Message>,
+        tools: &[ToolSpec],
+        task: &UserInput,
+    ) -> Result<Option<(Usage, usize, usize)>> {
+        let before = self.prompt_budget.estimate(messages, tools);
+        let mut compact_request = Vec::with_capacity(messages.len() + 1);
+        compact_request.push(Message::System(COMPACTION_PROMPT.to_string()));
+        compact_request.extend(messages.iter().cloned());
+        if self.prompt_budget.estimate(&compact_request, &[]) > self.prompt_budget.input_budget() {
+            compact_request = self.prompt_budget.prepare(&compact_request, &[])?;
+        }
+        let compact_output_tokens = self
+            .prompt_budget
+            .context_window()
+            .saturating_sub(self.prompt_budget.estimate(&compact_request, &[]))
+            .clamp(1, 16_384) as u32;
+
+        let stream = self
+            .model
+            .stream(ModelRequest {
+                messages: compact_request,
+                tools: Vec::new(),
+                max_tokens: Some(compact_output_tokens),
+                temperature: None,
+                effort: None,
+            })
+            .await?;
+        let response = collect_response(stream).await?;
+        let summary = response.content.trim();
+        if summary.is_empty() {
+            return Ok(None);
+        }
+
+        let mut retained = messages
+            .iter()
+            .filter(|message| {
+                matches!(message, Message::System(text) if !text.starts_with(COMPACTED_CONTEXT_PREFIX))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        retained.push(Message::System(format!(
+            "{COMPACTED_CONTEXT_PREFIX}\n{summary}"
+        )));
+
+        let task_message = Message::user(task.clone());
+        let mut exact_indices = Vec::new();
+        if let Some(index) = messages
+            .iter()
+            .rposition(|message| message == &task_message)
+        {
+            exact_indices.push(index);
+        }
+        if let Some(index) = messages.iter().rposition(|message| {
+            matches!(message, Message::User(_) | Message::UserWithImages { .. })
+        }) {
+            exact_indices.push(index);
+        }
+        if let Some((start, end)) = prompt_budget::completed_tool_rounds(messages)
+            .last()
+            .copied()
+        {
+            exact_indices.extend(start..end);
+        }
+        exact_indices.sort_unstable();
+        exact_indices.dedup();
+        retained.extend(
+            exact_indices
+                .into_iter()
+                .filter_map(|index| messages.get(index))
+                .filter(|message| !matches!(message, Message::System(_)))
+                .cloned(),
+        );
+
+        *messages = self.prompt_budget.prepare(&retained, tools)?;
+        let after = self.prompt_budget.estimate(messages, tools);
+        Ok(Some((response.usage.unwrap_or_default(), before, after)))
     }
 
     /// Sets the reasoning-effort hint forwarded on every [`ModelRequest`]
@@ -229,6 +317,7 @@ impl Agent {
         let mut repeat_count: u32 = 0;
         let mut mutated = false;
         let mut steering_open = steering.is_some();
+        let mut compaction_available = self.auto_compact;
 
         for iteration in 1..=self.max_iterations {
             if ctx.cancel.is_cancelled() {
@@ -246,8 +335,37 @@ impl Agent {
                 }
             }
 
-            self.events.emit(KodeEvent::ModelStarted);
             let tools = self.tools.specs();
+            if compaction_available && self.prompt_budget.should_compact(&messages, &tools) {
+                match self.compact_messages(&mut messages, &tools, task).await {
+                    Ok(Some((compact_usage, before, after))) => {
+                        usage += compact_usage;
+                        self.events.emit(KodeEvent::Note {
+                            text: format!(
+                                "context auto-compacted: {before} → {after} estimated tokens · {} window",
+                                self.prompt_budget.context_window()
+                            ),
+                        });
+                    }
+                    Ok(None) => {
+                        compaction_available = false;
+                        self.events.emit(KodeEvent::Note {
+                            text: "auto-compact returned an empty summary; using safe truncation"
+                                .to_string(),
+                        });
+                    }
+                    Err(error) => {
+                        compaction_available = false;
+                        self.events.emit(KodeEvent::Note {
+                            text: format!(
+                                "auto-compact unavailable ({error}); using safe truncation"
+                            ),
+                        });
+                    }
+                }
+            }
+
+            self.events.emit(KodeEvent::ModelStarted);
             let request_messages = self.prompt_budget.prepare(&messages, &tools)?;
             let mut stream = self
                 .model
@@ -512,6 +630,16 @@ mod tests {
         assert!(prompt.contains("User instructions override skill instructions"));
     }
 
+    #[test]
+    fn system_prompt_prefers_code_graph_and_limits_grep_to_fallback() {
+        let prompt = system_prompt();
+        assert!(prompt.contains("use them first"));
+        assert!(prompt.contains("`code_search`"));
+        assert!(prompt.contains("`file_outline`"));
+        assert!(prompt.contains("exact literal matching"));
+        assert!(prompt.contains("tools are unavailable"));
+    }
+
     struct DelayedSteeringModel {
         calls: AtomicUsize,
         requests: Mutex<Vec<ModelRequest>>,
@@ -669,6 +797,83 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, KodeEvent::AgentFinished))
         );
+    }
+
+    #[tokio::test]
+    async fn auto_compact_summarizes_before_model_window_is_exhausted() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("large.txt"), "important detail\n".repeat(2_500)).unwrap();
+
+        let mock = MockModel::new();
+        let mut tool_call = read_file_call(0, "call_1", "large.txt");
+        tool_call.push(StreamEvent::Finished {
+            reason: FinishReason::ToolCalls,
+            usage: Some(Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+            }),
+        });
+        mock.push_script(tool_call);
+        mock.push_script(vec![
+            StreamEvent::TextDelta(
+                "Objective: inspect large.txt. Observed: important detail repeats. Remaining: report."
+                    .to_string(),
+            ),
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: Some(Usage {
+                    input_tokens: 11_000,
+                    output_tokens: 30,
+                }),
+            },
+        ]);
+        mock.push_script(vec![
+            StreamEvent::TextDelta("done".to_string()),
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: Some(Usage {
+                    input_tokens: 3_000,
+                    output_tokens: 4,
+                }),
+            },
+        ]);
+
+        let mock = Arc::new(mock);
+        let events = EventBus::new(64);
+        let mut rx = events.subscribe();
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let agent_cfg = AgentConfig {
+            max_context_tokens: 12_000,
+            auto_compact: true,
+            ..Default::default()
+        };
+        let agent = Agent::new(mock.clone(), tools, events, &agent_cfg);
+
+        let outcome = agent.run("inspect large.txt", &ctx(dir)).await.unwrap();
+        assert_eq!(outcome.final_text, "done");
+        assert_eq!(outcome.usage.input_tokens, 14_010);
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[1].tools.is_empty());
+        assert!(matches!(
+            &requests[1].messages[0],
+            Message::System(text) if text.contains("compacting an active coding-agent conversation")
+        ));
+        assert!(requests[2].messages.iter().any(|message| {
+            matches!(message, Message::System(text) if text.starts_with(COMPACTED_CONTEXT_PREFIX))
+        }));
+        assert!(requests[2].messages.iter().any(|message| {
+            matches!(message, Message::User(text) if text == "inspect large.txt")
+        }));
+        let mut saw_compaction = false;
+        while let Ok(event) = rx.try_recv() {
+            saw_compaction |= matches!(
+                event,
+                KodeEvent::Note { text } if text.contains("context auto-compacted")
+            );
+        }
+        assert!(saw_compaction);
     }
 
     #[tokio::test]

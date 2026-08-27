@@ -3,6 +3,7 @@ mod auth;
 mod custom_commands;
 mod doctor;
 mod exec;
+mod intel_tools;
 mod models;
 mod pipeline;
 mod remember;

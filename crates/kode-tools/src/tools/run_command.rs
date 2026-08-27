@@ -130,7 +130,7 @@ impl Tool for RunCommand {
             if e.kind() == std::io::ErrorKind::NotFound {
                 let hint = match program.as_str() {
                     "rg" | "grep" | "ag" | "ack" | "findstr" => {
-                        " To search code use program `git` with args [\"grep\", \"-n\", \"<pattern>\"]."
+                        " Use the `code_search` tool when offered; otherwise use program `git` with args [\"grep\", \"-n\", \"<exact-pattern>\"]."
                     }
                     "cat" | "head" | "tail" | "less" | "more" | "type" => {
                         " Use the `read_file` tool instead."

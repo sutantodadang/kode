@@ -1,5 +1,6 @@
+use std::collections::HashSet;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use kode_agent::Agent;
@@ -8,7 +9,7 @@ use kode_core::config::{AgentConfig, IngatConfig, KodeConfig, PermissionMode};
 use kode_core::event::{EventBus, KodeEvent, NoteSource, TaskStep};
 use kode_core::{CancellationToken, UserInput};
 use kode_intel::{CodeIntelligence, ZindeksAdapter};
-use kode_memory::{EngineeringMemory, IngatAdapter, RememberTool};
+use kode_memory::{EngineeringMemory, IngatAdapter, MemorySearchTool, RememberTool};
 use kode_model::{OpenAiModel, OpenAiOptions, Usage};
 use kode_tools::ToolContext;
 use kode_tools::permission::PermissionHandler;
@@ -16,6 +17,8 @@ use kode_tools::registry::{ToolRegistry, ToolRuntime};
 use kode_tools::skills::SkillCatalog;
 use kode_tools::tools::UseSkill;
 use tokio::sync::mpsc;
+
+use crate::intel_tools::{CodeSearchTool, FileOutlineTool};
 
 /// Appended to the task text for the plan-mode turn (see
 /// [`run_plan_phase`]). The turn exposes no implementation tools; only the
@@ -28,6 +31,49 @@ Do not write code. You have no implementation tools available for this turn; `us
 /// service (successful or not). Guards against re-attempting on every task
 /// within a long-lived `kode` process (e.g. the TUI running many turns).
 static INGAT_AUTOSTART_ATTEMPTED: OnceLock<()> = OnceLock::new();
+static REPORTED_CONTEXT_BUDGETS: OnceLock<Mutex<HashSet<(String, String, u32)>>> = OnceLock::new();
+
+fn format_token_count(tokens: u32) -> String {
+    if tokens < 1_000 {
+        tokens.to_string()
+    } else if tokens < 1_000_000 {
+        format!("{:.0}k", tokens as f64 / 1_000.0)
+    } else {
+        format!("{:.1}m", tokens as f64 / 1_000_000.0)
+    }
+}
+
+fn should_report_context_budget(provider: &str, model: &str, window: u32) -> bool {
+    REPORTED_CONTEXT_BUDGETS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .map(|mut reported| reported.insert((provider.to_string(), model.to_string(), window)))
+        .unwrap_or(false)
+}
+
+fn register_code_intelligence_tools(
+    registry: &mut ToolRegistry,
+    intel: &Option<Arc<dyn CodeIntelligence>>,
+) {
+    if let Some(code_intel) = intel {
+        registry.register(Arc::new(CodeSearchTool::new(code_intel.clone())));
+        registry.register(Arc::new(FileOutlineTool::new(code_intel.clone())));
+    }
+}
+
+fn register_memory_tools(
+    registry: &mut ToolRegistry,
+    memory: &Option<Arc<dyn EngineeringMemory>>,
+    repository: Option<String>,
+) {
+    if let Some(memory) = memory {
+        registry.register(Arc::new(MemorySearchTool::new(
+            memory.clone(),
+            repository.clone(),
+        )));
+        registry.register(Arc::new(RememberTool::new(memory.clone(), repository)));
+    }
+}
 
 /// Machine-readable result of a completed pipeline run. UIs may keep using
 /// [`KodeEvent`] for live rendering, while headless callers use this value to
@@ -239,6 +285,36 @@ pub async fn run_task_with_input(
     mut steering: Option<mpsc::UnboundedReceiver<UserInput>>,
 ) -> anyhow::Result<TaskOutcome> {
     let model = ModelFactory::create(config)?;
+    let detected_context_window = if config.agent.max_context_tokens == 0 {
+        kode_model::catalog::context_window_tokens(&config.model.provider, &config.model.model)
+            .await
+    } else {
+        None
+    };
+    let agent_config = config.agent.resolved(detected_context_window);
+    if (config.agent.max_context_tokens == 0
+        || config.agent.context_budget_tokens == 0
+        || config.agent.history_budget_tokens == 0)
+        && should_report_context_budget(
+            &config.model.provider,
+            &config.model.model,
+            agent_config.max_context_tokens,
+        )
+    {
+        events.emit(KodeEvent::Note {
+            text: format!(
+                "adaptive context: {} window · {} repository · {} recent history · auto-compact {}",
+                format_token_count(agent_config.max_context_tokens),
+                format_token_count(agent_config.context_budget_tokens),
+                format_token_count(agent_config.history_budget_tokens),
+                if agent_config.auto_compact {
+                    "on"
+                } else {
+                    "off"
+                }
+            ),
+        });
+    }
 
     let ctx = ToolContext {
         workspace_root: cwd.to_path_buf(),
@@ -309,15 +385,14 @@ pub async fn run_task_with_input(
     }
 
     let mut registry = ToolRegistry::with_builtins();
+    register_code_intelligence_tools(&mut registry, &intel);
     if !skills.is_empty() {
         registry.register(Arc::new(UseSkill::new(skills.clone())));
     }
-    if let Some(mem) = &memory {
-        let repository = cwd
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string());
-        registry.register(Arc::new(RememberTool::new(mem.clone(), repository)));
-    }
+    let repository = cwd
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string());
+    register_memory_tools(&mut registry, &memory, repository);
 
     // Generic external MCP servers (kept architecturally separate from the
     // first-class Zindeks/Ingat integrations above). `_mcp_manager` owns the
@@ -345,10 +420,10 @@ pub async fn run_task_with_input(
         Some(config.model.effort.clone())
     };
     let agent =
-        Agent::new(model.clone(), tools, events.clone(), &config.agent).with_effort(effort.clone());
+        Agent::new(model.clone(), tools, events.clone(), &agent_config).with_effort(effort.clone());
 
     events.emit(KodeEvent::ContextCompilationStarted);
-    let compiler = ContextCompiler::new(intel, memory, config.agent.context_budget_tokens as usize);
+    let compiler = ContextCompiler::new(intel, memory, agent_config.context_budget_tokens as usize);
     let compiled = compiler
         .compile(
             &ContextRequest {
@@ -364,7 +439,7 @@ pub async fn run_task_with_input(
     });
     events.emit(knowledge_from(
         &compiled,
-        config.agent.context_budget_tokens as usize,
+        agent_config.context_budget_tokens as usize,
     ));
     events.emit(KodeEvent::Note {
         text: compiled.summary_line(),
@@ -378,7 +453,7 @@ pub async fn run_task_with_input(
     let initial_context = merge_agent_context(compiled.render(), skill_summary.as_deref());
 
     let (kept_history, history_truncated) =
-        kode_agent::select_history(history, config.agent.history_budget_tokens as usize);
+        kode_agent::select_history(history, agent_config.history_budget_tokens as usize);
     if history_truncated {
         events.emit(KodeEvent::Note {
             text: "(older conversation truncated)".to_string(),
@@ -394,7 +469,7 @@ pub async fn run_task_with_input(
             model.clone(),
             &events,
             handler.clone(),
-            &config.agent,
+            &agent_config,
             effort.clone(),
             input,
             initial_context.as_deref(),
@@ -1461,5 +1536,37 @@ mod knowledge_tests {
             10,
         );
         assert!(git_lines(&c).is_empty());
+    }
+
+    #[test]
+    fn available_code_intelligence_registers_search_and_outline_tools() {
+        let intel: Option<Arc<dyn CodeIntelligence>> =
+            Some(Arc::new(kode_intel::MockCodeIntelligence::default()));
+        let mut registry = ToolRegistry::new();
+
+        register_code_intelligence_tools(&mut registry, &intel);
+
+        let names = registry
+            .specs()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["code_search", "file_outline"]);
+    }
+
+    #[test]
+    fn available_memory_registers_search_and_remember_tools() {
+        let memory: Option<Arc<dyn EngineeringMemory>> =
+            Some(Arc::new(kode_memory::MockEngineeringMemory::default()));
+        let mut registry = ToolRegistry::new();
+
+        register_memory_tools(&mut registry, &memory, Some("kode".to_string()));
+
+        let names = registry
+            .specs()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["memory_search", "remember"]);
     }
 }
