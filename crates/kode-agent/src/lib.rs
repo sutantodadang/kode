@@ -10,7 +10,7 @@ use kode_core::config::AgentConfig;
 use kode_core::event::{EventBus, KodeEvent};
 use kode_core::{ImageAttachment, UserInput};
 use kode_model::{
-    Message, Model, ModelRequest, ResponseAccumulator, StreamEvent, ToolSpec, Usage,
+    Message, Model, ModelError, ModelRequest, ResponseAccumulator, StreamEvent, ToolSpec, Usage,
     collect_response,
 };
 use kode_tools::registry::ToolRuntime;
@@ -19,6 +19,7 @@ use prompt_budget::PromptBudget;
 use tokio::sync::mpsc;
 
 const MAX_TOOL_LABEL_CHARS: usize = 240;
+const MAX_MODEL_RETRY_DELAY_MS: u64 = 30_000;
 const COMPACTED_CONTEXT_PREFIX: &str = "Compacted work context:";
 const COMPACTION_PROMPT: &str = "You are compacting an active coding-agent conversation so work can continue without re-reading the full transcript. Produce a dense, factual structured summary. Preserve: the user's objective and corrections; decisions and constraints; exact file paths, symbols, commands, edits, and observed results; failed approaches and error text; repository state; current progress; and remaining work. Distinguish completed from pending work. Never invent facts. Omit pleasantries and repeated tool output. The original session remains stored, but this summary must be sufficient to continue correctly.";
 
@@ -94,6 +95,8 @@ pub struct Agent {
     events: EventBus,
     max_iterations: u32,
     max_tool_calls: u32,
+    model_retries: u32,
+    model_retry_base_ms: u64,
     prompt_budget: PromptBudget,
     auto_compact: bool,
     effort: Option<String>,
@@ -156,9 +159,36 @@ impl Agent {
             events,
             max_iterations: agent_cfg.max_iterations,
             max_tool_calls: agent_cfg.max_tool_calls,
+            model_retries: agent_cfg.model_retries.min(10),
+            model_retry_base_ms: agent_cfg.model_retry_base_ms,
             prompt_budget: PromptBudget::new(agent_cfg.max_context_tokens),
             auto_compact: agent_cfg.auto_compact,
             effort: None,
+        }
+    }
+
+    async fn wait_for_model_retry(
+        &self,
+        retry: u32,
+        error: &ModelError,
+        ctx: &ToolContext,
+    ) -> Result<()> {
+        let exponent = retry.saturating_sub(1).min(16);
+        let delay_ms = self
+            .model_retry_base_ms
+            .saturating_mul(1u64 << exponent)
+            .min(MAX_MODEL_RETRY_DELAY_MS);
+        let reason = truncate_tool_label(error.to_string().replace(['\r', '\n'], " "));
+        self.events.emit(KodeEvent::Note {
+            text: format!(
+                "model temporarily unavailable; retrying {retry}/{} in {delay_ms}ms ({reason})",
+                self.model_retries
+            ),
+        });
+
+        tokio::select! {
+            _ = ctx.cancel.cancelled() => Err(AgentError::Cancelled),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => Ok(()),
         }
     }
 
@@ -367,57 +397,77 @@ impl Agent {
 
             self.events.emit(KodeEvent::ModelStarted);
             let request_messages = self.prompt_budget.prepare(&messages, &tools)?;
-            let mut stream = self
-                .model
-                .stream(ModelRequest {
-                    messages: request_messages,
-                    tools,
-                    max_tokens: Some(self.prompt_budget.output_tokens()),
-                    temperature: None,
-                    effort: self.effort.clone(),
-                })
-                .await?;
-
-            let mut acc = ResponseAccumulator::new();
+            let model_request = ModelRequest {
+                messages: request_messages,
+                tools,
+                max_tokens: Some(self.prompt_budget.output_tokens()),
+                temperature: None,
+                effort: self.effort.clone(),
+            };
             let mut steers_after_response = Vec::new();
-            let response = loop {
-                let steer = async {
-                    if steering_open {
-                        match steering.as_deref_mut() {
-                            Some(receiver) => receiver.recv().await,
-                            None => std::future::pending::<Option<UserInput>>().await,
-                        }
-                    } else {
-                        std::future::pending::<Option<UserInput>>().await
+            let mut retry = 0;
+            let response = 'model_attempt: loop {
+                let mut stream = match self.model.stream(model_request.clone()).await {
+                    Ok(stream) => stream,
+                    Err(error) if error.is_retryable() && retry < self.model_retries => {
+                        retry += 1;
+                        self.wait_for_model_retry(retry, &error, ctx).await?;
+                        continue;
                     }
+                    Err(error) => return Err(AgentError::Model(error)),
                 };
-                tokio::select! {
-                    biased;
-                    _ = ctx.cancel.cancelled() => {
-                        return Err(AgentError::Cancelled);
-                    }
-                    message = steer => {
-                        match message {
-                            Some(message) if !message.is_empty() => {
-                                self.events.emit(KodeEvent::SteeringAccepted {
-                                    message: message.clone(),
-                                });
-                                steers_after_response.push(message);
+                let mut acc = ResponseAccumulator::new();
+                let mut saw_model_delta = false;
+
+                loop {
+                    let steer = async {
+                        if steering_open {
+                            match steering.as_deref_mut() {
+                                Some(receiver) => receiver.recv().await,
+                                None => std::future::pending::<Option<UserInput>>().await,
                             }
-                            Some(_) => {}
-                            None => steering_open = false,
+                        } else {
+                            std::future::pending::<Option<UserInput>>().await
                         }
-                    }
-                    item = stream.next() => {
-                        match item {
-                            Some(Ok(event)) => {
-                                if let StreamEvent::TextDelta(text) = &event {
-                                    self.events.emit(KodeEvent::ModelToken { text: text.clone() });
+                    };
+                    tokio::select! {
+                        biased;
+                        _ = ctx.cancel.cancelled() => {
+                            return Err(AgentError::Cancelled);
+                        }
+                        message = steer => {
+                            match message {
+                                Some(message) if !message.is_empty() => {
+                                    self.events.emit(KodeEvent::SteeringAccepted {
+                                        message: message.clone(),
+                                    });
+                                    steers_after_response.push(message);
                                 }
-                                acc.push(event);
+                                Some(_) => {}
+                                None => steering_open = false,
                             }
-                            Some(Err(e)) => return Err(AgentError::Model(e)),
-                            None => break acc.finish()?,
+                        }
+                        item = stream.next() => {
+                            match item {
+                                Some(Ok(event)) => {
+                                    saw_model_delta = true;
+                                    if let StreamEvent::TextDelta(text) = &event {
+                                        self.events.emit(KodeEvent::ModelToken { text: text.clone() });
+                                    }
+                                    acc.push(event);
+                                }
+                                Some(Err(error))
+                                    if !saw_model_delta
+                                        && error.is_retryable()
+                                        && retry < self.model_retries =>
+                                {
+                                    retry += 1;
+                                    self.wait_for_model_retry(retry, &error, ctx).await?;
+                                    continue 'model_attempt;
+                                }
+                                Some(Err(error)) => return Err(AgentError::Model(error)),
+                                None => break 'model_attempt acc.finish()?,
+                            }
                         }
                     }
                 }
@@ -643,6 +693,270 @@ mod tests {
     struct DelayedSteeringModel {
         calls: AtomicUsize,
         requests: Mutex<Vec<ModelRequest>>,
+    }
+
+    struct OverloadedThenSuccessModel {
+        calls: AtomicUsize,
+    }
+
+    struct InitialFailureModel {
+        calls: AtomicUsize,
+        status: u16,
+        message: &'static str,
+        failures: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl Model for InitialFailureModel {
+        async fn stream(&self, _request: ModelRequest) -> kode_model::Result<ModelStream> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call < self.failures {
+                return Err(kode_model::ModelError::Api {
+                    status: self.status,
+                    message: self.message.to_string(),
+                });
+            }
+            Ok(Box::pin(futures::stream::iter([
+                Ok(StreamEvent::TextDelta("recovered".to_string())),
+                Ok(StreamEvent::Finished {
+                    reason: FinishReason::Stop,
+                    usage: None,
+                }),
+            ])))
+        }
+
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities {
+                id: "initial-failure-test".to_string(),
+                supports_tools: true,
+                supports_streaming: true,
+            }
+        }
+    }
+
+    struct PartialThenOverloadedModel {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Model for PartialThenOverloadedModel {
+        async fn stream(&self, _request: ModelRequest) -> kode_model::Result<ModelStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures::stream::iter([
+                Ok(StreamEvent::TextDelta("partial".to_string())),
+                Err(kode_model::ModelError::Api {
+                    status: 503,
+                    message: "service unavailable".to_string(),
+                }),
+            ])))
+        }
+
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities {
+                id: "partial-failure-test".to_string(),
+                supports_tools: true,
+                supports_streaming: true,
+            }
+        }
+    }
+
+    fn retry_test_config() -> AgentConfig {
+        AgentConfig {
+            model_retry_base_ms: 0,
+            ..Default::default()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Model for OverloadedThenSuccessModel {
+        async fn stream(&self, _request: ModelRequest) -> kode_model::Result<ModelStream> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                return Ok(Box::pin(futures::stream::iter([Err(
+                    kode_model::ModelError::Api {
+                        status: 0,
+                        message: "Our servers are currently overloaded. Please try again later."
+                            .to_string(),
+                    },
+                )])));
+            }
+
+            Ok(Box::pin(futures::stream::iter([
+                Ok(StreamEvent::TextDelta("recovered".to_string())),
+                Ok(StreamEvent::Finished {
+                    reason: FinishReason::Stop,
+                    usage: None,
+                }),
+            ])))
+        }
+
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities {
+                id: "overload-retry-test".to_string(),
+                supports_tools: true,
+                supports_streaming: true,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_transient_stream_failure_before_first_delta() {
+        let model = Arc::new(OverloadedThenSuccessModel {
+            calls: AtomicUsize::new(0),
+        });
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let agent = Agent::new(
+            model.clone(),
+            tools,
+            EventBus::new(64),
+            &retry_test_config(),
+        );
+
+        let outcome = agent
+            .run("continue the task", &ctx(temp_dir()))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.final_text, "recovered");
+        assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn retries_transient_failure_before_stream_opens() {
+        let model = Arc::new(InitialFailureModel {
+            calls: AtomicUsize::new(0),
+            status: 503,
+            message: "service unavailable",
+            failures: 1,
+        });
+        let events = EventBus::new(64);
+        let mut rx = events.subscribe();
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let agent = Agent::new(model.clone(), tools, events, &retry_test_config());
+
+        let outcome = agent
+            .run("continue the task", &ctx(temp_dir()))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.final_text, "recovered");
+        assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+        assert!(
+            (0..rx.len())
+                .filter_map(|_| rx.try_recv().ok())
+                .any(|event| {
+                    matches!(event, KodeEvent::Note { text } if text.contains("retrying 1/3"))
+                })
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_permanent_model_error() {
+        let model = Arc::new(InitialFailureModel {
+            calls: AtomicUsize::new(0),
+            status: 401,
+            message: "invalid credentials",
+            failures: usize::MAX,
+        });
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let agent = Agent::new(
+            model.clone(),
+            tools,
+            EventBus::new(64),
+            &retry_test_config(),
+        );
+
+        let error = agent
+            .run("continue the task", &ctx(temp_dir()))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AgentError::Model(ModelError::Api { status: 401, .. })
+        ));
+        assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stops_after_configured_transient_retries_are_exhausted() {
+        let model = Arc::new(InitialFailureModel {
+            calls: AtomicUsize::new(0),
+            status: 503,
+            message: "service unavailable",
+            failures: usize::MAX,
+        });
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let config = AgentConfig {
+            model_retries: 2,
+            model_retry_base_ms: 0,
+            ..Default::default()
+        };
+        let agent = Agent::new(model.clone(), tools, EventBus::new(64), &config);
+
+        let error = agent
+            .run("continue the task", &ctx(temp_dir()))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AgentError::Model(ModelError::Api { status: 503, .. })
+        ));
+        assert_eq!(model.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_after_partial_model_output() {
+        let model = Arc::new(PartialThenOverloadedModel {
+            calls: AtomicUsize::new(0),
+        });
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let agent = Agent::new(
+            model.clone(),
+            tools,
+            EventBus::new(64),
+            &retry_test_config(),
+        );
+
+        let error = agent
+            .run("continue the task", &ctx(temp_dir()))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AgentError::Model(ModelError::Api { status: 503, .. })
+        ));
+        assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_model_retry_backoff() {
+        let model = Arc::new(InitialFailureModel {
+            calls: AtomicUsize::new(0),
+            status: 503,
+            message: "service unavailable",
+            failures: usize::MAX,
+        });
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let config = AgentConfig {
+            model_retry_base_ms: 10_000,
+            ..Default::default()
+        };
+        let agent = Agent::new(model.clone(), tools, EventBus::new(64), &config);
+        let tool_ctx = ctx(temp_dir());
+        let cancel = tool_ctx.cancel.clone();
+
+        let run = agent.run("continue the task", &tool_ctx);
+        let cancel_soon = async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cancel.cancel();
+        };
+        let (result, ()) = tokio::join!(run, cancel_soon);
+
+        assert!(matches!(result.unwrap_err(), AgentError::Cancelled));
+        assert_eq!(model.calls.load(Ordering::SeqCst), 1);
     }
 
     #[async_trait::async_trait]

@@ -53,6 +53,14 @@ fn default_max_tool_calls() -> u32 {
     100
 }
 
+fn default_model_retries() -> u32 {
+    3
+}
+
+fn default_model_retry_base_ms() -> u64 {
+    500
+}
+
 fn default_max_context_tokens() -> u32 {
     0
 }
@@ -297,6 +305,12 @@ pub struct AgentConfig {
     pub max_iterations: u32,
     #[serde(default = "default_max_tool_calls")]
     pub max_tool_calls: u32,
+    /// Number of retries after the initial model request for transient errors.
+    #[serde(default = "default_model_retries")]
+    pub model_retries: u32,
+    /// Initial exponential-backoff delay between model retries.
+    #[serde(default = "default_model_retry_base_ms")]
+    pub model_retry_base_ms: u64,
     #[serde(default = "default_max_context_tokens")]
     pub max_context_tokens: u32,
     #[serde(default = "default_context_budget_tokens")]
@@ -312,6 +326,8 @@ impl Default for AgentConfig {
         Self {
             max_iterations: default_max_iterations(),
             max_tool_calls: default_max_tool_calls(),
+            model_retries: default_model_retries(),
+            model_retry_base_ms: default_model_retry_base_ms(),
             max_context_tokens: default_max_context_tokens(),
             context_budget_tokens: default_context_budget_tokens(),
             history_budget_tokens: default_history_budget_tokens(),
@@ -505,6 +521,8 @@ mod tests {
         assert!(cfg.ingat.autostart);
         assert_eq!(cfg.agent.max_iterations, 80);
         assert_eq!(cfg.agent.max_tool_calls, 100);
+        assert_eq!(cfg.agent.model_retries, 3);
+        assert_eq!(cfg.agent.model_retry_base_ms, 500);
         assert_eq!(cfg.agent.max_context_tokens, 0);
         assert_eq!(cfg.agent.context_budget_tokens, 0);
         assert_eq!(cfg.agent.history_budget_tokens, 0);
@@ -585,6 +603,15 @@ timeout_seconds = 120
         let cfg = KodeConfig::load(&dir).unwrap();
         assert_eq!(cfg.agent.max_iterations, 5);
         assert_eq!(cfg.agent.history_budget_tokens, 0);
+    }
+
+    #[test]
+    fn model_retry_settings_deserialize() {
+        let cfg: KodeConfig =
+            toml::from_str("[agent]\nmodel_retries = 5\nmodel_retry_base_ms = 250\n").unwrap();
+
+        assert_eq!(cfg.agent.model_retries, 5);
+        assert_eq!(cfg.agent.model_retry_base_ms, 250);
     }
 
     #[test]

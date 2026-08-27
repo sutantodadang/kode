@@ -74,6 +74,8 @@ autostart = true
 |---|---|---|---|
 | `max_iterations` | integer | `80` | Upper bound on agent loop iterations per task, as a runaway guard. |
 | `max_tool_calls` | integer | `100` | Upper bound on total tool calls per task. |
+| `model_retries` | integer | `3` | Retries a transient model failure without consuming another agent iteration. Capped at 10; set to `0` to disable. A stream is retried only before any model delta, so partial responses and tool calls are never duplicated. |
+| `model_retry_base_ms` | integer | `500` | Initial retry delay in milliseconds. Subsequent retries use exponential backoff, capped at 30 seconds, and remain immediately cancellable. |
 | `max_context_tokens` | integer | `0` (auto) | Total model window Kode may use. Auto reads live provider metadata when available, then falls back conservatively. Set a non-zero value to override detection. |
 | `context_budget_tokens` | integer | `0` (auto) | Repository knowledge budget. Auto uses roughly 10% of the resolved model window, bounded to 16k–64k (and never more than a quarter of small windows). |
 | `history_budget_tokens` | integer | `0` (auto) | Verbatim recent-session budget. Auto uses roughly 30% of the resolved window, bounded to 6k–256k. Older turns remain stored in the session even when omitted from verbatim replay. |
@@ -83,6 +85,8 @@ autostart = true
 [agent]
 max_iterations = 80
 max_tool_calls = 100
+model_retries = 3
+model_retry_base_ms = 500
 max_context_tokens = 0
 context_budget_tokens = 0
 history_budget_tokens = 0
@@ -185,6 +189,8 @@ autostart = true
 [agent]
 max_iterations = 80
 max_tool_calls = 100
+model_retries = 3
+model_retry_base_ms = 500
 max_context_tokens = 0
 context_budget_tokens = 0
 history_budget_tokens = 0
