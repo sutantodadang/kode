@@ -45,10 +45,6 @@ fn default_ingat_url() -> String {
     "http://127.0.0.1:3200".to_string()
 }
 
-fn default_max_iterations() -> u32 {
-    80
-}
-
 fn default_max_tool_calls() -> u32 {
     100
 }
@@ -59,6 +55,14 @@ fn default_model_retries() -> u32 {
 
 fn default_model_retry_base_ms() -> u64 {
     500
+}
+
+fn default_subagents_enabled() -> bool {
+    true
+}
+
+fn default_subagent_max_result_chars() -> usize {
+    12_000
 }
 
 fn default_max_context_tokens() -> u32 {
@@ -301,8 +305,6 @@ impl Default for IngatConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentConfig {
-    #[serde(default = "default_max_iterations")]
-    pub max_iterations: u32,
     #[serde(default = "default_max_tool_calls")]
     pub max_tool_calls: u32,
     /// Number of retries after the initial model request for transient errors.
@@ -319,12 +321,14 @@ pub struct AgentConfig {
     pub history_budget_tokens: u32,
     #[serde(default = "default_true")]
     pub auto_compact: bool,
+    /// Native, non-recursive leaf-agent delegation.
+    #[serde(default)]
+    pub subagents: SubagentConfig,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            max_iterations: default_max_iterations(),
             max_tool_calls: default_max_tool_calls(),
             model_retries: default_model_retries(),
             model_retry_base_ms: default_model_retry_base_ms(),
@@ -332,6 +336,27 @@ impl Default for AgentConfig {
             context_budget_tokens: default_context_budget_tokens(),
             history_budget_tokens: default_history_budget_tokens(),
             auto_compact: true,
+            subagents: SubagentConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SubagentConfig {
+    /// Exposes the `delegate_task` tool to the root agent.
+    #[serde(default = "default_subagents_enabled")]
+    pub enabled: bool,
+    /// Maximum child summary size returned to the root agent.
+    #[serde(default = "default_subagent_max_result_chars")]
+    pub max_result_chars: usize,
+}
+
+impl Default for SubagentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_subagents_enabled(),
+            max_result_chars: default_subagent_max_result_chars(),
         }
     }
 }
@@ -519,7 +544,6 @@ mod tests {
         assert!(cfg.ingat.enabled);
         assert_eq!(cfg.ingat.url, "http://127.0.0.1:3200");
         assert!(cfg.ingat.autostart);
-        assert_eq!(cfg.agent.max_iterations, 80);
         assert_eq!(cfg.agent.max_tool_calls, 100);
         assert_eq!(cfg.agent.model_retries, 3);
         assert_eq!(cfg.agent.model_retry_base_ms, 500);
@@ -527,6 +551,8 @@ mod tests {
         assert_eq!(cfg.agent.context_budget_tokens, 0);
         assert_eq!(cfg.agent.history_budget_tokens, 0);
         assert!(cfg.agent.auto_compact);
+        assert!(cfg.agent.subagents.enabled);
+        assert_eq!(cfg.agent.subagents.max_result_chars, 12_000);
         assert_eq!(cfg.permissions.default_mode, PermissionMode::Ask);
         assert!(cfg.mcp.servers.is_empty());
         assert_eq!(cfg.verify.timeout_seconds, 600);
@@ -581,7 +607,7 @@ timeout_seconds = 120
         std::fs::create_dir_all(&kode_dir).unwrap();
         std::fs::write(
             kode_dir.join("config.toml"),
-            "[agent]\nmax_iterations = 5\n",
+            "[agent]\nauto_compact = false\n",
         )
         .unwrap();
 
@@ -596,13 +622,19 @@ timeout_seconds = 120
         std::fs::create_dir_all(&kode_dir).unwrap();
         std::fs::write(
             kode_dir.join("config.toml"),
-            concat!("[agent]\n", "max_iterations = 5\n"),
+            concat!("[agent]\n", "max_tool_calls = 5\n"),
         )
         .unwrap();
 
         let cfg = KodeConfig::load(&dir).unwrap();
-        assert_eq!(cfg.agent.max_iterations, 5);
         assert_eq!(cfg.agent.history_budget_tokens, 0);
+    }
+
+    #[test]
+    fn legacy_max_iterations_is_ignored() {
+        let cfg: KodeConfig = toml::from_str("[agent]\nmax_iterations = 1\n").unwrap();
+
+        assert_eq!(cfg.agent, AgentConfig::default());
     }
 
     #[test]
@@ -612,6 +644,16 @@ timeout_seconds = 120
 
         assert_eq!(cfg.agent.model_retries, 5);
         assert_eq!(cfg.agent.model_retry_base_ms, 250);
+    }
+
+    #[test]
+    fn subagent_settings_deserialize() {
+        let cfg: KodeConfig =
+            toml::from_str("[agent.subagents]\nenabled = false\nmax_result_chars = 4096\n")
+                .unwrap();
+
+        assert!(!cfg.agent.subagents.enabled);
+        assert_eq!(cfg.agent.subagents.max_result_chars, 4096);
     }
 
     #[test]
@@ -699,12 +741,12 @@ timeout_seconds = 120
         std::fs::create_dir_all(&kode_dir).unwrap();
         std::fs::write(
             kode_dir.join("config.toml"),
-            "[agent]\nmax_iterations = 7\n\n[permissions]\ndefault = \"deny\"\n",
+            "[agent]\nmax_tool_calls = 7\n\n[permissions]\ndefault = \"deny\"\n",
         )
         .unwrap();
 
         let cfg = KodeConfig::load(&dir).unwrap();
-        assert_eq!(cfg.agent.max_iterations, 7);
+        assert_eq!(cfg.agent.max_tool_calls, 7);
         assert_eq!(cfg.permissions.default_mode, PermissionMode::Deny);
     }
 
@@ -770,14 +812,14 @@ timeout_seconds = 120
         std::fs::create_dir_all(&kode_dir).unwrap();
         std::fs::write(
             kode_dir.join("config.toml"),
-            "[agent]\nmax_iterations = 7\n\n[model]\nprovider = \"codex\"\n",
+            "[agent]\nmax_tool_calls = 7\n\n[model]\nprovider = \"codex\"\n",
         )
         .unwrap();
 
         KodeConfig::update_model_selection(&dir, Some("gpt-5.6-sol"), None).unwrap();
 
         let cfg = KodeConfig::load(&dir).unwrap();
-        assert_eq!(cfg.agent.max_iterations, 7);
+        assert_eq!(cfg.agent.max_tool_calls, 7);
         assert_eq!(cfg.model.provider, "codex");
         assert_eq!(cfg.model.model, "gpt-5.6-sol");
         assert_eq!(cfg.model.effort, "");
@@ -790,7 +832,7 @@ timeout_seconds = 120
         std::fs::create_dir_all(&kode_dir).unwrap();
         std::fs::write(
             kode_dir.join("config.toml"),
-            "[agent]\nmax_iterations = 7\n\n[mcp.servers.everything]\ncommand = \"npx\"\n",
+            "[agent]\nmax_tool_calls = 7\n\n[mcp.servers.everything]\ncommand = \"npx\"\n",
         )
         .unwrap();
 
@@ -799,7 +841,7 @@ timeout_seconds = 120
         let cfg = KodeConfig::load(&dir).unwrap();
         assert_eq!(cfg.model.provider, "codex");
         assert_eq!(cfg.model.model, "");
-        assert_eq!(cfg.agent.max_iterations, 7);
+        assert_eq!(cfg.agent.max_tool_calls, 7);
         assert_eq!(cfg.mcp.servers.get("everything").unwrap().command, "npx");
     }
 }

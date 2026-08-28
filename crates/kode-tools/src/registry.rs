@@ -4,12 +4,14 @@ use kode_core::config::PermissionMode;
 use kode_model::ToolSpec;
 
 use crate::error::{Result, ToolError};
+use crate::path::WriteScope;
 use crate::permission::{Decision, PermissionHandler, decide};
 use crate::tools::{
     ApplyPatch, FetchUrl, GitDiff, GitStatus, ReadFile, RunCommand, WebSearch, WriteFile,
 };
 use crate::{Tool, ToolContext, ToolOutput};
 
+#[derive(Clone)]
 pub struct ToolRegistry {
     tools: Vec<Arc<dyn Tool>>,
 }
@@ -56,12 +58,27 @@ impl ToolRegistry {
         registry.register(Arc::new(WebSearch));
         registry
     }
+
+    /// Child-safe builtins: no arbitrary command execution. Mutations are
+    /// further constrained by [`WriteScope`] in [`ToolRuntime`].
+    pub fn with_subagent_builtins() -> Self {
+        let mut registry = Self::new();
+        registry.register(Arc::new(ReadFile));
+        registry.register(Arc::new(WriteFile));
+        registry.register(Arc::new(ApplyPatch));
+        registry.register(Arc::new(GitStatus));
+        registry.register(Arc::new(GitDiff));
+        registry.register(Arc::new(FetchUrl));
+        registry.register(Arc::new(WebSearch));
+        registry
+    }
 }
 
 pub struct ToolRuntime {
     registry: ToolRegistry,
     mode: PermissionMode,
     handler: Arc<dyn PermissionHandler>,
+    write_scope: Option<WriteScope>,
 }
 
 impl ToolRuntime {
@@ -74,7 +91,13 @@ impl ToolRuntime {
             registry,
             mode,
             handler,
+            write_scope: None,
         }
+    }
+
+    pub fn with_write_scope(mut self, write_scope: WriteScope) -> Self {
+        self.write_scope = Some(write_scope);
+        self
     }
 
     pub fn builtin_runtime(mode: PermissionMode, handler: Arc<dyn PermissionHandler>) -> Self {
@@ -100,6 +123,24 @@ impl ToolRuntime {
             .get(name)
             .ok_or_else(|| ToolError::UnknownTool(name.to_string()))?;
 
+        if tool.required_permission() == crate::RequiredPermission::Mutating
+            && let Some(scope) = &self.write_scope
+        {
+            if !matches!(name, "write_file" | "apply_patch") {
+                return Err(ToolError::Denied(format!(
+                    "{name} is not available inside a scoped subagent"
+                )));
+            }
+            let path = args
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| ToolError::InvalidArgs {
+                    tool: name.to_string(),
+                    message: "path must be a string".to_string(),
+                })?;
+            scope.ensure_contains(&ctx.workspace_root, path)?;
+        }
+
         match decide(self.mode, tool.required_permission()) {
             Decision::Allow => {}
             Decision::Deny => {
@@ -116,6 +157,24 @@ impl ToolRuntime {
         }
 
         tool.execute(args, ctx).await
+    }
+
+    /// Executes a tool and returns its dynamic mutation effect. This differs
+    /// from [`Self::required_permission`] for composite tools such as native
+    /// delegation, whose read-only and writable invocations share one schema.
+    pub async fn execute_with_effect(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<(ToolOutput, bool)> {
+        let tool = self
+            .registry
+            .get(name)
+            .ok_or_else(|| ToolError::UnknownTool(name.to_string()))?;
+        let output = self.execute(name, args, ctx).await?;
+        let mutated = tool.output_mutated(&output);
+        Ok((output, mutated))
     }
 }
 
@@ -160,6 +219,48 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing {expected}");
         }
+    }
+
+    #[test]
+    fn subagent_builtins_exclude_arbitrary_command_execution() {
+        let names = ToolRegistry::with_subagent_builtins()
+            .specs()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert!(!names.contains(&"run_command".to_string()));
+        assert!(names.contains(&"write_file".to_string()));
+        assert!(names.contains(&"apply_patch".to_string()));
+    }
+
+    #[tokio::test]
+    async fn scoped_runtime_rejects_write_outside_ownership() {
+        let dir = std::env::temp_dir().join(format!(
+            "kode-tools-scope-{}-{}",
+            std::process::id(),
+            nanos()
+        ));
+        std::fs::create_dir_all(dir.join("owned")).unwrap();
+        let scope = WriteScope::new(&dir, &["owned".to_string()]).unwrap();
+        let runtime = ToolRuntime::new(
+            ToolRegistry::with_subagent_builtins(),
+            PermissionMode::Allow,
+            Arc::new(AutoApprove),
+        )
+        .with_write_scope(scope);
+
+        let error = runtime
+            .execute(
+                "write_file",
+                serde_json::json!({"path": "elsewhere.txt", "content": "no"}),
+                &ToolContext {
+                    workspace_root: dir,
+                    cancel: kode_core::CancellationToken::new(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::Denied(_)));
     }
 
     #[tokio::test]

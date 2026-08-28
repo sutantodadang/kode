@@ -52,6 +52,19 @@ pub enum KodeEvent {
         /// success). Frontends render it next to the tool name.
         error: Option<String>,
     },
+    /// A bounded leaf agent started. Child model/tool traffic stays private;
+    /// frontends receive only these lifecycle receipts.
+    SubagentStarted {
+        id: String,
+        ownership: Vec<String>,
+    },
+    /// A bounded leaf agent completed or failed without changing the parent
+    /// agent's top-level run state.
+    SubagentFinished {
+        id: String,
+        ok: bool,
+        summary: String,
+    },
     /// A user steering message was accepted into the active agent's message
     /// history. The TUI uses this acknowledgment when persisting the turn.
     SteeringAccepted {

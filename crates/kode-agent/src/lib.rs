@@ -1,7 +1,9 @@
 mod error;
 mod prompt_budget;
+mod subagent;
 
 pub use error::{AgentError, Result};
+pub use subagent::SubagentTool;
 
 use std::sync::Arc;
 
@@ -14,7 +16,7 @@ use kode_model::{
     collect_response,
 };
 use kode_tools::registry::ToolRuntime;
-use kode_tools::{RequiredPermission, ToolContext, ToolError};
+use kode_tools::{ToolContext, ToolError};
 use prompt_budget::PromptBudget;
 use tokio::sync::mpsc;
 
@@ -45,6 +47,22 @@ fn truncate_tool_label(label: String) -> String {
 }
 
 fn tool_event_label(name: &str, arguments: &serde_json::Value) -> String {
+    if name == "delegate_task" {
+        let id = arguments
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("leaf");
+        let mode = if arguments
+            .get("read_only")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true)
+        {
+            "read-only"
+        } else {
+            "scoped write"
+        };
+        return truncate_tool_label(format!("{name} · {id} · {mode}"));
+    }
     if name != "run_command" {
         return name.to_string();
     }
@@ -80,7 +98,9 @@ fn system_prompt() -> String {
 
 Environment: OS is `{os}`. `run_command` spawns the program directly with NO shell: no pipes, redirects, globs or builtins, and Unix tools such as `rg`, `grep`, `find`, `cat`, `ls`, `sed` are NOT guaranteed to exist (they usually do not on Windows). When `code_search` and `file_outline` are offered, use them first for conceptual, symbol, implementation, and call-site discovery because they query the indexed code graph. Use `git grep` through `run_command` only for exact literal matching or when code-intelligence tools are unavailable. To read exact file contents use `read_file`. Do not retry a program that was reported as not found.
 
-Skills: when repository context lists available skills, call `use_skill` before taking task actions if the user names a skill (for example `$review`) or the task clearly matches a skill description. Read `SKILL.md` first, then use `use_skill` with a relative `path` for any referenced resource you need. User instructions override skill instructions.",
+Skills: when repository context lists available skills, call `use_skill` before taking task actions if the user names a skill (for example `$review`) or the task clearly matches a skill description. Read `SKILL.md` first, then use `use_skill` with a relative `path` for any referenced resource you need. User instructions override skill instructions.
+
+Delegation: when `delegate_task` is offered, use it only for an independent, bounded leaf task that materially helps the root task. Give the child complete context and narrow, explicit ownership. Prefer read-only investigation. The root agent owns integration, conflict resolution, final verification, and the final user response. Never delegate the entire task.",
         os = std::env::consts::OS
     )
 }
@@ -93,7 +113,6 @@ pub struct Agent {
     model: Arc<dyn Model>,
     tools: ToolRuntime,
     events: EventBus,
-    max_iterations: u32,
     max_tool_calls: u32,
     model_retries: u32,
     model_retry_base_ms: u64,
@@ -157,7 +176,6 @@ impl Agent {
             model,
             tools,
             events,
-            max_iterations: agent_cfg.max_iterations,
             max_tool_calls: agent_cfg.max_tool_calls,
             model_retries: agent_cfg.model_retries.min(10),
             model_retry_base_ms: agent_cfg.model_retry_base_ms,
@@ -349,7 +367,9 @@ impl Agent {
         let mut steering_open = steering.is_some();
         let mut compaction_available = self.auto_compact;
 
-        for iteration in 1..=self.max_iterations {
+        let mut iteration = 0_u32;
+        loop {
+            iteration = iteration.saturating_add(1);
             if ctx.cancel.is_cancelled() {
                 return Err(AgentError::Cancelled);
             }
@@ -543,13 +563,11 @@ impl Agent {
 
                 match self
                     .tools
-                    .execute(&call.name, call.arguments.clone(), ctx)
+                    .execute_with_effect(&call.name, call.arguments.clone(), ctx)
                     .await
                 {
-                    Ok(out) => {
-                        if self.tools.required_permission(&call.name)
-                            == Some(RequiredPermission::Mutating)
-                        {
+                    Ok((out, tool_mutated)) => {
+                        if tool_mutated {
                             mutated = true;
                         }
                         self.events.emit(KodeEvent::ToolFinished {
@@ -581,8 +599,6 @@ impl Agent {
 
             messages.extend(steers_after_response.into_iter().map(Message::user));
         }
-
-        Err(AgentError::IterationLimit(self.max_iterations))
     }
 }
 
@@ -673,11 +689,23 @@ mod tests {
     }
 
     #[test]
+    fn delegate_task_label_shows_child_and_mode() {
+        assert_eq!(
+            tool_event_label(
+                "delegate_task",
+                &serde_json::json!({"id": "api_tests", "read_only": false})
+            ),
+            "delegate_task · api_tests · scoped write"
+        );
+    }
+
+    #[test]
     fn system_prompt_requires_progressive_skill_loading() {
         let prompt = system_prompt();
         assert!(prompt.contains("call `use_skill`"));
         assert!(prompt.contains("Read `SKILL.md` first"));
         assert!(prompt.contains("User instructions override skill instructions"));
+        assert!(prompt.contains("The root agent owns integration"));
     }
 
     #[test]
@@ -1317,10 +1345,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn iteration_limit_returns_err() {
+    async fn continues_past_eighty_iterations() {
         let dir = temp_dir();
         let mock = MockModel::new();
-        for i in 0..3 {
+        for i in 0..80 {
             let mut script = read_file_call(0, "call", &format!("f{i}.txt"));
             script.push(StreamEvent::Finished {
                 reason: FinishReason::ToolCalls,
@@ -1328,16 +1356,26 @@ mod tests {
             });
             mock.push_script(script);
         }
+        mock.push_script(vec![
+            StreamEvent::TextDelta("finished".to_string()),
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: None,
+            },
+        ]);
 
         let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
-        let agent_cfg = AgentConfig {
-            max_iterations: 3,
-            ..Default::default()
-        };
-        let agent = Agent::new(Arc::new(mock), tools, EventBus::new(64), &agent_cfg);
+        let agent = Agent::new(
+            Arc::new(mock),
+            tools,
+            EventBus::new(256),
+            &AgentConfig::default(),
+        );
 
-        let err = agent.run("loop forever", &ctx(dir)).await.unwrap_err();
-        assert!(matches!(err, AgentError::IterationLimit(3)));
+        let outcome = agent.run("long task", &ctx(dir)).await.unwrap();
+        assert_eq!(outcome.final_text, "finished");
+        assert_eq!(outcome.iterations, 81);
+        assert_eq!(outcome.tool_calls, 80);
     }
 
     #[tokio::test]

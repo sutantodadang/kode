@@ -72,7 +72,6 @@ autostart = true
 
 | Key | Type | Default | Effect |
 |---|---|---|---|
-| `max_iterations` | integer | `80` | Upper bound on agent loop iterations per task, as a runaway guard. |
 | `max_tool_calls` | integer | `100` | Upper bound on total tool calls per task. |
 | `model_retries` | integer | `3` | Retries a transient model failure without consuming another agent iteration. Capped at 10; set to `0` to disable. A stream is retried only before any model delta, so partial responses and tool calls are never duplicated. |
 | `model_retry_base_ms` | integer | `500` | Initial retry delay in milliseconds. Subsequent retries use exponential backoff, capped at 30 seconds, and remain immediately cancellable. |
@@ -83,7 +82,6 @@ autostart = true
 
 ```toml
 [agent]
-max_iterations = 80
 max_tool_calls = 100
 model_retries = 3
 model_retry_base_ms = 500
@@ -92,6 +90,21 @@ context_budget_tokens = 0
 history_budget_tokens = 0
 auto_compact = true
 ```
+
+## `[agent.subagents]`
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `enabled` | bool | `true` | Exposes the native `delegate_task` tool to the root agent. Set `false` to disable delegation entirely. |
+| `max_result_chars` | integer | `12000` | Maximum child summary size returned to the root. Values are clamped to 1,000–50,000 characters. |
+
+```toml
+[agent.subagents]
+enabled = true
+max_result_chars = 12000
+```
+
+Sub-agents are bounded leaf workers, not independent roots. They share the selected model and workspace but receive no parent conversation history, cannot delegate again, cannot run arbitrary commands, and never receive external MCP tools. Read-only tasks cannot mutate. A writable task must declare narrower workspace-relative ownership; `write_file` and `apply_patch` are rejected outside that scope. Kode runs one child at a time so workspace writes cannot overlap, and parent cancellation also cancels the active child. The root remains responsible for integration and final verification.
 
 ## `[permissions]`
 
@@ -187,7 +200,6 @@ url = "http://127.0.0.1:3200"
 autostart = true
 
 [agent]
-max_iterations = 80
 max_tool_calls = 100
 model_retries = 3
 model_retry_base_ms = 500
@@ -195,6 +207,10 @@ max_context_tokens = 0
 context_budget_tokens = 0
 history_budget_tokens = 0
 auto_compact = true
+
+[agent.subagents]
+enabled = true
+max_result_chars = 12000
 
 [permissions]
 default = "ask"

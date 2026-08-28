@@ -86,6 +86,58 @@ pub fn resolve_in_workspace(root: &Path, requested: &str) -> Result<PathBuf> {
     Ok(normalized)
 }
 
+/// Workspace-contained roots that a delegated leaf agent is allowed to
+/// mutate. The workspace root itself is deliberately rejected: delegation
+/// must declare a narrower ownership boundary.
+#[derive(Debug, Clone)]
+pub struct WriteScope {
+    roots: Vec<PathBuf>,
+}
+
+impl WriteScope {
+    pub fn new(workspace_root: &Path, requested_roots: &[String]) -> Result<Self> {
+        if requested_roots.is_empty() {
+            return Err(ToolError::InvalidArgs {
+                tool: "delegate_task".to_string(),
+                message: "ownership must contain at least one workspace-relative path".to_string(),
+            });
+        }
+
+        let normalized_root = resolve_in_workspace(workspace_root, ".")?;
+        let mut roots = Vec::with_capacity(requested_roots.len());
+        for requested in requested_roots {
+            if requested.trim().is_empty() {
+                return Err(ToolError::InvalidArgs {
+                    tool: "delegate_task".to_string(),
+                    message: "ownership paths must not be empty".to_string(),
+                });
+            }
+            let resolved = resolve_in_workspace(workspace_root, requested)?;
+            if resolved == normalized_root {
+                return Err(ToolError::InvalidArgs {
+                    tool: "delegate_task".to_string(),
+                    message: "ownership may not be the workspace root".to_string(),
+                });
+            }
+            roots.push(resolved);
+        }
+        roots.sort();
+        roots.dedup();
+        Ok(Self { roots })
+    }
+
+    pub fn ensure_contains(&self, workspace_root: &Path, requested: &str) -> Result<()> {
+        let resolved = resolve_in_workspace(workspace_root, requested)?;
+        if self.roots.iter().any(|root| resolved.starts_with(root)) {
+            Ok(())
+        } else {
+            Err(ToolError::Denied(format!(
+                "subagent write outside delegated ownership: {requested}"
+            )))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,5 +262,24 @@ mod tests {
         }
 
         assert!(resolve_in_workspace(&root, "link/file.txt").is_err());
+    }
+
+    #[test]
+    fn write_scope_allows_owned_path_and_rejects_sibling() {
+        let root = temp_dir("write-scope");
+        std::fs::create_dir_all(root.join("owned")).unwrap();
+        std::fs::create_dir_all(root.join("sibling")).unwrap();
+        let scope = WriteScope::new(&root, &["owned".to_string()]).unwrap();
+
+        scope.ensure_contains(&root, "owned/file.rs").unwrap();
+        let error = scope.ensure_contains(&root, "sibling/file.rs").unwrap_err();
+        assert!(matches!(error, ToolError::Denied(_)));
+    }
+
+    #[test]
+    fn write_scope_rejects_workspace_root() {
+        let root = temp_dir("write-scope-root");
+        let error = WriteScope::new(&root, &[".".to_string()]).unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArgs { .. }));
     }
 }

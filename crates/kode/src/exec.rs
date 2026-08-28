@@ -164,6 +164,20 @@ pub async fn run(
                         git.len()
                     );
                 }
+                Ok(KodeEvent::SubagentStarted { id, ownership }) => {
+                    let scope = if ownership.is_empty() {
+                        "read-only".to_string()
+                    } else {
+                        format!("owns {}", ownership.join(", "))
+                    };
+                    eprintln!("◆ subagent {id}: started ({scope})");
+                }
+                Ok(KodeEvent::SubagentFinished { id, ok, summary }) => {
+                    eprintln!(
+                        "◆ subagent {id}: {} — {summary}",
+                        if ok { "done" } else { "failed" }
+                    );
+                }
                 Ok(KodeEvent::TaskFinished {
                     iterations,
                     tool_calls,

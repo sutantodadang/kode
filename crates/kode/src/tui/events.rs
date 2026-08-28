@@ -161,6 +161,26 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             }
             state.current_tool = None;
         }
+        KodeEvent::SubagentStarted { id, ownership } => {
+            let scope = if ownership.is_empty() {
+                "read-only".to_string()
+            } else {
+                format!("owns {}", ownership.join(", "))
+            };
+            state.transcript.push(TranscriptLine::new(
+                Gutter::Note,
+                format!("subagent {id} · started · {scope}"),
+            ));
+        }
+        KodeEvent::SubagentFinished { id, ok, summary } => {
+            state.transcript.push(TranscriptLine::new(
+                Gutter::Note,
+                format!(
+                    "subagent {id} · {} · {summary}",
+                    if ok { "done" } else { "failed" }
+                ),
+            ));
+        }
         KodeEvent::SteeringAccepted { message } => {
             state.append_pending_steering(&message);
         }

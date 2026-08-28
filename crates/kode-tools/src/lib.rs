@@ -37,6 +37,12 @@ pub trait Tool: Send + Sync {
     /// JSON Schema for the arguments object.
     fn parameters(&self) -> serde_json::Value;
     fn required_permission(&self) -> RequiredPermission;
+    /// Whether a successful output represents a workspace mutation. Most
+    /// tools derive this directly from their static permission. Composite
+    /// tools may override it when only some invocations mutate.
+    fn output_mutated(&self, _output: &ToolOutput) -> bool {
+        self.required_permission() == RequiredPermission::Mutating
+    }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput>;
 }
 

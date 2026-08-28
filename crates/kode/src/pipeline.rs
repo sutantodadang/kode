@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use kode_agent::Agent;
+use kode_agent::{Agent, SubagentTool};
 use kode_context::{CompiledContext, ContextCompiler, ContextRequest, ContextSource};
 use kode_core::config::{AgentConfig, IngatConfig, KodeConfig, PermissionMode};
 use kode_core::event::{EventBus, KodeEvent, NoteSource, TaskStep};
@@ -384,15 +384,42 @@ pub async fn run_task_with_input(
         });
     }
 
+    let effort = if config.model.effort.is_empty() {
+        None
+    } else {
+        Some(config.model.effort.clone())
+    };
+    let repository = cwd
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string());
+
     let mut registry = ToolRegistry::with_builtins();
     register_code_intelligence_tools(&mut registry, &intel);
     if !skills.is_empty() {
         registry.register(Arc::new(UseSkill::new(skills.clone())));
     }
-    let repository = cwd
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string());
-    register_memory_tools(&mut registry, &memory, repository);
+    register_memory_tools(&mut registry, &memory, repository.clone());
+
+    if agent_config.subagents.enabled {
+        let mut child_registry = ToolRegistry::with_subagent_builtins();
+        register_code_intelligence_tools(&mut child_registry, &intel);
+        if !skills.is_empty() {
+            child_registry.register(Arc::new(UseSkill::new(skills.clone())));
+        }
+        if let Some(memory) = &memory {
+            child_registry.register(Arc::new(MemorySearchTool::new(memory.clone(), repository)));
+        }
+        registry.register(Arc::new(SubagentTool::new(
+            model.clone(),
+            child_registry,
+            agent_config.clone(),
+            effort.clone(),
+            config.permissions.default_mode,
+            handler.clone(),
+            events.clone(),
+            agent_config.subagents.max_result_chars,
+        )));
+    }
 
     // Generic external MCP servers (kept architecturally separate from the
     // first-class Zindeks/Ingat integrations above). `_mcp_manager` owns the
@@ -414,11 +441,6 @@ pub async fn run_task_with_input(
     };
 
     let tools = ToolRuntime::new(registry, config.permissions.default_mode, handler.clone());
-    let effort = if config.model.effort.is_empty() {
-        None
-    } else {
-        Some(config.model.effort.clone())
-    };
     let agent =
         Agent::new(model.clone(), tools, events.clone(), &agent_config).with_effort(effort.clone());
 
