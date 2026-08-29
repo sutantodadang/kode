@@ -405,6 +405,22 @@ pub(crate) fn submit_task(
     }
 }
 
+fn record_failed_turn(
+    state: &mut AppState,
+    cwd: &Path,
+    provider: &str,
+    model: &str,
+    error: &str,
+    had_partial_response: bool,
+) {
+    state.last_response = if had_partial_response {
+        format!("{}\n\n[run stopped: {error}]", state.last_response)
+    } else {
+        format!("[run stopped: {error}]")
+    };
+    record_completed_turn(state, cwd, provider, model, 0);
+}
+
 /// Launches the interactive TUI. Runs until the user quits (Ctrl-C/'q' while
 /// idle) or the process is otherwise terminated. `continue_` resumes the
 /// latest session: transcript replayed, history armed for the model.
@@ -644,7 +660,14 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                             KodeEvent::TaskFinished { tool_calls, .. } => Some(*tool_calls),
                             _ => None,
                         };
-                        let is_agent_error = matches!(ev, KodeEvent::AgentError { .. });
+                        let agent_error = match &ev {
+                            KodeEvent::AgentError { message } => Some(message.clone()),
+                            _ => None,
+                        };
+                        let had_partial_response = agent_error.is_some()
+                            && (!state.response_buf.is_empty()
+                                || !state.current_stream.is_empty()
+                                || !state.stream_pending.is_empty());
                         let deferred_steering = match &ev {
                             KodeEvent::SteeringDeferred { messages } => Some(messages.clone()),
                             _ => None,
@@ -690,11 +713,18 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                 current_cancel = Some(submitted.cancel);
                                 current_steering = Some(submitted.steering);
                             }
-                        } else if is_agent_error {
+                        } else if let Some(error) = agent_error {
                             // Preserve a truthful recovery surface: an agent
                             // may have edited files before it stopped.
                             spawn_git_poll(cwd.to_path_buf(), git_tx.clone());
-                            state.pending_task = None;
+                            record_failed_turn(
+                                &mut state,
+                                cwd,
+                                &config.model.provider,
+                                &config.model.model,
+                                &error,
+                                had_partial_response,
+                            );
                             current_cancel = None;
                             current_steering = None;
                             if let Some(task) = queued_followup.take() {
@@ -1096,3 +1126,56 @@ pub(crate) fn copy_to_clipboard(text: &str) -> Result<usize, ()> {
 
 #[allow(dead_code)]
 pub(crate) type Backend = CrosstermBackend<Stdout>;
+
+#[cfg(test)]
+mod failure_persistence_tests {
+    use super::*;
+
+    #[test]
+    fn failed_turn_keeps_partial_response_for_next_task() {
+        let cwd = std::env::temp_dir().join(format!(
+            "kode-failed-turn-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut state = AppState::new("codex".into(), "gpt-test".into(), String::new());
+        state.start_new_task("continue phase 7", false);
+        state.response_buf = "implemented prefault path".to_string();
+        apply_event(
+            &mut state,
+            KodeEvent::AgentError {
+                message: "model unavailable".into(),
+            },
+        );
+
+        record_failed_turn(
+            &mut state,
+            &cwd,
+            "codex",
+            "gpt-test",
+            "model unavailable",
+            true,
+        );
+
+        assert_eq!(state.history.len(), 1);
+        assert!(
+            state.history[0]
+                .response
+                .contains("implemented prefault path")
+        );
+        assert!(
+            state.history[0]
+                .response
+                .contains("run stopped: model unavailable")
+        );
+        let (turns, corrupt) =
+            crate::session::load(&cwd, state.session_id.as_deref().expect("session created"))
+                .unwrap();
+        assert_eq!(corrupt, 0);
+        assert_eq!(turns, state.history);
+    }
+}

@@ -72,7 +72,7 @@ autostart = true
 
 | Key | Type | Default | Effect |
 |---|---|---|---|
-| `max_tool_calls` | integer | `100` | Upper bound on total tool calls per task. |
+| `max_tool_calls` | integer | `0` (unlimited) | Optional upper bound on total tool calls per task. Keep `0` for normal long-running work; set a non-zero value only when an external policy requires a hard cap. |
 | `model_retries` | integer | `3` | Retries a transient model failure without consuming another agent iteration. Capped at 10; set to `0` to disable. A stream is retried only before any model delta, so partial responses and tool calls are never duplicated. |
 | `model_retry_base_ms` | integer | `500` | Initial retry delay in milliseconds. Subsequent retries use exponential backoff, capped at 30 seconds, and remain immediately cancellable. |
 | `max_context_tokens` | integer | `0` (auto) | Total model window Kode may use. Auto reads live provider metadata when available, then falls back conservatively. Set a non-zero value to override detection. |
@@ -82,7 +82,7 @@ autostart = true
 
 ```toml
 [agent]
-max_tool_calls = 100
+max_tool_calls = 0
 model_retries = 3
 model_retry_base_ms = 500
 max_context_tokens = 0
@@ -200,7 +200,7 @@ url = "http://127.0.0.1:3200"
 autostart = true
 
 [agent]
-max_tool_calls = 100
+max_tool_calls = 0
 model_retries = 3
 model_retry_base_ms = 500
 max_context_tokens = 0

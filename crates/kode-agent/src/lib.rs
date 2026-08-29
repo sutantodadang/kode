@@ -531,7 +531,7 @@ impl Agent {
             });
 
             for call in &response.tool_calls {
-                if total_tool_calls >= self.max_tool_calls {
+                if self.max_tool_calls > 0 && total_tool_calls >= self.max_tool_calls {
                     return Err(AgentError::ToolCallLimit(self.max_tool_calls));
                 }
 
@@ -1345,10 +1345,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn continues_past_eighty_iterations() {
+    async fn default_agent_continues_past_one_hundred_tool_calls() {
         let dir = temp_dir();
         let mock = MockModel::new();
-        for i in 0..80 {
+        for i in 0..101 {
             let mut script = read_file_call(0, "call", &format!("f{i}.txt"));
             script.push(StreamEvent::Finished {
                 reason: FinishReason::ToolCalls,
@@ -1374,8 +1374,8 @@ mod tests {
 
         let outcome = agent.run("long task", &ctx(dir)).await.unwrap();
         assert_eq!(outcome.final_text, "finished");
-        assert_eq!(outcome.iterations, 81);
-        assert_eq!(outcome.tool_calls, 80);
+        assert_eq!(outcome.iterations, 102);
+        assert_eq!(outcome.tool_calls, 101);
     }
 
     #[tokio::test]

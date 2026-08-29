@@ -209,6 +209,7 @@ impl Tool for SubagentTool {
         }
 
         let leaf_events = EventBus::new(64);
+        let mut leaf_event_rx = leaf_events.subscribe();
         let leaf = Agent::new(self.model.clone(), runtime, leaf_events, &self.agent_config)
             .with_effort(self.effort.clone());
         let leaf_context = format!(
@@ -231,10 +232,42 @@ impl Tool for SubagentTool {
             cancel: ctx.cancel.child_token(),
         };
 
-        match leaf
-            .run_with_context(args.task.trim(), Some(&leaf_context), &[], false, &leaf_ctx)
-            .await
-        {
+        let child_run =
+            leaf.run_with_context(args.task.trim(), Some(&leaf_context), &[], false, &leaf_ctx);
+        tokio::pin!(child_run);
+        let child_result = loop {
+            tokio::select! {
+                biased;
+                event = leaf_event_rx.recv() => match event {
+                    Ok(KodeEvent::ToolStarted { name }) => {
+                        self.parent_events.emit(KodeEvent::Note {
+                            text: format!("subagent {} · {name}", args.id),
+                        });
+                    }
+                    Ok(KodeEvent::ToolFinished { name, ok: false, error }) => {
+                        let reason = error.unwrap_or_else(|| "failed".to_string());
+                        self.parent_events.emit(KodeEvent::Note {
+                            text: format!("subagent {} · {name} failed: {reason}", args.id),
+                        });
+                    }
+                    Ok(KodeEvent::Note { text }) => {
+                        self.parent_events.emit(KodeEvent::Note {
+                            text: format!("subagent {} · {text}", args.id),
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        self.parent_events.emit(KodeEvent::Note {
+                            text: format!("subagent {} · {skipped} activity events skipped", args.id),
+                        });
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                },
+                result = &mut child_run => break result,
+            }
+        };
+
+        match child_result {
             Ok(outcome) => {
                 let summary = truncate_chars(outcome.final_text.trim(), self.max_result_chars);
                 self.parent_events.emit(KodeEvent::SubagentFinished {
@@ -413,7 +446,9 @@ mod tests {
         model.push_script(finish_script("edit complete"));
         let root = temp_dir();
         std::fs::create_dir_all(root.join("owned")).unwrap();
-        let output = tool(model, EventBus::new(8))
+        let events = EventBus::new(16);
+        let mut event_rx = events.subscribe();
+        let output = tool(model, events)
             .execute(
                 serde_json::json!({
                     "id": "edit",
@@ -434,6 +469,14 @@ mod tests {
             "from leaf"
         );
         assert!(output.content.contains(r#""mutated":true"#));
+        let mut saw_write_activity = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if matches!(event, KodeEvent::Note { text } if text.contains("subagent edit · write_file"))
+            {
+                saw_write_activity = true;
+            }
+        }
+        assert!(saw_write_activity);
     }
 
     #[test]

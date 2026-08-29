@@ -46,7 +46,7 @@ fn default_ingat_url() -> String {
 }
 
 fn default_max_tool_calls() -> u32 {
-    100
+    0
 }
 
 fn default_model_retries() -> u32 {
@@ -544,7 +544,7 @@ mod tests {
         assert!(cfg.ingat.enabled);
         assert_eq!(cfg.ingat.url, "http://127.0.0.1:3200");
         assert!(cfg.ingat.autostart);
-        assert_eq!(cfg.agent.max_tool_calls, 100);
+        assert_eq!(cfg.agent.max_tool_calls, 0);
         assert_eq!(cfg.agent.model_retries, 3);
         assert_eq!(cfg.agent.model_retry_base_ms, 500);
         assert_eq!(cfg.agent.max_context_tokens, 0);
