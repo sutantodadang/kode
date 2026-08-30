@@ -439,7 +439,6 @@ impl Agent {
                     Err(error) => return Err(AgentError::Model(error)),
                 };
                 let mut acc = ResponseAccumulator::new();
-                let mut saw_model_delta = false;
 
                 loop {
                     let steer = async {
@@ -472,17 +471,20 @@ impl Agent {
                         item = stream.next() => {
                             match item {
                                 Some(Ok(event)) => {
-                                    saw_model_delta = true;
                                     if let StreamEvent::TextDelta(text) = &event {
                                         self.events.emit(KodeEvent::ModelToken { text: text.clone() });
                                     }
                                     acc.push(event);
                                 }
                                 Some(Err(error))
-                                    if !saw_model_delta
-                                        && error.is_retryable()
-                                        && retry < self.model_retries =>
+                                    if error.is_retryable() && retry < self.model_retries =>
                                 {
+                                    // Transient transport failure. Retry even
+                                    // if partial deltas were already observed:
+                                    // a dropped connection mid-generation is
+                                    // common on streaming gateways and the
+                                    // discarded partial response is never
+                                    // committed to the message history.
                                     retry += 1;
                                     self.wait_for_model_retry(retry, &error, ctx).await?;
                                     continue 'model_attempt;
@@ -491,10 +493,9 @@ impl Agent {
                                 None => match acc.finish() {
                                     Ok(response) => break 'model_attempt response,
                                     Err(error)
-                                        if error.is_truncated_tool_call()
-                                            && retry < self.model_retries =>
+                                        if error.is_truncated() && retry < self.model_retries =>
                                     {
-                                        // Stream was cut short mid-tool-call
+                                        // Stream was cut short mid-generation
                                         // (output-token limit or dropped
                                         // connection); retry the request.
                                         retry += 1;
@@ -960,7 +961,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn does_not_retry_after_partial_model_output() {
+    async fn retries_transient_failure_after_partial_model_output() {
         let model = Arc::new(PartialThenOverloadedModel {
             calls: AtomicUsize::new(0),
         });
@@ -977,11 +978,14 @@ mod tests {
             .await
             .unwrap_err();
 
+        // A dropped connection mid-generation (deltas already observed) is
+        // retried like any transient failure, bounded by model_retries
+        // (default 3): one initial call plus three retries.
         assert!(matches!(
             error,
             AgentError::Model(ModelError::Api { status: 503, .. })
         ));
-        assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(model.calls.load(Ordering::SeqCst), 4);
     }
 
     #[tokio::test]

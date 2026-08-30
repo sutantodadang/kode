@@ -55,9 +55,24 @@ impl ResponseAccumulator {
     }
 
     pub fn finish(self) -> Result<ModelResponse> {
-        let finish_reason = self
-            .finish_reason
-            .ok_or_else(|| ModelError::Parse("stream ended without finish event".to_string()))?;
+        let finish_reason = if let Some(reason) = self.finish_reason {
+            reason
+        } else {
+            // No Finished event ever arrived: the stream was cut before the
+            // provider sent a finish chunk. If we already collected partial
+            // output, this is a dropped connection (retryable by the agent);
+            // if nothing arrived at all, the gateway is misbehaving.
+            let detail = if !self.content.is_empty() || !self.tool_calls.is_empty() {
+                format!(
+                    "truncated model stream: ended without finish event after {} content chars and {} pending tool call(s)",
+                    self.content.chars().count(),
+                    self.tool_calls.len()
+                )
+            } else {
+                "stream ended without finish event".to_string()
+            };
+            return Err(ModelError::Parse(detail));
+        };
 
         let mut resolved_tool_calls = Vec::with_capacity(self.tool_calls.len());
         for (_, pending) in self.tool_calls {
@@ -74,7 +89,7 @@ impl ResponseAccumulator {
                     let prefix = if e.is_eof() {
                         // The stream ended before the JSON payload was complete
                         // (output-token limit or dropped connection). This is
-                        // transient; see `ModelError::is_truncated_tool_call`.
+                        // transient; see `ModelError::is_truncated`.
                         "truncated tool call arguments JSON"
                     } else {
                         "invalid tool call arguments JSON"
@@ -227,7 +242,7 @@ mod tests {
         ];
         let err = collect_response(boxed(events)).await.unwrap_err();
         assert!(matches!(err, ModelError::Parse(_)));
-        assert!(!err.is_truncated_tool_call());
+        assert!(!err.is_truncated());
     }
 
     #[tokio::test]
@@ -246,9 +261,39 @@ mod tests {
         ];
         let err = collect_response(boxed(events)).await.unwrap_err();
         assert!(matches!(err, ModelError::Parse(_)));
-        assert!(err.is_truncated_tool_call());
+        assert!(err.is_truncated());
         let message = err.to_string();
         assert!(message.contains("apply_patch"));
         assert!(message.contains("29 bytes"));
+    }
+
+    #[tokio::test]
+    async fn flags_dropped_stream_without_finish_event_as_truncated() {
+        let events = vec![
+            StreamEvent::TextDelta("partial answer befor".to_string()),
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call_a".to_string()),
+                name: Some("apply_patch".to_string()),
+                arguments_delta: "{\"path\": \"src".to_string(),
+            },
+        ];
+        let err = collect_response(boxed(events)).await.unwrap_err();
+        assert!(matches!(err, ModelError::Parse(_)));
+        assert!(err.is_truncated());
+        let message = err.to_string();
+        assert!(message.contains("truncated model stream"));
+        assert!(message.contains("1 pending tool call"));
+    }
+
+    #[tokio::test]
+    async fn empty_stream_without_finish_event_stays_non_truncated() {
+        let err = collect_response(boxed(vec![])).await.unwrap_err();
+        assert!(matches!(err, ModelError::Parse(_)));
+        assert!(!err.is_truncated());
+        assert_eq!(
+            err.to_string(),
+            "failed to parse model response: stream ended without finish event"
+        );
     }
 }

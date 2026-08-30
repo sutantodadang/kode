@@ -31,13 +31,19 @@ impl ModelError {
         }
     }
 
-    /// Whether the failure is a tool-call argument payload cut short by a
-    /// truncated stream (output-token limit or dropped connection). Not part
-    /// of [`Self::is_retryable`] because a blind identical retry can hit the
-    /// same token limit; callers that retry should treat this as a distinct,
-    /// bounded recovery path.
-    pub fn is_truncated_tool_call(&self) -> bool {
-        matches!(self, Self::Parse(message) if message.starts_with("truncated tool call arguments"))
+    /// Whether the failure is a model stream cut short mid-generation:
+    /// tool-call argument JSON truncated by an output-token limit, or a
+    /// dropped connection that ended the stream before a finish event.
+    /// Not part of [`Self::is_retryable`] because a blind identical retry
+    /// can hit the same limit; callers that retry should treat this as a
+    /// distinct, bounded recovery path.
+    pub fn is_truncated(&self) -> bool {
+        matches!(
+            self,
+            Self::Parse(message)
+                if message.starts_with("truncated tool call arguments")
+                    || message.starts_with("truncated model stream")
+        )
     }
 }
 
@@ -100,18 +106,27 @@ mod tests {
     }
 
     #[test]
-    fn truncated_tool_call_parse_errors_are_flagged() {
-        let truncated = ModelError::Parse(
-            "truncated tool call arguments JSON for apply_patch (33 bytes): EOF".to_string(),
+    fn truncated_stream_parse_errors_are_flagged() {
+        let truncated_args = ModelError::Parse(
+            "truncated tool call arguments JSON for apply_patch (29 bytes): EOF".to_string(),
         );
-        assert!(truncated.is_truncated_tool_call());
+        assert!(truncated_args.is_truncated());
         // Still not blindly retryable via the transient-failure path.
-        assert!(!truncated.is_retryable());
+        assert!(!truncated_args.is_retryable());
+
+        let truncated_stream = ModelError::Parse(
+            "truncated model stream: ended without finish event after 120 content chars and 1 pending tool call(s)".to_string(),
+        );
+        assert!(truncated_stream.is_truncated());
+        assert!(!truncated_stream.is_retryable());
 
         let invalid = ModelError::Parse(
             "invalid tool call arguments JSON for apply_patch (5 bytes): expected value"
                 .to_string(),
         );
-        assert!(!invalid.is_truncated_tool_call());
+        assert!(!invalid.is_truncated());
+
+        let no_finish = ModelError::Parse("stream ended without finish event".to_string());
+        assert!(!no_finish.is_truncated());
     }
 }
