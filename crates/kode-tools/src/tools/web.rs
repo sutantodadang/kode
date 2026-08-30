@@ -280,7 +280,7 @@ pub(crate) fn decode_entities(s: &str) -> String {
     while let Some(amp) = rest.find('&') {
         out.push_str(&rest[..amp]);
         rest = &rest[amp..];
-        let Some(semi) = rest[..rest.len().min(12)].find(';') else {
+        let Some(semi) = rest.as_bytes().iter().take(12).position(|b| *b == b';') else {
             out.push('&');
             rest = &rest[1..];
             continue;
@@ -770,6 +770,12 @@ mod tests {
             decode_entities("a &lt; b &#x41; &#66; &unknown; &"),
             "a < b A B &unknown; &"
         );
+    }
+
+    #[test]
+    fn decode_entities_handles_utf8_near_scan_limit() {
+        assert_eq!(decode_entities("&amp;12345应"), "&12345应");
+        assert_eq!(decode_entities("&1234567890应;"), "&1234567890应;");
     }
 
     #[test]

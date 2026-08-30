@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
+use std::future::Future;
 use std::io::Stdout;
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +17,7 @@ use crossterm::terminal::{
 };
 #[cfg(any(windows, test))]
 use futures::Stream;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use kode_context::git::RepoState;
 use kode_core::config::{KodeConfig, PermissionMode};
 use kode_core::event::{EventBus, KodeEvent};
@@ -340,6 +342,16 @@ pub(crate) fn route_running_input(
     ));
 }
 
+async fn guard_task<F, T>(task: F) -> Result<T, String>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    match AssertUnwindSafe(task).catch_unwind().await {
+        Ok(result) => result.map_err(|error| error.to_string()),
+        Err(_) => Err("agent task panicked; run recovered".to_string()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn submit_task(
     state: &mut AppState,
@@ -381,7 +393,7 @@ pub(crate) fn submit_task(
         .collect();
     let task_child = child.clone();
     tokio::spawn(async move {
-        if let Err(err) = pipeline::run_task_with_input(
+        if let Err(message) = guard_task(pipeline::run_task_with_input(
             &task,
             &task_cwd,
             &task_config,
@@ -391,12 +403,10 @@ pub(crate) fn submit_task(
             &task_history,
             plan_mode,
             Some(steering_rx),
-        )
+        ))
         .await
         {
-            task_events.emit(KodeEvent::AgentError {
-                message: err.to_string(),
-            });
+            task_events.emit(KodeEvent::AgentError { message });
         }
     });
     SubmittedTask {
@@ -1130,6 +1140,18 @@ pub(crate) type Backend = CrosstermBackend<Stdout>;
 #[cfg(test)]
 mod failure_persistence_tests {
     use super::*;
+
+    async fn panicking_task() -> anyhow::Result<()> {
+        panic!("boom")
+    }
+
+    #[tokio::test]
+    async fn guarded_task_converts_panic_to_recoverable_error() {
+        assert_eq!(
+            guard_task(panicking_task()).await.unwrap_err(),
+            "agent task panicked; run recovered"
+        );
+    }
 
     #[test]
     fn failed_turn_keeps_partial_response_for_next_task() {
