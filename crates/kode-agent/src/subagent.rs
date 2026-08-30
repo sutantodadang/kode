@@ -240,25 +240,29 @@ impl Tool for SubagentTool {
                 biased;
                 event = leaf_event_rx.recv() => match event {
                     Ok(KodeEvent::ToolStarted { name }) => {
-                        self.parent_events.emit(KodeEvent::Note {
-                            text: format!("subagent {} · {name}", args.id),
+                        self.parent_events.emit(KodeEvent::SubagentActivity {
+                            id: args.id.clone(),
+                            text: name,
                         });
                     }
                     Ok(KodeEvent::ToolFinished { name, ok: false, error }) => {
                         let reason = error.unwrap_or_else(|| "failed".to_string());
-                        self.parent_events.emit(KodeEvent::Note {
-                            text: format!("subagent {} · {name} failed: {reason}", args.id),
+                        self.parent_events.emit(KodeEvent::SubagentActivity {
+                            id: args.id.clone(),
+                            text: format!("{name} failed: {reason}"),
                         });
                     }
                     Ok(KodeEvent::Note { text }) => {
-                        self.parent_events.emit(KodeEvent::Note {
-                            text: format!("subagent {} · {text}", args.id),
+                        self.parent_events.emit(KodeEvent::SubagentActivity {
+                            id: args.id.clone(),
+                            text,
                         });
                     }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        self.parent_events.emit(KodeEvent::Note {
-                            text: format!("subagent {} · {skipped} activity events skipped", args.id),
+                        self.parent_events.emit(KodeEvent::SubagentActivity {
+                            id: args.id.clone(),
+                            text: format!("{skipped} activity events skipped"),
                         });
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
@@ -471,7 +475,7 @@ mod tests {
         assert!(output.content.contains(r#""mutated":true"#));
         let mut saw_write_activity = false;
         while let Ok(event) = event_rx.try_recv() {
-            if matches!(event, KodeEvent::Note { text } if text.contains("subagent edit · write_file"))
+            if matches!(event, KodeEvent::SubagentActivity { id, text } if id == "edit" && text == "write_file")
             {
                 saw_write_activity = true;
             }

@@ -434,7 +434,7 @@ impl Tool for WebSearch {
     }
 
     fn description(&self) -> &str {
-        "Search the web (DuckDuckGo). Returns up to 10 results as `title — url` plus a one-line snippet. \
+        "Search the web. Returns up to 10 results as `title — url` plus a one-line snippet. \
          Follow up with fetch_url on a result to read it."
     }
 
@@ -476,8 +476,26 @@ impl Tool for WebSearch {
             "https://html.duckduckgo.com/html/?q={}",
             percent_encode(query)
         );
-        let (body, _) = get_text(&url).await?;
-        let results = parse_ddg_results(&body, n);
+        let ddg = get_text(&url).await;
+        let mut results = ddg
+            .as_ref()
+            .map(|(body, _)| parse_ddg_results(body, n))
+            .unwrap_or_default();
+        if results.is_empty() {
+            let fallback_url = format!(
+                "https://www.bing.com/search?format=rss&q={}&count={n}",
+                percent_encode(query)
+            );
+            let (body, _) = get_text(&fallback_url).await.map_err(|bing_error| {
+                ToolError::Failed(format!(
+                    "web search unavailable: DuckDuckGo {}; Bing {bing_error}",
+                    ddg.err()
+                        .map(|error| error.to_string())
+                        .unwrap_or_else(|| "returned no parsable results".to_string())
+                ))
+            })?;
+            results = parse_bing_rss(&body, n);
+        }
         if results.is_empty() {
             return Ok(ToolOutput {
                 content: format!("no results for '{query}'"),
@@ -555,6 +573,32 @@ pub(crate) fn parse_ddg_results(html: &str, max: usize) -> Vec<SearchResult> {
         });
     }
     out
+}
+
+pub(crate) fn parse_bing_rss(xml: &str, max: usize) -> Vec<SearchResult> {
+    xml.split("<item>")
+        .skip(1)
+        .filter_map(|item| {
+            let item = item.split("</item>").next()?;
+            let field = |tag: &str| {
+                let start = format!("<{tag}>");
+                let end = format!("</{tag}>");
+                let value = item.split_once(&start)?.1.split_once(&end)?.0;
+                Some(collapse_whitespace(&html_to_text(value)))
+            };
+            let title = field("title")?;
+            let url = field("link")?;
+            if title.is_empty() || url.is_empty() {
+                return None;
+            }
+            Some(SearchResult {
+                title,
+                url,
+                snippet: field("description").unwrap_or_default(),
+            })
+        })
+        .take(max)
+        .collect()
 }
 
 fn attr(tag: &str, name: &str) -> Option<String> {
@@ -784,5 +828,18 @@ mod tests {
         );
         assert_eq!(FetchUrl.name(), "fetch_url");
         assert_eq!(WebSearch.name(), "web_search");
+    }
+
+    #[test]
+    fn parse_bing_rss_extracts_direct_results() {
+        let xml = r#"<rss><channel><item><title>Rust &amp; Safety</title><link>https://rust-lang.org/</link><description>Fast &amp; safe.</description></item></channel></rss>"#;
+        assert_eq!(
+            parse_bing_rss(xml, 5),
+            vec![SearchResult {
+                title: "Rust & Safety".to_string(),
+                url: "https://rust-lang.org/".to_string(),
+                snippet: "Fast & safe.".to_string(),
+            }]
+        );
     }
 }

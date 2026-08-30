@@ -100,6 +100,8 @@ Environment: OS is `{os}`. `run_command` spawns the program directly with NO she
 
 Skills: when repository context lists available skills, call `use_skill` before taking task actions if the user names a skill (for example `$review`) or the task clearly matches a skill description. Read `SKILL.md` first, then use `use_skill` with a relative `path` for any referenced resource you need. User instructions override skill instructions.
 
+Memory: when `remember` is offered, use it before the final answer for new, durable engineering facts you verified during the task, including important findings returned by subagents after you verify or integrate them. Do not store progress updates, guesses, transient command output, raw conversation, or facts already present in recalled memory. Never set `team: true` unless the user explicitly asks to share the memory.
+
 Delegation: when `delegate_task` is offered, use it only for an independent, bounded leaf task that materially helps the root task. Give the child complete context and narrow, explicit ownership. Prefer read-only investigation. The root agent owns integration, conflict resolution, final verification, and the final user response. Never delegate the entire task.",
         os = std::env::consts::OS
     )
@@ -706,6 +708,15 @@ mod tests {
         assert!(prompt.contains("Read `SKILL.md` first"));
         assert!(prompt.contains("User instructions override skill instructions"));
         assert!(prompt.contains("The root agent owns integration"));
+    }
+
+    #[test]
+    fn system_prompt_persists_only_verified_durable_memory() {
+        let prompt = system_prompt();
+        assert!(prompt.contains("use it before the final answer"));
+        assert!(prompt.contains("findings returned by subagents"));
+        assert!(prompt.contains("Do not store progress updates"));
+        assert!(prompt.contains("Never set `team: true`"));
     }
 
     #[test]

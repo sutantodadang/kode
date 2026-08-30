@@ -168,18 +168,46 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
                 format!("owns {}", ownership.join(", "))
             };
             state.transcript.push(TranscriptLine::new(
-                Gutter::Note,
-                format!("subagent {id} · started · {scope}"),
+                Gutter::Tool,
+                format!("subagent {id} · {scope}"),
             ));
         }
+        KodeEvent::SubagentActivity { id, text } => {
+            if let Some(receipt) = state.transcript.iter_mut().rev().find(|line| {
+                line.gutter == Gutter::Tool
+                    && line.tool_ok.is_none()
+                    && line.text.starts_with(&format!("subagent {id} ·"))
+            }) {
+                receipt.tool_children.push(text);
+                receipt.text = format!(
+                    "subagent {id} · {} tool{}",
+                    receipt.tool_children.len(),
+                    if receipt.tool_children.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                );
+            }
+        }
         KodeEvent::SubagentFinished { id, ok, summary } => {
-            state.transcript.push(TranscriptLine::new(
-                Gutter::Note,
-                format!(
-                    "subagent {id} · {} · {summary}",
-                    if ok { "done" } else { "failed" }
-                ),
-            ));
+            let status = if ok { "done" } else { "failed" };
+            if let Some(receipt) = state.transcript.iter_mut().rev().find(|line| {
+                line.gutter == Gutter::Tool
+                    && line.tool_ok.is_none()
+                    && line.text.starts_with(&format!("subagent {id} ·"))
+            }) {
+                let count = receipt.tool_children.len();
+                receipt.text = if count == 0 {
+                    format!("subagent {id} · {status} · {summary}")
+                } else {
+                    format!(
+                        "subagent {id} · {count} tool{} · {status} · {summary}",
+                        if count == 1 { "" } else { "s" }
+                    )
+                };
+                receipt.tool_ok = Some(ok);
+            }
         }
         KodeEvent::SteeringAccepted { message } => {
             state.append_pending_steering(&message);
@@ -375,4 +403,47 @@ pub(crate) fn first_line_truncated(s: &str) -> String {
     let mut out: String = line.chars().take(MAX - 1).collect();
     out.push('\u{2026}');
     out
+}
+
+#[cfg(test)]
+mod subagent_group_tests {
+    use super::*;
+
+    #[test]
+    fn subagent_activities_collapse_into_one_expandable_tool_receipt() {
+        let mut state = AppState::new("codex".into(), "model".into(), String::new());
+        apply_event(
+            &mut state,
+            KodeEvent::SubagentStarted {
+                id: "worker".into(),
+                ownership: vec![],
+            },
+        );
+        for text in ["code_search", "read_file"] {
+            apply_event(
+                &mut state,
+                KodeEvent::SubagentActivity {
+                    id: "worker".into(),
+                    text: text.into(),
+                },
+            );
+        }
+        apply_event(
+            &mut state,
+            KodeEvent::SubagentFinished {
+                id: "worker".into(),
+                ok: true,
+                summary: "found the seam".into(),
+            },
+        );
+
+        assert_eq!(state.transcript.len(), 1);
+        assert_eq!(state.transcript[0].gutter, Gutter::Tool);
+        assert_eq!(
+            state.transcript[0].tool_children,
+            ["code_search", "read_file"]
+        );
+        assert!(state.transcript[0].text.contains("2 tools · done"));
+        assert_eq!(state.transcript[0].tool_ok, Some(true));
+    }
 }

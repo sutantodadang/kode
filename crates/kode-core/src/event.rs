@@ -58,6 +58,11 @@ pub enum KodeEvent {
         id: String,
         ownership: Vec<String>,
     },
+    /// One child activity receipt, grouped under the active subagent by UIs.
+    SubagentActivity {
+        id: String,
+        text: String,
+    },
     /// A bounded leaf agent completed or failed without changing the parent
     /// agent's top-level run state.
     SubagentFinished {

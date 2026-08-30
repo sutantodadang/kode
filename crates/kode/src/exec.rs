@@ -172,6 +172,9 @@ pub async fn run(
                     };
                     eprintln!("◆ subagent {id}: started ({scope})");
                 }
+                Ok(KodeEvent::SubagentActivity { id, text }) => {
+                    eprintln!("  ├─ {id}: {text}");
+                }
                 Ok(KodeEvent::SubagentFinished { id, ok, summary }) => {
                     eprintln!(
                         "◆ subagent {id}: {} — {summary}",
