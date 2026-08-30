@@ -71,7 +71,18 @@ impl ResponseAccumulator {
                 serde_json::json!({})
             } else {
                 serde_json::from_str(&pending.arguments).map_err(|e| {
-                    ModelError::Parse(format!("invalid tool call arguments JSON: {e}"))
+                    let prefix = if e.is_eof() {
+                        // The stream ended before the JSON payload was complete
+                        // (output-token limit or dropped connection). This is
+                        // transient; see `ModelError::is_truncated_tool_call`.
+                        "truncated tool call arguments JSON"
+                    } else {
+                        "invalid tool call arguments JSON"
+                    };
+                    ModelError::Parse(format!(
+                        "{prefix} for {name} ({} bytes): {e}",
+                        pending.arguments.len()
+                    ))
                 })?
             };
             resolved_tool_calls.push(ToolCall {
@@ -216,5 +227,28 @@ mod tests {
         ];
         let err = collect_response(boxed(events)).await.unwrap_err();
         assert!(matches!(err, ModelError::Parse(_)));
+        assert!(!err.is_truncated_tool_call());
+    }
+
+    #[tokio::test]
+    async fn flags_truncated_tool_call_json_as_retryable_by_agent() {
+        let events = vec![
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call_a".to_string()),
+                name: Some("apply_patch".to_string()),
+                arguments_delta: "{\"patch\": \"+248 lines cut off".to_string(),
+            },
+            StreamEvent::Finished {
+                reason: FinishReason::Length,
+                usage: None,
+            },
+        ];
+        let err = collect_response(boxed(events)).await.unwrap_err();
+        assert!(matches!(err, ModelError::Parse(_)));
+        assert!(err.is_truncated_tool_call());
+        let message = err.to_string();
+        assert!(message.contains("apply_patch"));
+        assert!(message.contains("29 bytes"));
     }
 }

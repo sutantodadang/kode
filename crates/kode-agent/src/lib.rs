@@ -488,7 +488,21 @@ impl Agent {
                                     continue 'model_attempt;
                                 }
                                 Some(Err(error)) => return Err(AgentError::Model(error)),
-                                None => break 'model_attempt acc.finish()?,
+                                None => match acc.finish() {
+                                    Ok(response) => break 'model_attempt response,
+                                    Err(error)
+                                        if error.is_truncated_tool_call()
+                                            && retry < self.model_retries =>
+                                    {
+                                        // Stream was cut short mid-tool-call
+                                        // (output-token limit or dropped
+                                        // connection); retry the request.
+                                        retry += 1;
+                                        self.wait_for_model_retry(retry, &error, ctx).await?;
+                                        continue 'model_attempt;
+                                    }
+                                    Err(error) => return Err(AgentError::Model(error)),
+                                },
                             }
                         }
                     }

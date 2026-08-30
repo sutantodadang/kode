@@ -30,6 +30,15 @@ impl ModelError {
             Self::Parse(_) | Self::Cancelled => false,
         }
     }
+
+    /// Whether the failure is a tool-call argument payload cut short by a
+    /// truncated stream (output-token limit or dropped connection). Not part
+    /// of [`Self::is_retryable`] because a blind identical retry can hit the
+    /// same token limit; callers that retry should treat this as a distinct,
+    /// bounded recovery path.
+    pub fn is_truncated_tool_call(&self) -> bool {
+        matches!(self, Self::Parse(message) if message.starts_with("truncated tool call arguments"))
+    }
 }
 
 fn is_transient_provider_message(message: &str) -> bool {
@@ -88,5 +97,21 @@ mod tests {
         }
         assert!(!ModelError::Parse("invalid SSE".to_string()).is_retryable());
         assert!(!ModelError::Cancelled.is_retryable());
+    }
+
+    #[test]
+    fn truncated_tool_call_parse_errors_are_flagged() {
+        let truncated = ModelError::Parse(
+            "truncated tool call arguments JSON for apply_patch (33 bytes): EOF".to_string(),
+        );
+        assert!(truncated.is_truncated_tool_call());
+        // Still not blindly retryable via the transient-failure path.
+        assert!(!truncated.is_retryable());
+
+        let invalid = ModelError::Parse(
+            "invalid tool call arguments JSON for apply_patch (5 bytes): expected value"
+                .to_string(),
+        );
+        assert!(!invalid.is_truncated_tool_call());
     }
 }
