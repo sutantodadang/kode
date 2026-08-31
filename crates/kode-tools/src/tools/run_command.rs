@@ -156,14 +156,32 @@ impl Tool for RunCommand {
             .stderr
             .take()
             .ok_or_else(|| std::io::Error::other("child stderr was not piped"))?;
-        let stdout_task = tokio::spawn(read_bounded(stdout, MAX_CAPTURE_BYTES));
-        let stderr_task = tokio::spawn(read_bounded(stderr, MAX_CAPTURE_BYTES));
+        let mut stdout_task = tokio::spawn(read_bounded(stdout, MAX_CAPTURE_BYTES));
+        let mut stderr_task = tokio::spawn(read_bounded(stderr, MAX_CAPTURE_BYTES));
 
-        tokio::select! {
-            result = child.wait() => {
-                let status = result?;
-                let stdout = stdout_task.await.map_err(std::io::Error::other)??;
-                let stderr = stderr_task.await.map_err(std::io::Error::other)??;
+        // Race the child's exit AND the output drain together. A detached
+        // grandchild (e.g. `cmd /c start /b server.exe`) exits its parent
+        // immediately while inheriting the pipe handles, so the drain can
+        // block forever; it must stay under the timeout and cancel guards,
+        // not just the wait.
+        enum Outcome {
+            Done(std::io::Result<(std::process::ExitStatus, String, String)>),
+            TimedOut,
+            Cancelled,
+        }
+        let combined = async {
+            let status = child.wait().await?;
+            let stdout = (&mut stdout_task).await.map_err(std::io::Error::other)??;
+            let stderr = (&mut stderr_task).await.map_err(std::io::Error::other)??;
+            Ok((status, stdout, stderr))
+        };
+        let outcome = tokio::select! {
+            result = combined => Outcome::Done(result),
+            _ = tokio::time::sleep(timeout) => Outcome::TimedOut,
+            _ = ctx.cancel.cancelled() => Outcome::Cancelled,
+        };
+        match outcome {
+            Outcome::Done(Ok((status, stdout, stderr))) => {
                 let exit_code = status.code().unwrap_or(-1);
                 tracing::debug!(program = %program, exit_code, "run_command executed");
                 Ok(ToolOutput {
@@ -172,13 +190,14 @@ impl Tool for RunCommand {
                     ),
                 })
             }
-            _ = tokio::time::sleep(timeout) => {
+            Outcome::Done(Err(e)) => Err(ToolError::Io(e)),
+            Outcome::TimedOut => {
                 tree.kill_tree();
                 stdout_task.abort();
                 stderr_task.abort();
                 Err(ToolError::Timeout(timeout))
             }
-            _ = ctx.cancel.cancelled() => {
+            Outcome::Cancelled => {
                 tree.kill_tree();
                 stdout_task.abort();
                 stderr_task.abort();
@@ -245,6 +264,30 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Timeout(_)));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn timeout_covers_output_drain_held_by_detached_grandchild() {
+        // Regression: `cmd /c start /b <server>` exits cmd immediately while
+        // the grandchild inherits the stdout/stderr pipe handles. The drain
+        // used to block forever AFTER the child exited — past the timeout
+        // and cancel guards — leaving the tool uninterruptible.
+        let tool = RunCommand;
+        let started = std::time::Instant::now();
+        let err = tool
+            .execute(
+                serde_json::json!({
+                    "program": "cmd",
+                    "args": ["/C", "start", "/b", "ping", "-n", "30", "127.0.0.1"],
+                    "timeout_secs": 1
+                }),
+                &ctx(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Timeout(_)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
     #[cfg(unix)]
