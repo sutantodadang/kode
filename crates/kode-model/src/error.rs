@@ -127,11 +127,13 @@ mod tests {
         .is_retryable());
 
         // Per-minute rate limit: worth a quick retry.
-        assert!(ModelError::Api {
-            status: 429,
-            message: "rate limit exceeded, retry later".to_string(),
-        }
-        .is_retryable());
+        assert!(
+            ModelError::Api {
+                status: 429,
+                message: "rate limit exceeded, retry later".to_string(),
+            }
+            .is_retryable()
+        );
     }
 
     #[test]

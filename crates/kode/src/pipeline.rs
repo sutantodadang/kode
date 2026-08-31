@@ -410,8 +410,7 @@ pub async fn run_task_with_input(
             child_registry.register(Arc::new(UseSkill::new(skills.clone())));
         }
         if let Some(memory) = &memory {
-            child_registry
-                .register(Arc::new(MemorySearchTool::new(memory.clone(), repository)));
+            child_registry.register(Arc::new(MemorySearchTool::new(memory.clone(), repository)));
         }
         // Named delegation tiers ([agent.subagents.models.<name>]) let the
         // root agent run mechanical child work on a cheaper model. Tier

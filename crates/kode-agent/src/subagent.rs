@@ -663,7 +663,8 @@ mod tests {
             .as_array()
             .expect("failed delegations must include an activity tail");
         assert!(
-            tail.iter().any(|entry| entry.as_str().unwrap_or("") == "read_file"),
+            tail.iter()
+                .any(|entry| entry.as_str().unwrap_or("") == "read_file"),
             "activity tail should record the tool the child already ran: {}",
             output.content
         );
