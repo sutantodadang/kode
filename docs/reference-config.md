@@ -97,6 +97,7 @@ auto_compact = true
 |---|---|---|---|
 | `enabled` | bool | `true` | Exposes the native `delegate_task` tool to the root agent. Set `false` to disable delegation entirely. |
 | `max_result_chars` | integer | `12000` | Maximum child summary size returned to the root. Values are clamped to 1,000–50,000 characters. |
+| `models` | table of tables | `{}` | Named model tiers selectable per delegation via `delegate_task`'s `model` argument. Empty means every child runs on the root session model. |
 
 ```toml
 [agent.subagents]
@@ -104,7 +105,37 @@ enabled = true
 max_result_chars = 12000
 ```
 
-Sub-agents are bounded leaf workers, not independent roots. They share the selected model and workspace but receive no parent conversation history, cannot delegate again, cannot run arbitrary commands, and never receive external MCP tools. Read-only tasks cannot mutate. A writable task must declare narrower workspace-relative ownership; `write_file` and `apply_patch` are rejected outside that scope. Kode runs one child at a time so workspace writes cannot overlap, and parent cancellation also cancels the active child. The root remains responsible for integration and final verification.
+Sub-agents are bounded leaf workers, not independent roots. They share the workspace but receive no parent conversation history, cannot delegate again, cannot run arbitrary commands, and never receive external MCP tools. Read-only tasks cannot mutate. A writable task must declare narrower workspace-relative ownership; `write_file` and `apply_patch` are rejected outside that scope. Kode runs one child at a time so workspace writes cannot overlap, and parent cancellation also cancels the active child. The root remains responsible for integration and final verification.
+
+### `[agent.subagents.models.<tier>]`
+
+Tiered model routing: map a short tier name to any provider/model pair. The
+root agent then passes `"model": "<tier>"` to `delegate_task` to run that
+child on the tier's model instead of the root session model — mechanical
+work on a cheap executor, judgment stays on the root. Tiers may mix
+providers. A tier that fails to resolve at startup (bad provider, missing
+auth) degrades to a startup note; delegations targeting it fail with the
+available-tier list.
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `provider` | string | none: required | Same provider names as `[model]`: `openai`, `anthropic`, `antigravity`, `codex`, `opencode-go`, `opencode`, `kilo`, `lmstudio`. |
+| `model` | string | none: required | Model id on that provider. |
+
+```toml
+[agent.subagents.models.terra]
+provider = "opencode-go"
+model = "terra-executor"
+
+[agent.subagents.models.luna]
+provider = "kilo"
+model = "luna-cheap"
+```
+
+Delegations that fail mid-run return an `activity_tail` (the child's last
+tool activities) alongside the error; feed it back as `context` on a
+re-delegate so the replacement resumes instead of re-exploring from zero.
+The bundled `tiered-exec` skill documents the routing conventions.
 
 ## `[permissions]`
 
@@ -211,6 +242,14 @@ auto_compact = true
 [agent.subagents]
 enabled = true
 max_result_chars = 12000
+
+[agent.subagents.models.terra]
+provider = "opencode-go"
+model = "terra-executor"
+
+[agent.subagents.models.luna]
+provider = "kilo"
+model = "luna-cheap"
 
 [permissions]
 default = "ask"

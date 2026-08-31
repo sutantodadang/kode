@@ -18,6 +18,7 @@ const MAX_RESULT_CHARS: usize = 50_000;
 /// Root-only tool that runs one bounded, non-recursive leaf agent.
 pub struct SubagentTool {
     model: Arc<dyn Model>,
+    tiers: std::collections::BTreeMap<String, Arc<dyn Model>>,
     child_registry: ToolRegistry,
     agent_config: AgentConfig,
     effort: Option<String>,
@@ -42,6 +43,7 @@ impl SubagentTool {
     ) -> Self {
         Self {
             model,
+            tiers: Default::default(),
             child_registry,
             agent_config,
             effort,
@@ -50,6 +52,38 @@ impl SubagentTool {
             parent_events,
             gate: Arc::new(Semaphore::new(1)),
             max_result_chars: max_result_chars.clamp(MIN_RESULT_CHARS, MAX_RESULT_CHARS),
+        }
+    }
+
+    /// Registers named model tiers selectable per delegation via the
+    /// `model` argument. Tier names not already registered win.
+    pub fn with_model_tiers(
+        mut self,
+        tiers: std::collections::BTreeMap<String, Arc<dyn Model>>,
+    ) -> Self {
+        self.tiers.extend(tiers);
+        self
+    }
+
+    fn resolve_model(&self, tier: Option<&str>) -> kode_tools::Result<Arc<dyn Model>> {
+        match tier {
+            None => Ok(self.model.clone()),
+            Some(name) => match self.tiers.get(name) {
+                Some(model) => Ok(model.clone()),
+                None => {
+                    let available: Vec<String> =
+                        std::iter::once("default (root model)".to_string())
+                            .chain(self.tiers.keys().map(|key| key.to_string()))
+                            .collect();
+                    Err(ToolError::InvalidArgs {
+                        tool: self.name().to_string(),
+                        message: format!(
+                            "unknown model tier '{name}' — available: [{}]. Define tiers under [agent.subagents.models.<name>] in .kode/config.toml",
+                            available.join(", ")
+                        ),
+                    })
+                }
+            },
         }
     }
 }
@@ -65,6 +99,9 @@ struct DelegateArgs {
     read_only: bool,
     #[serde(default)]
     ownership: Vec<String>,
+    /// Optional model tier name from `[agent.subagents.models]`.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 fn default_read_only() -> bool {
@@ -103,7 +140,7 @@ impl Tool for SubagentTool {
     }
 
     fn description(&self) -> &str {
-        "Delegate one independent, bounded task to a non-recursive leaf agent. Use read_only=true for investigation. For edits, set read_only=false and declare narrow workspace-relative ownership roots. The root agent remains responsible for integration and final verification."
+        "Delegate one independent, bounded task to a non-recursive leaf agent. Use read_only=true for investigation. For edits, set read_only=false and declare narrow workspace-relative ownership roots. Optionally select a cheaper model tier via `model` for mechanical work. The root agent remains responsible for integration and final verification."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -132,6 +169,10 @@ impl Tool for SubagentTool {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Narrow workspace-relative files/directories this child may edit; required when read_only=false"
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional model tier from [agent.subagents.models] in .kode/config.toml; omit to run on the root model"
                 }
             },
             "required": ["id", "task"],
@@ -183,6 +224,7 @@ impl Tool for SubagentTool {
         } else {
             Some(WriteScope::new(&ctx.workspace_root, &args.ownership)?)
         };
+        let model = self.resolve_model(args.model.as_deref())?;
 
         let _permit = tokio::select! {
             _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
@@ -210,7 +252,7 @@ impl Tool for SubagentTool {
 
         let leaf_events = EventBus::new(64);
         let mut leaf_event_rx = leaf_events.subscribe();
-        let leaf = Agent::new(self.model.clone(), runtime, leaf_events, &self.agent_config)
+        let leaf = Agent::new(model, runtime, leaf_events, &self.agent_config)
             .with_effort(self.effort.clone());
         let leaf_context = format!(
             "You are leaf subagent `{id}`. Complete only the delegated task and return a concise evidence-backed result. You are not the root agent and cannot delegate. Preserve unrelated work in the shared workspace. Mode: {mode}. Declared ownership: {ownership}. Never edit outside ownership.\n\nParent context:\n{context}",
@@ -235,11 +277,24 @@ impl Tool for SubagentTool {
         let child_run =
             leaf.run_with_context(args.task.trim(), Some(&leaf_context), &[], false, &leaf_ctx);
         tokio::pin!(child_run);
+        // Rolling tail of child activity so a failed delegation can report
+        // what was already done — the root agent then re-delegates with the
+        // partial progress as context instead of restarting from zero.
+        const ACTIVITY_TAIL_MAX: usize = 20;
+        let mut activity_tail: std::collections::VecDeque<String> =
+            std::collections::VecDeque::with_capacity(ACTIVITY_TAIL_MAX);
+        let mut push_tail = |text: String| {
+            if activity_tail.len() == ACTIVITY_TAIL_MAX {
+                activity_tail.pop_front();
+            }
+            activity_tail.push_back(text);
+        };
         let child_result = loop {
             tokio::select! {
                 biased;
                 event = leaf_event_rx.recv() => match event {
                     Ok(KodeEvent::ToolStarted { name }) => {
+                        push_tail(name.clone());
                         self.parent_events.emit(KodeEvent::SubagentActivity {
                             id: args.id.clone(),
                             text: name,
@@ -247,12 +302,14 @@ impl Tool for SubagentTool {
                     }
                     Ok(KodeEvent::ToolFinished { name, ok: false, error }) => {
                         let reason = error.unwrap_or_else(|| "failed".to_string());
+                        push_tail(format!("{name} failed: {reason}"));
                         self.parent_events.emit(KodeEvent::SubagentActivity {
                             id: args.id.clone(),
                             text: format!("{name} failed: {reason}"),
                         });
                     }
                     Ok(KodeEvent::Note { text }) => {
+                        push_tail(format!("note: {text}"));
                         self.parent_events.emit(KodeEvent::SubagentActivity {
                             id: args.id.clone(),
                             text,
@@ -310,12 +367,17 @@ impl Tool for SubagentTool {
                     ok: false,
                     summary: summary.clone(),
                 });
+                let activity: Vec<String> = activity_tail.into_iter().collect();
                 let content = serde_json::to_string(&serde_json::json!({
                     "id": args.id,
                     "status": "failed",
                     "error": summary,
                     "ownership": args.ownership,
                     "mutated": false,
+                    // What the child already did before dying. Feed this back
+                    // as `context` on a re-delegate so the retry resumes
+                    // instead of re-exploring from zero.
+                    "activity_tail": activity,
                 }))
                 .map_err(|json_error| ToolError::Failed(json_error.to_string()))?;
                 Ok(ToolOutput { content })
@@ -493,5 +555,117 @@ mod tests {
         assert!(!tool.output_mutated(&ToolOutput {
             content: r#"{"mutated":false}"#.to_string(),
         }));
+    }
+
+    fn ctx_for(root: &std::path::Path) -> ToolContext {
+        ToolContext {
+            workspace_root: root.to_path_buf(),
+            cancel: kode_core::CancellationToken::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_model_tier_lists_available_tiers() {
+        let model = Arc::new(MockModel::new());
+        let mut tiers: std::collections::BTreeMap<String, Arc<dyn kode_model::Model>> =
+            std::collections::BTreeMap::new();
+        let terra = Arc::new(MockModel::new());
+        terra.push_script(finish_script("unused"));
+        tiers.insert("terra".to_string(), terra);
+        let tool = tool(model, EventBus::new(8)).with_model_tiers(tiers);
+
+        let error = tool
+            .execute(
+                serde_json::json!({
+                    "id": "edit",
+                    "task": "do work",
+                    "model": "luna"
+                }),
+                &ctx_for(&temp_dir()),
+            )
+            .await
+            .unwrap_err();
+
+        match error {
+            ToolError::InvalidArgs { message, .. } => {
+                assert!(message.contains("unknown model tier 'luna'"), "{message}");
+                assert!(message.contains("terra"), "{message}");
+                assert!(message.contains("default"), "{message}");
+            }
+            other => panic!("expected InvalidArgs, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delegation_runs_on_selected_tier_model() {
+        let root = Arc::new(MockModel::new());
+        let terra = Arc::new(MockModel::new());
+        terra.push_script(finish_script("terra did the work"));
+        let mut tiers: std::collections::BTreeMap<String, Arc<dyn kode_model::Model>> =
+            std::collections::BTreeMap::new();
+        tiers.insert("terra".to_string(), terra.clone());
+        let tool = tool(root, EventBus::new(8)).with_model_tiers(tiers);
+
+        let output = tool
+            .execute(
+                serde_json::json!({
+                    "id": "mechanical",
+                    "task": "apply the edit",
+                    "model": "terra"
+                }),
+                &ctx_for(&temp_dir()),
+            )
+            .await
+            .unwrap();
+
+        assert!(output.content.contains("terra did the work"));
+        // The tier model served the child; the root model was never called.
+        assert_eq!(terra.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_delegation_reports_activity_tail_for_resume() {
+        let model = Arc::new(MockModel::new());
+        // Script 1: the child reads a file (recorded as activity), then asks
+        // the model again. No further scripts -> hard model error -> the
+        // delegation fails with the partial progress preserved.
+        model.push_script(vec![
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("read_1".to_string()),
+                name: Some("read_file".to_string()),
+                arguments_delta: serde_json::json!({"path": "note.txt"}).to_string(),
+            },
+            StreamEvent::Finished {
+                reason: FinishReason::ToolCalls,
+                usage: None,
+            },
+        ]);
+        let root = temp_dir();
+        std::fs::write(root.join("note.txt"), "payload").unwrap();
+        let tool = tool(model, EventBus::new(8));
+
+        let output = tool
+            .execute(
+                serde_json::json!({
+                    "id": "review",
+                    "task": "review the bridge",
+                    "context": "note.txt matters"
+                }),
+                &ctx_for(&root),
+            )
+            .await
+            .unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&output.content).unwrap();
+        assert_eq!(value["status"], "failed");
+        let tail = value["activity_tail"]
+            .as_array()
+            .expect("failed delegations must include an activity tail");
+        assert!(
+            tail.iter().any(|entry| entry.as_str().unwrap_or("") == "read_file"),
+            "activity tail should record the tool the child already ran: {}",
+            output.content
+        );
     }
 }

@@ -158,8 +158,16 @@ impl ModelFactory {
         if config.model.model.is_empty() {
             anyhow::bail!("set model.model in .kode/config.toml");
         }
+        Self::build_model(&config.model.provider, &config.model.model)
+    }
 
-        let model: Arc<dyn kode_model::Model> = match config.model.provider.as_str() {
+    /// Builds a model handle for one provider/model pair. Shared by the root
+    /// session model and `[agent.subagents.models.*]` delegation tiers.
+    fn build_model(provider: &str, model: &str) -> anyhow::Result<Arc<dyn kode_model::Model>> {
+        if model.is_empty() {
+            anyhow::bail!("model id must not be empty");
+        }
+        let model: Arc<dyn kode_model::Model> = match provider {
             "openai" => {
                 let api_key = std::env::var("OPENAI_API_KEY")
                     .or_else(|_| std::env::var("KODE_API_KEY"))
@@ -167,7 +175,7 @@ impl ModelFactory {
 
                 let mut opts = OpenAiOptions {
                     api_key,
-                    model: config.model.model.clone(),
+                    model: model.to_string(),
                     ..Default::default()
                 };
                 if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
@@ -190,12 +198,12 @@ impl ModelFactory {
                     })?;
                     Arc::new(OpenAiModel::new(OpenAiOptions {
                         api_key,
-                        model: config.model.model.clone(),
+                        model: model.to_string(),
                         ..Default::default()
                     }))
                 } else {
                     Arc::new(
-                        kode_model::CodexModel::new(auth_path, config.model.model.clone())
+                        kode_model::CodexModel::new(auth_path, model.to_string())
                             .map_err(|e| anyhow::anyhow!("{e}"))?,
                     )
                 }
@@ -205,13 +213,8 @@ impl ModelFactory {
                     anyhow::anyhow!("cannot resolve home directory for opencode auth")
                 })?;
                 Arc::new(
-                    kode_model::opencode::resolve(
-                        &config.model.provider,
-                        config.model.model.clone(),
-                        &auth_path,
-                        None,
-                    )
-                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+                    kode_model::opencode::resolve(provider, model.to_string(), &auth_path, None)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
                 )
             }
             "anthropic" => {
@@ -219,7 +222,7 @@ impl ModelFactory {
                     anyhow::anyhow!("cannot resolve home directory for anthropic auth")
                 })?;
                 Arc::new(
-                    kode_model::AnthropicModel::new(auth_path, config.model.model.clone())
+                    kode_model::AnthropicModel::new(auth_path, model.to_string())
                         .map_err(|e| anyhow::anyhow!("{e}"))?,
                 )
             }
@@ -228,7 +231,7 @@ impl ModelFactory {
                     anyhow::anyhow!("cannot resolve home directory for antigravity auth")
                 })?;
                 Arc::new(
-                    kode_model::AntigravityModel::new(auth_path, config.model.model.clone())
+                    kode_model::AntigravityModel::new(auth_path, model.to_string())
                         .map_err(|e| anyhow::anyhow!("{e}"))?,
                 )
             }
@@ -407,18 +410,49 @@ pub async fn run_task_with_input(
             child_registry.register(Arc::new(UseSkill::new(skills.clone())));
         }
         if let Some(memory) = &memory {
-            child_registry.register(Arc::new(MemorySearchTool::new(memory.clone(), repository)));
+            child_registry
+                .register(Arc::new(MemorySearchTool::new(memory.clone(), repository)));
         }
-        registry.register(Arc::new(SubagentTool::new(
-            model.clone(),
-            child_registry,
-            agent_config.clone(),
-            effort.clone(),
-            config.permissions.default_mode,
-            handler.clone(),
-            events.clone(),
-            agent_config.subagents.max_result_chars,
-        )));
+        // Named delegation tiers ([agent.subagents.models.<name>]) let the
+        // root agent run mechanical child work on a cheaper model. Tier
+        // resolution failures degrade to a note instead of killing the
+        // session — the default (root model) path still works.
+        let mut tiers = std::collections::BTreeMap::new();
+        for (name, tier) in &agent_config.subagents.models {
+            match ModelFactory::build_model(&tier.provider, &tier.model) {
+                Ok(model) => {
+                    tiers.insert(name.clone(), model);
+                }
+                Err(error) => {
+                    events.emit(KodeEvent::Note {
+                        text: format!(
+                            "subagent model tier '{name}' unavailable: {error}; delegations targeting it will fail"
+                        ),
+                    });
+                }
+            }
+        }
+        if !tiers.is_empty() {
+            events.emit(KodeEvent::Note {
+                text: format!(
+                    "subagent model tiers: [{}]",
+                    tiers.keys().cloned().collect::<Vec<_>>().join(", ")
+                ),
+            });
+        }
+        registry.register(Arc::new(
+            SubagentTool::new(
+                model.clone(),
+                child_registry,
+                agent_config.clone(),
+                effort.clone(),
+                config.permissions.default_mode,
+                handler.clone(),
+                events.clone(),
+                agent_config.subagents.max_result_chars,
+            )
+            .with_model_tiers(tiers),
+        ));
     }
 
     // Generic external MCP servers (kept architecturally separate from the

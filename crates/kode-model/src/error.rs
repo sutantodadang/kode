@@ -24,7 +24,8 @@ impl ModelError {
         match self {
             Self::Http(error) => error.is_timeout() || error.is_connect() || error.is_body(),
             Self::Api { status, message } => {
-                matches!(*status, 408 | 409 | 425 | 429 | 500 | 502 | 503 | 504 | 529)
+                (matches!(*status, 408 | 409 | 425 | 429 | 500 | 502 | 503 | 504 | 529)
+                    && !is_usage_quota_exhausted(message))
                     || (*status == 0 && is_transient_provider_message(message))
             }
             Self::Parse(_) | Self::Cancelled => false,
@@ -61,6 +62,17 @@ fn is_transient_provider_message(message: &str) -> bool {
     ]
     .iter()
     .any(|needle| message.contains(needle))
+}
+
+/// Distinguishes per-minute rate limits (retry soon) from plan quota
+/// exhaustion (`usage_limit_reached` / monthly caps, resets in hours).
+/// Retrying the latter on a 500ms-2s backoff is pure waste: it burns the
+/// retry budget and discards in-flight subagent work for nothing.
+fn is_usage_quota_exhausted(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    ["usage limit", "usage_limit_reached", "quota"]
+        .iter()
+        .any(|needle| message.contains(needle))
 }
 
 pub type Result<T> = std::result::Result<T, ModelError>;
@@ -103,6 +115,23 @@ mod tests {
         }
         assert!(!ModelError::Parse("invalid SSE".to_string()).is_retryable());
         assert!(!ModelError::Cancelled.is_retryable());
+    }
+
+    #[test]
+    fn quota_exhaustion_fails_fast_while_rate_limits_retry() {
+        // Plan usage limit (resets in hours): retrying after 500ms is waste.
+        assert!(!ModelError::Api {
+            status: 429,
+            message: r#"{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"plus"}"#.to_string(),
+        }
+        .is_retryable());
+
+        // Per-minute rate limit: worth a quick retry.
+        assert!(ModelError::Api {
+            status: 429,
+            message: "rate limit exceeded, retry later".to_string(),
+        }
+        .is_retryable());
     }
 
     #[test]

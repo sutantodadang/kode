@@ -350,6 +350,11 @@ pub struct SubagentConfig {
     /// Maximum child summary size returned to the root agent.
     #[serde(default = "default_subagent_max_result_chars")]
     pub max_result_chars: usize,
+    /// Named model tiers the root agent can select per delegation via
+    /// `delegate_task`'s `model` argument (e.g. a cheap executor tier).
+    /// Empty means every child runs on the root model.
+    #[serde(default)]
+    pub models: std::collections::BTreeMap<String, ModelTierConfig>,
 }
 
 impl Default for SubagentConfig {
@@ -357,8 +362,18 @@ impl Default for SubagentConfig {
         Self {
             enabled: default_subagents_enabled(),
             max_result_chars: default_subagent_max_result_chars(),
+            models: std::collections::BTreeMap::new(),
         }
     }
+}
+
+/// One delegable model tier: where to reach it and which model to run.
+/// `[agent.subagents.models.terra]` -> provider + model id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelTierConfig {
+    pub provider: String,
+    pub model: String,
 }
 
 impl AgentConfig {
@@ -654,6 +669,43 @@ timeout_seconds = 120
 
         assert!(!cfg.agent.subagents.enabled);
         assert_eq!(cfg.agent.subagents.max_result_chars, 4096);
+        assert!(cfg.agent.subagents.models.is_empty());
+    }
+
+    #[test]
+    fn subagent_model_tiers_deserialize() {
+        let cfg: KodeConfig = toml::from_str(
+            r#"
+[agent.subagents.models.terra]
+provider = "opencode-go"
+model = "terra- executor"
+
+[agent.subagents.models.luna]
+provider = "kilo"
+model = "luna-cheap"
+"#,
+        )
+        .unwrap();
+
+        let terra = cfg.agent.subagents.models.get("terra").unwrap();
+        assert_eq!(terra.provider, "opencode-go");
+        assert_eq!(terra.model, "terra- executor");
+        let luna = cfg.agent.subagents.models.get("luna").unwrap();
+        assert_eq!(luna.provider, "kilo");
+        assert_eq!(luna.model, "luna-cheap");
+    }
+
+    #[test]
+    fn subagent_model_tier_rejects_unknown_fields() {
+        let result = toml::from_str::<KodeConfig>(
+            r#"
+[agent.subagents.models.terra]
+provider = "opencode-go"
+model = "terra"
+effort = "high"
+"#,
+        );
+        assert!(result.is_err());
     }
 
     #[test]

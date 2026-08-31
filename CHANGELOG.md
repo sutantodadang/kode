@@ -52,8 +52,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   (user-global), expanded (with `$ARGUMENTS` substitution) into task
   prompts in both the TUI and `kode exec`. See
   [howto-custom-commands.md](./docs/howto-custom-commands.md).
+- Tiered delegation: `[agent.subagents.models.<tier>]` maps a short tier
+  name to any provider/model pair, and `delegate_task`'s new `model`
+  argument runs that child on the tier's model instead of the root session
+  model — mechanical work on a cheap executor, judgment on the root. Tiers
+  may mix providers; unresolvable tiers degrade to a startup note. Bundled
+  `tiered-exec` skill documents the routing conventions.
+- Failed delegations now return an `activity_tail` (the child's last tool
+  activities) alongside the error, so a re-delegate can resume from the
+  partial progress instead of re-exploring from zero.
 
 ### Fixed
+
+- Truncated model streams no longer stop the run: streams cut mid-generation
+  (dropped connection before the finish event, or tool-call argument JSON
+  truncated by an output-token limit) are retried like transient failures,
+  including after partial output was already observed, and error messages
+  now name the affected tool and byte count.
+- Plan-quota 429s (`usage_limit_reached`-style messages) fail fast instead
+  of burning the retry budget on 500ms–2s backoffs against a limit that
+  resets in hours; per-minute rate limits still retry.
+- `run_command` hang with detached grandchildren: `cmd /c start /b <server>`
+  exits its parent immediately while the grandchild inherits the pipe
+  handles, leaving the tool blocked forever in the output drain — past the
+  timeout and past Esc. The timeout and cancellation guards now cover the
+  drain, and the whole process tree is killed.
 
 - CI on Linux/macOS: Windows-only Ingat setup helpers are now
   `#[cfg(windows)]`-gated instead of tripping `-D dead-code`.
