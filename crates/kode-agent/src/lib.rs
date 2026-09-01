@@ -419,7 +419,7 @@ impl Agent {
 
             self.events.emit(KodeEvent::ModelStarted);
             let request_messages = self.prompt_budget.prepare(&messages, &tools)?;
-            let model_request = ModelRequest {
+            let mut model_request = ModelRequest {
                 messages: request_messages,
                 tools,
                 max_tokens: Some(self.prompt_budget.output_tokens()),
@@ -495,9 +495,33 @@ impl Agent {
                                     Err(error)
                                         if error.is_truncated() && retry < self.model_retries =>
                                     {
-                                        // Stream was cut short mid-generation
-                                        // (output-token limit or dropped
-                                        // connection); retry the request.
+                                        // Stream was cut short mid-generation.
+                                        // When the provider reported a length
+                                        // finish, the output-token budget ran
+                                        // out (reasoning-heavy models spend
+                                        // most of it thinking before the tool
+                                        // call): escalate the budget for the
+                                        // retry instead of regenerating an
+                                        // identical doomed request.
+                                        if error.to_string().contains("budget exhausted")
+                                            && let Some(current) = model_request.max_tokens
+                                        {
+                                            let mut escalated =
+                                                current.saturating_mul(2).min(32_768);
+                                            let window_cap = (self.prompt_budget.context_window()
+                                                / 2) as u32;
+                                            if window_cap > 0 {
+                                                escalated = escalated.min(window_cap);
+                                            }
+                                            if escalated > current {
+                                                model_request.max_tokens = Some(escalated);
+                                                self.events.emit(KodeEvent::Note {
+                                                    text: format!(
+                                                        "output budget exhausted mid-tool-call; retrying with max_tokens {escalated}"
+                                                    ),
+                                                });
+                                            }
+                                        }
                                         retry += 1;
                                         self.wait_for_model_retry(retry, &error, ctx).await?;
                                         continue 'model_attempt;
@@ -958,6 +982,53 @@ mod tests {
             AgentError::Model(ModelError::Api { status: 503, .. })
         ));
         assert_eq!(model.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn escalates_output_budget_when_tool_call_truncated_by_length() {
+        let model = Arc::new(MockModel::new());
+        // Attempt 1: reasoning burned the budget and the tool call arguments
+        // were cut off with a length finish.
+        model.push_script(vec![
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call_1".to_string()),
+                name: Some("apply_patch".to_string()),
+                arguments_delta: "{\"path\": \"cut".to_string(),
+            },
+            StreamEvent::Finished {
+                reason: FinishReason::Length,
+                usage: None,
+            },
+        ]);
+        // Attempt 2 (with the escalated budget): completes.
+        model.push_script(vec![
+            StreamEvent::TextDelta("done after retry".to_string()),
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: None,
+            },
+        ]);
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let config = AgentConfig {
+            max_context_tokens: 200_000,
+            model_retry_base_ms: 0,
+            ..Default::default()
+        };
+        let agent = Agent::new(model.clone(), tools, EventBus::new(64), &config);
+
+        let outcome = agent
+            .run("apply the patch", &ctx(temp_dir()))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.final_text, "done after retry");
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        // 200k window / 8 clamped to the 16_384 reserve cap.
+        assert_eq!(requests[0].max_tokens, Some(16_384));
+        // Retry doubled the budget (32_768), still under the window cap.
+        assert_eq!(requests[1].max_tokens, Some(32_768));
     }
 
     #[tokio::test]

@@ -94,8 +94,18 @@ impl ResponseAccumulator {
                     } else {
                         "invalid tool call arguments JSON"
                     };
+                    // A length finish means the provider stopped at its
+                    // max_tokens — reasoning-heavy models burn most of the
+                    // budget on hidden thinking before the tool call. The
+                    // agent escalates the budget on retry when it sees this.
+                    let budget_note = if e.is_eof() && matches!(finish_reason, FinishReason::Length)
+                    {
+                        " (output-token budget exhausted)"
+                    } else {
+                        ""
+                    };
                     ModelError::Parse(format!(
-                        "{prefix} for {name} ({} bytes): {e}",
+                        "{prefix} for {name} ({} bytes): {e}{budget_note}",
                         pending.arguments.len()
                     ))
                 })?
@@ -265,6 +275,28 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("apply_patch"));
         assert!(message.contains("29 bytes"));
+        // Length finish + truncated args => the agent should escalate the
+        // output budget on retry, not regenerate an identical request.
+        assert!(message.contains("output-token budget exhausted"));
+    }
+
+    #[tokio::test]
+    async fn stream_drop_truncation_has_no_budget_marker() {
+        let events = vec![
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call_a".to_string()),
+                name: Some("apply_patch".to_string()),
+                arguments_delta: "{\"patch\": \"cut".to_string(),
+            },
+            StreamEvent::Finished {
+                reason: FinishReason::ToolCalls,
+                usage: None,
+            },
+        ];
+        let err = collect_response(boxed(events)).await.unwrap_err();
+        assert!(err.is_truncated());
+        assert!(!err.to_string().contains("budget exhausted"));
     }
 
     #[tokio::test]

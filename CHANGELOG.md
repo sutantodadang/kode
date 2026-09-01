@@ -69,6 +69,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   truncated by an output-token limit) are retried like transient failures,
   including after partial output was already observed, and error messages
   now name the affected tool and byte count.
+- Reasoning-heavy models no longer truncate mid-tool-call from a starved
+  output budget: the `max_tokens` reserve now scales with the context window
+  (up to 16,384; previously a flat 4,096), and a length-finish truncation
+  escalates the budget on retry (doubled, capped at 32,768 and half the
+  window) instead of regenerating an identical doomed request.
+- OpenAI-compatible provider: reasoning-generation models (gpt-5*, o1/o3/o4*)
+  now receive `max_completion_tokens` instead of the legacy `max_tokens`
+  parameter they reject with a 400.
+- Anthropic provider: `max_tokens` is clamped to the model's ceiling
+  (8,192 for claude-3.5-generation models, 65,536 otherwise) so escalated
+  retry budgets can't be rejected with a 400 before generating.
 - Plan-quota 429s (`usage_limit_reached`-style messages) fail fast instead
   of burning the retry budget on 500ms–2s backoffs against a limit that
   resets in hours; per-minute rate limits still retry.

@@ -435,6 +435,18 @@ fn map_finish_reason(raw: &str) -> FinishReason {
     }
 }
 
+/// Per-model `max_tokens` ceiling. The Messages API rejects values above a
+/// model's cap with a 400, so callers' (possibly escalated) budgets are
+/// clamped before they hit the wire. Claude 3.5-generation models cap at
+/// 8,192; everything newer supports 64k.
+fn model_output_cap(model: &str) -> u32 {
+    if model.starts_with("claude-3-5") || model.starts_with("claude-3-haiku") {
+        8_192
+    } else {
+        65_536
+    }
+}
+
 /// Maps one decoded Anthropic Messages-API SSE event to zero or more
 /// [`StreamEvent`]s. Unrecognized `type`s (and `ping`) are ignored. `error`
 /// surfaces as an error rather than an event.
@@ -613,7 +625,10 @@ fn build_body(model: &str, request: &ModelRequest) -> Value {
         }
     }
 
-    let max_tokens = request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+    let max_tokens = request
+        .max_tokens
+        .unwrap_or(DEFAULT_MAX_TOKENS)
+        .min(model_output_cap(model));
     let mut body = serde_json::json!({
         "model": model,
         "max_tokens": max_tokens,
@@ -745,6 +760,37 @@ mod tests {
         };
         let body = build_body("claude-sonnet-5", &request);
         assert_eq!(body["max_tokens"], serde_json::json!(256));
+    }
+
+    #[test]
+    fn build_body_clamps_max_tokens_to_model_ceiling() {
+        let request = ModelRequest {
+            messages: vec![Message::User("hi".to_string())],
+            tools: vec![],
+            max_tokens: Some(32_768), // e.g. an escalated retry budget
+            temperature: None,
+            effort: None,
+        };
+
+        // Claude 3.5-generation models cap at 8,192; a larger budget would
+        // be rejected with a 400 before generating anything.
+        let older = build_body("claude-3-5-sonnet-20241022", &request);
+        assert_eq!(older["max_tokens"], serde_json::json!(8_192));
+
+        let haiku = build_body("claude-3-5-haiku-latest", &request);
+        assert_eq!(haiku["max_tokens"], serde_json::json!(8_192));
+
+        // Newer models accept (and need) the larger budget.
+        let newer = build_body("claude-sonnet-4-5", &request);
+        assert_eq!(newer["max_tokens"], serde_json::json!(32_768));
+
+        // Above even the newer ceiling, clamp to 65,536.
+        let huge = ModelRequest {
+            max_tokens: Some(131_072),
+            ..request
+        };
+        let clamped = build_body("claude-sonnet-4-5", &huge);
+        assert_eq!(clamped["max_tokens"], serde_json::json!(65_536));
     }
 
     #[test]

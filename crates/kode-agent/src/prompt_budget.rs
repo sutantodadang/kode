@@ -2,7 +2,6 @@ use kode_model::{Message, ToolSpec};
 
 use crate::{AgentError, Result};
 
-const DEFAULT_OUTPUT_TOKEN_RESERVE: usize = 4_096;
 const MAX_RETAINED_TOOL_OUTPUT_TOKENS: usize = 2_048;
 const TOOL_OUTPUT_TRUNCATED: &str = "\n[tool output truncated to fit context window]";
 const CONTEXT_TRUNCATED: &str = "\n[repository context truncated to fit context window]";
@@ -26,10 +25,14 @@ pub(crate) struct PromptBudget {
 impl PromptBudget {
     pub(crate) fn new(max_context_tokens: u32) -> Self {
         let max_context_tokens = max_context_tokens as usize;
-        let proportional_reserve = (max_context_tokens / 4).max(1);
-        let output_tokens = DEFAULT_OUTPUT_TOKEN_RESERVE
-            .min(proportional_reserve)
-            .min(u32::MAX as usize) as u32;
+        // Reasoning-heavy models (e.g. GLM via opencode-go) can spend most of
+        // an output budget on hidden thinking before emitting a tool call; a
+        // flat 4k reserve truncates mid-tool-call. Scale with the window,
+        // clamped so tiny windows keep a usable input budget (never reserve
+        // more than a quarter of the window).
+        let output_tokens = (max_context_tokens / 8)
+            .clamp(2_048, 16_384)
+            .min((max_context_tokens / 4).max(1)) as u32;
         Self {
             max_context_tokens,
             output_tokens,
@@ -324,9 +327,21 @@ mod tests {
         ];
         let prepared = budget.prepare(&messages, &tools()).unwrap();
 
-        assert_eq!(budget.output_tokens(), 4_096);
+        // 20k window / 8 = 2500, clamped up to the 2048 floor... 2500 > 2048
+        // so the raw proportional value wins.
+        assert_eq!(budget.output_tokens(), 2_500);
         assert_eq!(prepared, messages);
         assert!(estimate_request(&prepared, &tools()) <= budget.input_budget());
+    }
+
+    #[test]
+    fn output_reserve_scales_with_window() {
+        // Tiny windows stay quarter-capped so the input budget survives.
+        assert_eq!(PromptBudget::new(1_000).output_tokens(), 250);
+        assert_eq!(PromptBudget::new(8_000).output_tokens(), 2_000);
+        assert_eq!(PromptBudget::new(16_000).output_tokens(), 2_048);
+        assert_eq!(PromptBudget::new(128_000).output_tokens(), 16_000);
+        assert_eq!(PromptBudget::new(872_000).output_tokens(), 16_384);
     }
 
     #[test]

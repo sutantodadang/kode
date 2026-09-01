@@ -208,6 +208,17 @@ fn map_finish_reason(raw: &str) -> FinishReason {
     }
 }
 
+/// Whether the model id belongs to a reasoning generation that only accepts
+/// `max_completion_tokens` (gpt-5*, o1/o3/o4*). Legacy chat models (gpt-4o,
+/// gpt-4.1, ...) keep using `max_tokens`.
+fn uses_completion_tokens(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.starts_with("gpt-5")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct ChunkWire {
     #[serde(default)]
@@ -281,7 +292,14 @@ fn build_body(model: &str, request: &ModelRequest) -> serde_json::Value {
         body["tools"] = serde_json::Value::Array(tools);
     }
     if let Some(max_tokens) = request.max_tokens {
-        body["max_tokens"] = serde_json::json!(max_tokens);
+        // Reasoning-generation models (gpt-5*, o1/o3/o4*) reject the legacy
+        // `max_tokens` parameter with a 400; they require
+        // `max_completion_tokens`. Older chat models still take `max_tokens`.
+        if uses_completion_tokens(model) {
+            body["max_completion_tokens"] = serde_json::json!(max_tokens);
+        } else {
+            body["max_tokens"] = serde_json::json!(max_tokens);
+        }
     }
     if let Some(temperature) = request.temperature {
         body["temperature"] = serde_json::json!(temperature);
@@ -481,6 +499,28 @@ mod tests {
 
         let body = build_body("gpt-5", &request);
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn reasoning_generation_models_use_max_completion_tokens() {
+        let request = ModelRequest {
+            messages: vec![Message::User("hi".to_string())],
+            tools: vec![],
+            max_tokens: Some(16_384),
+            temperature: None,
+            effort: None,
+        };
+
+        for model in ["gpt-5.6-sol", "GPT-5", "o3", "o4-mini-high"] {
+            let body = build_body(model, &request);
+            assert_eq!(body["max_completion_tokens"], serde_json::json!(16_384));
+            assert!(body.get("max_tokens").is_none(), "{model}");
+        }
+
+        // Legacy chat models keep the classic parameter.
+        let legacy = build_body("gpt-4o", &request);
+        assert_eq!(legacy["max_tokens"], serde_json::json!(16_384));
+        assert!(legacy.get("max_completion_tokens").is_none());
     }
 
     #[test]
