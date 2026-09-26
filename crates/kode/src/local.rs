@@ -1,17 +1,19 @@
 //! Loads the local router stack (Laya + Qwen3 reranker) from verified
 //! artefacts under `~/.kode`, degrading to `StaticRouter` with a reason.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use kode_context::{ContextReranker, RerankOutcome};
 use kode_core::config::RouterConfig;
 use kode_local::LocalError;
 use kode_local::device::{DevicePref, init_runtime};
-use kode_local::laya::{LayaRouter, shared_laya};
+use kode_local::laya::{LayaModel, LayaRouter, shared_laya};
+use kode_local::manifest::{ModelChoice, choose};
 use kode_local::models::{LAYA_DIR, LocalPaths, RERANKER_DIR, installed_runtime, verify_model_dir};
 use kode_local::pins::{MODEL_FILES, MODELS_REVISION, ORT_VERSION};
 use kode_local::rerank::{QwenReranker, shared_reranker};
-use kode_local::route::{StaticRouter, TaskRouter};
+use kode_local::route::{StaticRouter, TaskRouter, questions_version};
 
 /// ponytail: CPU reranks only the first 10 candidates; the rest sort last.
 const CPU_RERANK_CAP: usize = 10;
@@ -47,7 +49,7 @@ fn reason_of(e: &LocalError) -> String {
     }
 }
 
-pub async fn load(cfg: &RouterConfig) -> LocalStack {
+pub async fn load(cfg: &RouterConfig, root: &Path) -> LocalStack {
     let mut notes = Vec::new();
     let pref = DevicePref::parse(&cfg.device).unwrap_or_else(|| {
         notes.push(format!(
@@ -66,21 +68,31 @@ pub async fn load(cfg: &RouterConfig) -> LocalStack {
         return static_stack(format!("onnx runtime failed to load: {e}"), notes);
     }
 
-    let laya_dir = match verify_model_dir(&paths, MODELS_REVISION, MODEL_FILES, LAYA_DIR) {
-        Ok(dir) => dir,
-        Err(e) => return static_stack(reason_of(&e), notes),
-    };
-    let laya = match tokio::task::spawn_blocking(move || shared_laya(&laya_dir, LAYA_DEVICE)).await
-    {
-        Ok(Ok(model)) => model,
-        Ok(Err(e)) => return static_stack(reason_of(&e), notes),
-        Err(e) => return static_stack(format!("laya load task failed: {e}"), notes),
+    let (choice, note) = choose(root, &paths, MODELS_REVISION, &questions_version());
+    notes.extend(note);
+    let (laya, temps, label) = match choice {
+        ModelChoice::Team { dir, temps, label } => match load_laya(dir).await {
+            Ok(model) => (model, Some(temps), label),
+            Err(e) => {
+                notes.push(format!(
+                    "router: team model failed to load ({e}) — using pinned"
+                ));
+                match load_pinned(&paths).await {
+                    Ok(model) => (model, None, "pinned".to_string()),
+                    Err(reason) => return static_stack(reason, notes),
+                }
+            }
+        },
+        ModelChoice::Pinned { temps, label } => match load_pinned(&paths).await {
+            Ok(model) => (model, temps, label.to_string()),
+            Err(reason) => return static_stack(reason, notes),
+        },
     };
     let router: Arc<dyn TaskRouter> = Arc::new(LayaRouter {
         model: laya,
         min_confidence: cfg.min_confidence,
-        temps: None,
-        label: "pinned".to_string(),
+        temps,
+        label,
     });
 
     let reranker = if cfg.rerank {
@@ -114,6 +126,20 @@ pub async fn load(cfg: &RouterConfig) -> LocalStack {
         reranker,
         notes,
     }
+}
+
+async fn load_laya(dir: std::path::PathBuf) -> Result<Arc<LayaModel>, String> {
+    match tokio::task::spawn_blocking(move || shared_laya(&dir, LAYA_DEVICE)).await {
+        Ok(Ok(model)) => Ok(model),
+        Ok(Err(e)) => Err(reason_of(&e)),
+        Err(e) => Err(format!("laya load task failed: {e}")),
+    }
+}
+
+async fn load_pinned(paths: &LocalPaths) -> Result<Arc<LayaModel>, String> {
+    let dir = verify_model_dir(paths, MODELS_REVISION, MODEL_FILES, LAYA_DIR)
+        .map_err(|e| reason_of(&e))?;
+    load_laya(dir).await
 }
 
 pub struct LocalReranker {

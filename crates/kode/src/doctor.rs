@@ -137,7 +137,7 @@ pub async fn run(cwd: &Path) -> anyhow::Result<()> {
     }
 
     collect_mcp_checks(&mut checks, &config).await;
-    collect_local_checks(&mut checks, &config).await;
+    collect_local_checks(&mut checks, cwd, &config).await;
 
     checks.push(git_binary_check().await);
     checks.push(git_repository_check(cwd));
@@ -713,7 +713,7 @@ fn tier_checks(router: &RouterConfig, subagents: &SubagentConfig) -> Vec<Check> 
         .collect()
 }
 
-async fn collect_local_checks(checks: &mut Vec<Check>, config: &KodeConfig) {
+async fn collect_local_checks(checks: &mut Vec<Check>, cwd: &Path, config: &KodeConfig) {
     let router = &config.router;
     if !router.enabled {
         checks.push(Check::warn(
@@ -779,6 +779,68 @@ async fn collect_local_checks(checks: &mut Vec<Check>, config: &KodeConfig) {
             };
         checks.push(check);
     }
+
+    let (choice, note) = kode_local::manifest::choose(
+        cwd,
+        &paths,
+        MODELS_REVISION,
+        &kode_local::route::questions_version(),
+    );
+    checks.push(match (choice, note) {
+        (_, Some(note)) => Check::warn(LOCAL, "team model", note, ""),
+        (kode_local::manifest::ModelChoice::Team { label, .. }, None) => {
+            Check::pass(LOCAL, "team model", label)
+        }
+        (kode_local::manifest::ModelChoice::Pinned { label, .. }, None) => {
+            Check::pass(LOCAL, "team model", format!("none — {label}"))
+        }
+    });
+    if config.router.training.enabled {
+        let uv = crate::setup::probe_version("uv").await;
+        let hf = tool_version("hf", &["version"]).await;
+        checks.extend(training_tool_checks(uv, hf));
+    }
+}
+
+async fn tool_version(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = tokio::time::timeout(
+        TIMEOUT,
+        tokio::process::Command::new(cmd).args(args).output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    out.status.success().then(|| {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    })
+}
+
+fn training_tool_checks(uv: Option<String>, hf: Option<String>) -> Vec<Check> {
+    vec![
+        match uv {
+            Some(v) => Check::pass(LOCAL, "uv (train)", v),
+            None => Check::warn(
+                LOCAL,
+                "uv (train)",
+                "not found — `kode router train` needs it",
+                "install: https://docs.astral.sh/uv/",
+            ),
+        },
+        match hf {
+            Some(v) => Check::pass(LOCAL, "hf (train --remote)", v),
+            None => Check::warn(
+                LOCAL,
+                "hf (train --remote)",
+                "not found — needed for --remote and hf: publish",
+                "install: https://huggingface.co/docs/huggingface_hub/guides/cli",
+            ),
+        },
+    ]
 }
 
 #[cfg(test)]
@@ -1155,5 +1217,13 @@ mod tests {
         assert_eq!(status("heavy"), CheckStatus::Pass);
         assert_eq!(status("huge"), CheckStatus::Fail);
         assert_eq!(status("light"), CheckStatus::Fail);
+    }
+
+    #[test]
+    fn training_tool_checks_warn_with_install_hints() {
+        let checks = training_tool_checks(Some("uv 0.8.0".to_string()), None);
+        assert_eq!(checks[0].status, CheckStatus::Pass);
+        assert_eq!(checks[1].status, CheckStatus::Warn);
+        assert!(checks[1].fix.as_ref().unwrap().contains("huggingface"));
     }
 }

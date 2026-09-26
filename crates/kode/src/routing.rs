@@ -124,7 +124,7 @@ pub async fn route_task(
             route_input: None,
         };
     }
-    let stack = crate::local::load(&config.router).await;
+    let stack = crate::local::load(&config.router, cwd).await;
     for text in &stack.notes {
         events.emit(KodeEvent::Note { text: text.clone() });
     }
