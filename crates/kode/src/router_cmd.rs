@@ -15,9 +15,9 @@ use kode_local::dataset::{self, Correction, Labeled, Line, Split, split_of};
 use kode_local::device::{DevicePref, init_runtime};
 use kode_local::laya::{LayaModel, shared_laya};
 use kode_local::manifest::{
-    ManifestKind, Source, TeamModel, manifest_path, read_manifest, write_manifest,
+    FileEntry, ManifestKind, Source, TeamModel, manifest_path, read_manifest, write_manifest,
 };
-use kode_local::models::{LAYA_DIR, LocalPaths, installed_runtime, verify_model_dir};
+use kode_local::models::{LAYA_DIR, LocalPaths, installed_runtime, sha256_file, verify_model_dir};
 use kode_local::pins::{MODEL_FILES, MODELS_REVISION, ORT_VERSION};
 use kode_local::route::{questions_version, route_questions};
 use kode_local::temps::Temperatures;
@@ -446,6 +446,188 @@ pub async fn train_cmd(root: &Path, config: &KodeConfig, remote: bool) -> anyhow
     Ok(())
 }
 
+const CHECKPOINT_FILES: &[&str] = &["laya.json", "model.onnx", "tokenizer.json"];
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PublishTarget {
+    Hf(String),
+    Path(PathBuf),
+    /// Repo-relative directory, tracked with Git LFS.
+    Lfs(String),
+}
+
+pub fn parse_target(s: &str) -> Result<PublishTarget, String> {
+    let (kind, value) = s
+        .split_once(':')
+        .ok_or_else(|| "use hf:<repo>, path:<dir>, or lfs:<repo-relative dir>".to_string())?;
+    match kind {
+        "hf" if value.contains('/') && !value.starts_with('/') => {
+            Ok(PublishTarget::Hf(value.to_string()))
+        }
+        "hf" => Err(format!("`{value}` is not an HF repo id (owner/name)")),
+        "path" if !value.is_empty() => Ok(PublishTarget::Path(PathBuf::from(value))),
+        "lfs" => {
+            let p = Path::new(value);
+            if value.is_empty()
+                || p.is_absolute()
+                || value.starts_with('/')
+                || p.components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                Err(format!("`{value}` must be a path inside the repo"))
+            } else {
+                Ok(PublishTarget::Lfs(value.trim_end_matches('/').to_string()))
+            }
+        }
+        _ => Err(format!("unknown target `{kind}` (hf, path, lfs)")),
+    }
+}
+
+pub fn checkpoint_files(dir: &Path) -> anyhow::Result<Vec<FileEntry>> {
+    CHECKPOINT_FILES
+        .iter()
+        .map(|name| {
+            let path = dir.join(name);
+            Ok(FileEntry {
+                path: name.to_string(),
+                sha256: sha256_file(&path).with_context(|| path.display().to_string())?,
+                size: std::fs::metadata(&path)?.len(),
+            })
+        })
+        .collect()
+}
+
+fn read_passed_report(root: &Path, candidate: &str) -> anyhow::Result<TrainReport> {
+    let path = candidates_dir(root).join(candidate).join("report.json");
+    let text = std::fs::read_to_string(&path).map_err(|_| {
+        anyhow::anyhow!("candidate {candidate} has no report (training did not finish)")
+    })?;
+    let report: TrainReport = serde_json::from_str(&text)?;
+    if report.status != "passed" {
+        anyhow::bail!(
+            "candidate {candidate} was rejected by the gate: {}",
+            report.evaluation.gate.reason
+        );
+    }
+    Ok(report)
+}
+
+fn copy_checkpoint(from: &Path, to: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for name in CHECKPOINT_FILES {
+        std::fs::copy(from.join(name), to.join(name))
+            .with_context(|| format!("copying {name} to {}", to.display()))?;
+    }
+    Ok(())
+}
+
+fn checkpoint_manifest(
+    report: &TrainReport,
+    source: Source,
+    files: Vec<FileEntry>,
+) -> anyhow::Result<TeamModel> {
+    Ok(TeamModel {
+        kind: ManifestKind::Checkpoint,
+        base_revision: String::new(),
+        questions_version: report.questions_version.clone(),
+        source: Some(source),
+        files,
+        temps: report.evaluation.candidate_temps.clone(),
+        report: serde_json::to_value(&report.evaluation)?,
+    })
+}
+
+/// `path:` and `lfs:` publishing (no network); writes the manifest.
+pub fn publish_local(
+    root: &Path,
+    candidate: &str,
+    target: &PublishTarget,
+) -> anyhow::Result<TeamModel> {
+    let report = read_passed_report(root, candidate)?;
+    let model_dir = candidates_dir(root).join(candidate).join("model");
+    let files = checkpoint_files(&model_dir)?;
+    let source = match target {
+        PublishTarget::Path(dir) => {
+            let dest = dir.join(candidate);
+            copy_checkpoint(&model_dir, &dest)?;
+            Source::Path(dest.to_string_lossy().to_string())
+        }
+        PublishTarget::Lfs(rel) => {
+            copy_checkpoint(&model_dir, &root.join(rel).join(candidate))?;
+            Source::RepoPath(format!("{rel}/{candidate}"))
+        }
+        PublishTarget::Hf(_) => anyhow::bail!("hf: targets are published by publish_cmd"),
+    };
+    let manifest = checkpoint_manifest(&report, source, files)?;
+    write_manifest(root, &manifest)?;
+    Ok(manifest)
+}
+
+pub async fn publish_cmd(root: &Path, candidate: &str, to: &str) -> anyhow::Result<()> {
+    let target = parse_target(to).map_err(anyhow::Error::msg)?;
+    let manifest = match &target {
+        PublishTarget::Hf(repo) => {
+            let report = read_passed_report(root, candidate)?;
+            let model_dir = candidates_dir(root).join(candidate).join("model");
+            let files = checkpoint_files(&model_dir)?;
+            crate::trainer::hf(&[
+                "repos",
+                "create",
+                repo,
+                "--type",
+                "model",
+                "--private",
+                "--exist-ok",
+            ])
+            .await?;
+            crate::trainer::hf(&[
+                "upload",
+                repo,
+                &model_dir.to_string_lossy(),
+                ".",
+                "--type",
+                "model",
+                "--commit-message",
+                &format!("kode router candidate {candidate}"),
+            ])
+            .await?;
+            let info: serde_json::Value = serde_json::from_str(
+                &crate::trainer::hf_output(&["models", "info", repo, "--format", "json"]).await?,
+            )?;
+            let revision = info["sha"]
+                .as_str()
+                .context("hf models info did not return a revision")?
+                .to_string();
+            let manifest = checkpoint_manifest(
+                &report,
+                Source::Hf {
+                    repo: repo.clone(),
+                    revision,
+                },
+                files,
+            )?;
+            write_manifest(root, &manifest)?;
+            manifest
+        }
+        _ => publish_local(root, candidate, &target)?,
+    };
+    println!(
+        "wrote {} — commit it to share with the team",
+        manifest_path(root).display()
+    );
+    if let Some(Source::RepoPath(p)) = &manifest.source {
+        println!(
+            "track the weights with Git LFS: git lfs track \"{p}/**\" && git add .gitattributes {p}"
+        );
+    }
+    if matches!(target, PublishTarget::Hf(_)) {
+        println!(
+            "the HF repo is private; teammates need `hf auth login` (or HF_TOKEN) before `kode setup`"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -732,5 +914,119 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(report.status, "rejected");
+    }
+
+    use kode_local::manifest::{ModelChoice, choose};
+
+    fn passed_candidate(root: &Path, id: &str, status: &str) {
+        let dir = candidates_dir(root).join(id);
+        std::fs::create_dir_all(dir.join("model")).unwrap();
+        for f in ["model.onnx", "laya.json", "tokenizer.json"] {
+            std::fs::write(dir.join("model").join(f), format!("{f} bytes")).unwrap();
+        }
+        let report = TrainReport {
+            id: id.to_string(),
+            status: status.to_string(),
+            questions_version: questions_version(),
+            n_train_rows: 900,
+            evaluation: kode_local::calibrate::Evaluation {
+                base: Default::default(),
+                candidate: Default::default(),
+                candidate_temps: Temperatures {
+                    temperature: vec![1.2, 1.0, 1.0],
+                    temperature_by_options: Default::default(),
+                },
+                gate: kode_local::calibrate::Gate {
+                    passed: status == "passed",
+                    reason: "r".to_string(),
+                },
+                n_calib: 90,
+            },
+        };
+        std::fs::write(
+            dir.join("report.json"),
+            serde_json::to_string(&report).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn parse_target_accepts_three_kinds_and_rejects_escapes() {
+        assert_eq!(
+            parse_target("hf:team/router").unwrap(),
+            PublishTarget::Hf("team/router".to_string())
+        );
+        assert_eq!(
+            parse_target("path:D:/shared").unwrap(),
+            PublishTarget::Path(PathBuf::from("D:/shared"))
+        );
+        assert_eq!(
+            parse_target("lfs:models/router").unwrap(),
+            PublishTarget::Lfs("models/router".to_string())
+        );
+        assert!(parse_target("hf:noslash").is_err());
+        assert!(parse_target("lfs:../outside").is_err());
+        assert!(parse_target("lfs:/abs").is_err());
+        assert!(parse_target("s3:bucket").is_err());
+    }
+
+    #[test]
+    fn publish_to_path_writes_a_manifest_the_router_accepts() {
+        let root = root("publish-path");
+        let shared = root.join("shared");
+        passed_candidate(&root, "01JCAND", "passed");
+        let m = publish_local(&root, "01JCAND", &PublishTarget::Path(shared.clone())).unwrap();
+        assert_eq!(
+            m.source,
+            Some(Source::Path(
+                shared.join("01JCAND").to_string_lossy().to_string()
+            ))
+        );
+        assert_eq!(m.files.len(), 3);
+        let paths = LocalPaths {
+            root: root.join("home"),
+        };
+        let (choice, note) = choose(
+            &root,
+            &paths,
+            kode_local::pins::MODELS_REVISION,
+            &questions_version(),
+        );
+        assert!(note.is_none(), "{note:?}");
+        assert!(matches!(choice, ModelChoice::Team { .. }));
+    }
+
+    #[test]
+    fn publish_to_lfs_uses_a_repo_relative_source() {
+        let root = root("publish-lfs");
+        passed_candidate(&root, "01JCAND", "passed");
+        let m = publish_local(
+            &root,
+            "01JCAND",
+            &PublishTarget::Lfs("models/router".to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            m.source,
+            Some(Source::RepoPath("models/router/01JCAND".to_string()))
+        );
+        assert!(root.join("models/router/01JCAND/model.onnx").is_file());
+    }
+
+    #[test]
+    fn publish_refuses_rejected_candidates() {
+        let root = root("publish-rejected");
+        passed_candidate(&root, "01JBAD", "rejected");
+        let err = publish_local(&root, "01JBAD", &PublishTarget::Path(root.join("s"))).unwrap_err();
+        assert!(err.to_string().contains("rejected"));
+    }
+
+    #[test]
+    fn publish_refuses_candidate_without_report() {
+        let root = root("publish-noreport");
+        std::fs::create_dir_all(candidates_dir(&root).join("01JHALF/model")).unwrap();
+        let err =
+            publish_local(&root, "01JHALF", &PublishTarget::Path(root.join("s"))).unwrap_err();
+        assert!(err.to_string().contains("no report"));
     }
 }

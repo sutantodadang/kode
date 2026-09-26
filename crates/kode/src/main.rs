@@ -143,6 +143,14 @@ enum RouterCmd {
         #[arg(long)]
         remote: bool,
     },
+    /// Share a candidate that passed the gate and write the team manifest.
+    Publish {
+        /// Candidate id (see `kode router train` output).
+        candidate: String,
+        /// hf:<owner/repo> | path:<dir> | lfs:<repo-relative dir>
+        #[arg(long)]
+        to: String,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -283,6 +291,9 @@ async fn main() -> anyhow::Result<()> {
                 RouterCmd::Train { remote } => {
                     let config = kode_core::KodeConfig::load(&cwd)?;
                     router_cmd::train_cmd(&cwd, &config, remote).await?;
+                }
+                RouterCmd::Publish { candidate, to } => {
+                    router_cmd::publish_cmd(&cwd, &candidate, &to).await?;
                 }
             }
         }
