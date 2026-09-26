@@ -2,6 +2,7 @@
 //! context reranking on ONNX Runtime. Core crate: never prints, never
 //! depends on ratatui; results travel back as values.
 
+pub mod calibrate;
 pub mod dataset;
 pub mod device;
 pub mod error;

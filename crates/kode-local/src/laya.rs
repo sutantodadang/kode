@@ -212,6 +212,15 @@ pub fn shared_laya(dir: &Path, pref: DevicePref) -> Result<Arc<LayaModel>, Local
     Ok(model)
 }
 
+impl crate::calibrate::LogitSource for LayaModel {
+    fn logits(&self, state: &str, q: &QuestionDef) -> Result<Vec<f32>, LocalError> {
+        LayaModel::logits(self, state, q)
+    }
+    fn temperatures(&self) -> Temperatures {
+        self.cfg.temps.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
