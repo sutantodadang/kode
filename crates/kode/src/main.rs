@@ -8,6 +8,7 @@ mod local;
 mod models;
 mod pipeline;
 mod remember;
+mod router_cmd;
 mod routing;
 mod session;
 mod setup;
@@ -110,6 +111,24 @@ enum Command {
     Memory {
         #[command(subcommand)]
         cmd: MemoryCmd,
+    },
+    /// Team router training: status, corrections, calibration, training.
+    Router {
+        #[command(subcommand)]
+        cmd: RouterCmd,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum RouterCmd {
+    /// Dataset counts, splits, thresholds, and the active team model.
+    Status,
+    /// Correct a record's labels: `kode router correct last tier=heavy`.
+    Correct {
+        /// A record id, or `last` (your newest record).
+        target: String,
+        /// key=value pairs: tier, effort, plan.
+        assignments: Vec<String>,
     },
 }
 
@@ -229,6 +248,26 @@ async fn main() -> anyhow::Result<()> {
                 team_memory::print_status(&cwd);
             }
         },
+        Some(Command::Router { cmd }) => {
+            let cwd = std::env::current_dir()?;
+            match cmd {
+                RouterCmd::Status => {
+                    for line in router_cmd::status_lines(&cwd) {
+                        println!("{line}");
+                    }
+                }
+                RouterCmd::Correct {
+                    target,
+                    assignments,
+                } => {
+                    println!(
+                        "{}",
+                        router_cmd::correct(&cwd, &target, &assignments)
+                            .map_err(anyhow::Error::msg)?
+                    );
+                }
+            }
+        }
     }
 
     Ok(())
