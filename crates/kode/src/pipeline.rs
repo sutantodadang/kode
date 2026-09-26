@@ -151,10 +151,10 @@ async fn run_verification_phase(
     (report, verdict)
 }
 
-struct ModelFactory;
+pub(crate) struct ModelFactory;
 
 impl ModelFactory {
-    fn create(config: &KodeConfig) -> anyhow::Result<Arc<dyn kode_model::Model>> {
+    pub(crate) fn create(config: &KodeConfig) -> anyhow::Result<Arc<dyn kode_model::Model>> {
         if config.model.model.is_empty() {
             anyhow::bail!("set model.model in .kode/config.toml");
         }
@@ -312,6 +312,39 @@ pub async fn run_task_with_input(
         )
     {
         events.emit(KodeEvent::Note { text });
+    }
+    if config.router.training.enabled
+        && let (Some(decision), Some(route_input), Ok(outcome)) =
+            (&routed.decision, &routed.route_input, &result)
+    {
+        let applied = &routed.applied.config;
+        let note = match ModelFactory::create(applied) {
+            Ok(model) => {
+                let files_changed = kode_context::git::repo_state(cwd)
+                    .await
+                    .map(|s| s.numstat.len())
+                    .unwrap_or(0);
+                crate::training::capture(
+                    model.as_ref(),
+                    crate::training::CaptureInput {
+                        root: cwd,
+                        model_id: format!("{}/{}", applied.model.provider, applied.model.model),
+                        author: crate::training::git_user_name(cwd).await,
+                        route_input,
+                        decision,
+                        outcome,
+                        files_changed,
+                    },
+                )
+                .await
+            }
+            Err(e) => Some(format!(
+                "router: label skipped (teacher model unavailable: {e})"
+            )),
+        };
+        if let Some(text) = note {
+            events.emit(KodeEvent::Note { text });
+        }
     }
     result
 }

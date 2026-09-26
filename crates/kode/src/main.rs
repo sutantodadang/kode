@@ -13,6 +13,7 @@ mod session;
 mod setup;
 mod status;
 mod team_memory;
+mod training;
 mod tui;
 mod update;
 mod verify;
