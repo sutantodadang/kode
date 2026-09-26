@@ -30,6 +30,7 @@ tok = agent.tok
 cfg = agent.cfg
 
 
+# The export path below is duplicated in train_laya.py (a single-file uv script cannot import it); keep them in sync.
 def head_layer(layer, x, keep):
     """Pre-LN nn.TransformerEncoderLayer, re-expressed for ONNX export.
 

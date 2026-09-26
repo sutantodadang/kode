@@ -6,8 +6,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
+use kode_core::config::KodeConfig;
 use kode_local::calibrate::{
-    Calibration, MIN_CALIBRATE, MIN_EVAL_DECISIONS, MIN_TRAIN, build_items, calibrate,
+    Calibration, Evaluation, LogitSource, MIN_CALIBRATE, MIN_EVAL_DECISIONS, MIN_TRAIN,
+    build_items, calibrate, evaluate,
 };
 use kode_local::dataset::{self, Correction, Labeled, Line, Split, split_of};
 use kode_local::device::{DevicePref, init_runtime};
@@ -18,6 +20,10 @@ use kode_local::manifest::{
 use kode_local::models::{LAYA_DIR, LocalPaths, installed_runtime, verify_model_dir};
 use kode_local::pins::{MODEL_FILES, MODELS_REVISION, ORT_VERSION};
 use kode_local::route::{questions_version, route_questions};
+use kode_local::temps::Temperatures;
+use serde::{Deserialize, Serialize};
+
+use crate::trainer::{HfJobsRunner, TRAIN_SCRIPT, TrainJob, TrainRunner, UvRunner};
 
 pub fn candidates_dir(root: &Path) -> PathBuf {
     root.join(".kode").join("router").join("candidates")
@@ -293,11 +299,160 @@ pub async fn calibrate_cmd(root: &Path, write: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainReport {
+    pub id: String,
+    /// `passed` | `rejected`.
+    pub status: String,
+    pub questions_version: String,
+    pub n_train_rows: usize,
+    pub evaluation: Evaluation,
+}
+
+/// One row per (train-split record, labeled question).
+pub fn write_train_jsonl(examples: &[Labeled], path: &Path) -> anyhow::Result<usize> {
+    use std::io::Write;
+    let questions = route_questions();
+    let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
+    let mut rows = 0;
+    for ex in examples.iter().filter(|e| split_of(&e.id) == Split::Train) {
+        for q in &questions {
+            if let Some(target) = ex.labels.get(q.key) {
+                let row = serde_json::json!({
+                    "id": ex.id, "state": ex.state, "question": q.def, "target": target,
+                });
+                writeln!(file, "{row}")?;
+                rows += 1;
+            }
+        }
+    }
+    file.flush()?;
+    Ok(rows)
+}
+
+pub type OpenCandidate = dyn Fn(&Path) -> anyhow::Result<Arc<dyn LogitSource>> + Send + Sync;
+
+pub async fn run_training(
+    root: &Path,
+    examples: &[Labeled],
+    runner: &dyn TrainRunner,
+    base: Arc<dyn LogitSource>,
+    base_temps: Temperatures,
+    open_candidate: &OpenCandidate,
+) -> anyhow::Result<TrainReport> {
+    let id = dataset::new_id();
+    let dir = candidates_dir(root).join(&id);
+    std::fs::create_dir_all(&dir)?;
+    let train_jsonl = dir.join("train.jsonl");
+    let n_train_rows = write_train_jsonl(examples, &train_jsonl)?;
+    let script = dir.join("train_laya.py");
+    std::fs::write(&script, TRAIN_SCRIPT)?;
+    let out_dir = dir.join("model");
+    runner
+        .run(&TrainJob {
+            id: id.clone(),
+            script,
+            train_jsonl,
+            out_dir: out_dir.clone(),
+        })
+        .await?;
+    for f in ["model.onnx", "laya.json", "tokenizer.json"] {
+        if !out_dir.join(f).is_file() {
+            anyhow::bail!(
+                "training finished but {f} is missing in {}",
+                out_dir.display()
+            );
+        }
+    }
+    let candidate = open_candidate(&out_dir)?;
+    let ex = examples.to_vec();
+    let (base_items, cand_items) = tokio::task::spawn_blocking(move || {
+        Ok::<_, kode_local::LocalError>((
+            build_items(base.as_ref(), &ex)?,
+            build_items(candidate.as_ref(), &ex)?,
+        ))
+    })
+    .await??;
+    let evaluation = evaluate(&base_items, &base_temps, &cand_items);
+    let report = TrainReport {
+        id: id.clone(),
+        status: if evaluation.gate.passed {
+            "passed"
+        } else {
+            "rejected"
+        }
+        .to_string(),
+        questions_version: questions_version(),
+        n_train_rows,
+        evaluation,
+    };
+    std::fs::write(
+        dir.join("report.json"),
+        serde_json::to_string_pretty(&report)? + "\n",
+    )?;
+    Ok(report)
+}
+
+pub async fn train_cmd(root: &Path, config: &KodeConfig, remote: bool) -> anyhow::Result<()> {
+    let examples = load_examples(root)?;
+    if examples.len() < MIN_TRAIN {
+        anyhow::bail!(
+            "training needs {MIN_TRAIN} labeled records; the dataset has {}",
+            examples.len()
+        );
+    }
+    let runner: Box<dyn TrainRunner> = if remote {
+        let repo = config.router.training.hf_dataset.trim();
+        if repo.is_empty() {
+            anyhow::bail!(
+                "set [router.training] hf_dataset = \"<you>/<private-dataset>\" for --remote"
+            );
+        }
+        Box::new(HfJobsRunner {
+            dataset_repo: repo.to_string(),
+        })
+    } else {
+        Box::new(UvRunner)
+    };
+    let base = load_pinned_laya().await?;
+    let base_temps = match read_manifest(root) {
+        Ok(Some(m))
+            if m.kind == ManifestKind::Calibration && m.base_revision == MODELS_REVISION =>
+        {
+            m.temps
+        }
+        _ => base.temperatures().clone(),
+    };
+    let open: &OpenCandidate =
+        &|dir: &Path| Ok(Arc::new(LayaModel::load(dir, DevicePref::Cpu)?) as Arc<dyn LogitSource>);
+    let report = run_training(root, &examples, runner.as_ref(), base, base_temps, open).await?;
+    let e = &report.evaluation;
+    println!("candidate {} — {}", report.id, report.status);
+    println!(
+        "  base:      accuracy {:.3} · ECE {:.3} (n={})",
+        e.base.accuracy, e.base.ece, e.base.n
+    );
+    println!(
+        "  candidate: accuracy {:.3} · ECE {:.3} (n={})",
+        e.candidate.accuracy, e.candidate.ece, e.candidate.n
+    );
+    println!("  gate: {}", e.gate.reason);
+    if e.gate.passed {
+        println!(
+            "publish with: kode router publish {} --to hf:<repo>|path:<dir>|lfs:<dir>",
+            report.id
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use kode_local::calibrate::{Calibration, Metrics};
     use kode_local::dataset::{Line, Record, TaskSummary, TeacherLabel, append, dataset_path};
+    use kode_local::error::LocalError;
+    use kode_local::sequence::QuestionDef;
     use kode_local::temps::Temperatures;
 
     fn cal() -> Calibration {
@@ -464,5 +619,118 @@ mod tests {
         let dir = root("examples");
         seed(&dir, "r1", 1);
         assert_eq!(load_examples(&dir).unwrap().len(), 1);
+    }
+
+    struct Fake {
+        good: bool,
+    }
+
+    impl LogitSource for Fake {
+        fn logits(&self, state: &str, q: &QuestionDef) -> Result<Vec<f32>, LocalError> {
+            let k = q.options.len();
+            if !self.good {
+                return Ok(vec![0.0; k]);
+            }
+            let right = q
+                .options
+                .iter()
+                .position(|(key, _)| state.contains(&format!("={key}")))
+                .unwrap_or(0);
+            Ok((0..k).map(|i| if i == right { 3.0 } else { 0.0 }).collect())
+        }
+        fn temperatures(&self) -> Temperatures {
+            Temperatures::default()
+        }
+    }
+
+    struct FakeRunner;
+
+    #[async_trait::async_trait]
+    impl TrainRunner for FakeRunner {
+        async fn run(&self, job: &TrainJob) -> anyhow::Result<()> {
+            assert!(job.train_jsonl.is_file());
+            assert!(job.script.is_file());
+            std::fs::create_dir_all(&job.out_dir)?;
+            for f in ["model.onnx", "laya.json", "tokenizer.json"] {
+                std::fs::write(job.out_dir.join(f), b"x")?;
+            }
+            Ok(())
+        }
+    }
+
+    fn examples(n: usize) -> Vec<Labeled> {
+        (0..n)
+            .map(|i| Labeled {
+                id: format!("01J{i:023}"),
+                state: "task tier=heavy effort=low plan=plan".to_string(),
+                labels: [
+                    ("tier".to_string(), vec![0.0, 0.0, 1.0]),
+                    ("effort".to_string(), vec![1.0, 0.0, 0.0]),
+                    ("plan".to_string(), vec![1.0, 0.0]),
+                ]
+                .into_iter()
+                .collect(),
+                corrected: false,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn train_jsonl_holds_only_train_split_rows() {
+        let dir = root("train-jsonl");
+        let ex = examples(200);
+        let path = dir.join("train.jsonl");
+        let rows = write_train_jsonl(&ex, &path).unwrap();
+        let train_records = ex
+            .iter()
+            .filter(|e| split_of(&e.id) == Split::Train)
+            .count();
+        assert_eq!(rows, train_records * 3);
+        let first: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(first["question"]["options"].is_array());
+        assert!(first["target"].is_array());
+    }
+
+    #[tokio::test]
+    async fn run_training_gates_and_writes_a_report() {
+        let dir = root("run-training");
+        let ex = examples(600);
+        let report = run_training(
+            &dir,
+            &ex,
+            &FakeRunner,
+            Arc::new(Fake { good: false }),
+            Temperatures::default(),
+            &|_: &Path| Ok(Arc::new(Fake { good: true }) as Arc<dyn LogitSource>),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.status, "passed", "{}", report.evaluation.gate.reason);
+        let saved = candidates_dir(&dir).join(&report.id).join("report.json");
+        let text = std::fs::read_to_string(saved).unwrap();
+        assert!(text.contains("\"status\": \"passed\""));
+    }
+
+    #[tokio::test]
+    async fn run_training_rejects_a_worse_candidate() {
+        let dir = root("run-training-bad");
+        let report = run_training(
+            &dir,
+            &examples(600),
+            &FakeRunner,
+            Arc::new(Fake { good: true }),
+            Temperatures::default(),
+            &|_: &Path| Ok(Arc::new(Fake { good: false }) as Arc<dyn LogitSource>),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.status, "rejected");
     }
 }

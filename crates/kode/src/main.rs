@@ -14,6 +14,7 @@ mod session;
 mod setup;
 mod status;
 mod team_memory;
+mod trainer;
 mod training;
 mod tui;
 mod update;
@@ -135,6 +136,12 @@ enum RouterCmd {
         /// Write `.kode/router/team-model.json` (commit it to share).
         #[arg(long)]
         write: bool,
+    },
+    /// Fine-tune Laya on the team dataset, calibrate, and gate the result.
+    Train {
+        /// Train on HF Jobs (needs `hf` and [router.training] hf_dataset).
+        #[arg(long)]
+        remote: bool,
     },
 }
 
@@ -273,6 +280,10 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
                 RouterCmd::Calibrate { write } => router_cmd::calibrate_cmd(&cwd, write).await?,
+                RouterCmd::Train { remote } => {
+                    let config = kode_core::KodeConfig::load(&cwd)?;
+                    router_cmd::train_cmd(&cwd, &config, remote).await?;
+                }
             }
         }
     }
