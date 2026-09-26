@@ -264,6 +264,19 @@ pub fn calibration_manifest(c: &Calibration) -> anyhow::Result<TeamModel> {
     })
 }
 
+fn pinned_temperatures(root: &Path, shipped: &Temperatures) -> Temperatures {
+    match read_manifest(root) {
+        Ok(Some(m))
+            if m.kind == ManifestKind::Calibration
+                && m.base_revision == MODELS_REVISION
+                && m.questions_version == questions_version() =>
+        {
+            m.temps
+        }
+        _ => shipped.clone(),
+    }
+}
+
 pub async fn calibrate_cmd(root: &Path, write: bool) -> anyhow::Result<()> {
     let examples = load_examples(root)?;
     if examples.len() < MIN_CALIBRATE {
@@ -282,7 +295,7 @@ pub async fn calibrate_cmd(root: &Path, write: bool) -> anyhow::Result<()> {
         );
     }
     let model = load_pinned_laya().await?;
-    let current = model.temperatures().clone();
+    let current = pinned_temperatures(root, model.temperatures());
     let items =
         tokio::task::spawn_blocking(move || build_items(model.as_ref(), &examples)).await??;
     let result = calibrate(&items, &current, &[Split::Train, Split::Calib]);
@@ -415,14 +428,7 @@ pub async fn train_cmd(root: &Path, config: &KodeConfig, remote: bool) -> anyhow
         Box::new(UvRunner)
     };
     let base = load_pinned_laya().await?;
-    let base_temps = match read_manifest(root) {
-        Ok(Some(m))
-            if m.kind == ManifestKind::Calibration && m.base_revision == MODELS_REVISION =>
-        {
-            m.temps
-        }
-        _ => base.temperatures().clone(),
-    };
+    let base_temps = pinned_temperatures(root, base.temperatures());
     let open: &OpenCandidate =
         &|dir: &Path| Ok(Arc::new(LayaModel::load(dir, DevicePref::Cpu)?) as Arc<dyn LogitSource>);
     let report = run_training(root, &examples, runner.as_ref(), base, base_temps, open).await?;
@@ -797,6 +803,27 @@ mod tests {
     }
 
     #[test]
+    fn pinned_temperatures_use_only_a_compatible_calibration() {
+        let dir = root("pinned-temperatures");
+        let shipped = Temperatures::default();
+        assert_eq!(pinned_temperatures(&dir, &shipped), shipped);
+        let mut manifest = calibration_manifest(&cal()).unwrap();
+        write_manifest(&dir, &manifest).unwrap();
+        assert_eq!(pinned_temperatures(&dir, &shipped), manifest.temps);
+        manifest.questions_version = "sha256:old-questions".to_string();
+        write_manifest(&dir, &manifest).unwrap();
+        assert_eq!(pinned_temperatures(&dir, &shipped), shipped);
+        manifest.questions_version = questions_version();
+        manifest.base_revision = "old-model".to_string();
+        write_manifest(&dir, &manifest).unwrap();
+        assert_eq!(pinned_temperatures(&dir, &shipped), shipped);
+        manifest.base_revision = MODELS_REVISION.to_string();
+        manifest.kind = ManifestKind::Checkpoint;
+        write_manifest(&dir, &manifest).unwrap();
+        assert_eq!(pinned_temperatures(&dir, &shipped), shipped);
+    }
+
+    #[test]
     fn load_examples_counts_only_current_version() {
         let dir = root("examples");
         seed(&dir, "r1", 1);
@@ -1028,5 +1055,42 @@ mod tests {
         let err =
             publish_local(&root, "01JHALF", &PublishTarget::Path(root.join("s"))).unwrap_err();
         assert!(err.to_string().contains("no report"));
+    }
+
+    /// Run after real training + path publishing in an isolated repo:
+    /// KODE_ROUTER_QA_ROOT=<repo> cargo test -p kode --bin kode published_checkpoint -- --ignored
+    #[tokio::test]
+    #[ignore = "requires a real published checkpoint and installed ONNX runtime"]
+    async fn published_checkpoint_loads_and_routes() {
+        let root = PathBuf::from(
+            std::env::var_os("KODE_ROUTER_QA_ROOT").expect("set KODE_ROUTER_QA_ROOT"),
+        );
+        let config = kode_core::config::RouterConfig {
+            rerank: false,
+            ..Default::default()
+        };
+        let stack = crate::local::load(&config, &root).await;
+        assert!(stack.notes.is_empty(), "{:?}", stack.notes);
+        let decision = stack
+            .router
+            .route(&kode_local::route::RouteInput {
+                task: "task tier=heavy effort=low plan=plan".to_string(),
+                project: "rust".to_string(),
+                changed_files: 0,
+            })
+            .await;
+        assert!(
+            decision.device.starts_with("laya team@path"),
+            "{}",
+            decision.device
+        );
+        assert_eq!(decision.probs.len(), 3);
+        assert!(
+            decision
+                .probs
+                .iter()
+                .all(|(_, p)| p.iter().all(|x| x.is_finite())
+                    && (p.iter().sum::<f32>() - 1.0).abs() < 1e-5)
+        );
     }
 }

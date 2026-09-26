@@ -190,7 +190,8 @@ pub fn labeled(ds: &Dataset, version: &str) -> Labels {
                     && p.len() == q.def.options.len()
                 {
                     let sum: f32 = p.iter().sum();
-                    if sum > 0.0 {
+                    if sum.is_finite() && sum > 0.0 && p.iter().all(|x| x.is_finite() && *x >= 0.0)
+                    {
                         labels.insert(q.key.to_string(), p.iter().map(|x| x / sum).collect());
                     }
                 }
@@ -445,6 +446,26 @@ mod tests {
             labeled(&ds, V).examples[0].labels["tier"],
             vec![0.25, 0.25, 0.5]
         );
+    }
+
+    #[test]
+    fn invalid_teacher_distributions_are_not_training_labels() {
+        let ds = Dataset {
+            records: vec![record(
+                "r1",
+                1,
+                V,
+                Some([
+                    vec![-1.0, 1.0, 1.0],
+                    vec![f32::MAX, f32::MAX, 0.0],
+                    vec![0.0, 0.0],
+                ]),
+            )],
+            ..Default::default()
+        };
+        let labels = labeled(&ds, V);
+        assert!(labels.examples.is_empty());
+        assert_eq!(labels.unlabeled, 1);
     }
 
     #[test]
