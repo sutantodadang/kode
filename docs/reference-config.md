@@ -137,6 +137,43 @@ tool activities) alongside the error; feed it back as `context` on a
 re-delegate so the replacement resumes instead of re-exploring from zero.
 The bundled `tiered-exec` skill documents the routing conventions.
 
+## `[router]`
+
+Local, in-process routing and context reranking. Runs Laya (a multilingual
+decision model) and Qwen3-Reranker-0.6B on ONNX Runtime; install them with
+`kode setup` (~4 GB). Without them Kode routes statically and says so.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | `false` = static routing, local models never loaded. Builds with no pinned models behave as `false` |
+| `min_confidence` | `0.6` | per answer; below it the static value is used (`static: low confidence …`) |
+| `device` | `"auto"` | reranker device: `auto` \| `cpu` \| `directml` \| `cuda` \| `coreml`; a failing GPU falls back to CPU. Laya always runs on CPU (faster than GPU for its short sequences) |
+| `rerank` | `true` | rerank up to 24 candidates (16 Ingat memories, 8 zindeks search hits) before budgeting; keeps the best 12 memories and 6 hits |
+| `rerank_on_cpu` | `false` | the reranker is slow on CPU (~0.8 s per candidate); it is skipped there unless this is set (then max 10 candidates — raise `rerank_timeout_ms` to ~10000 as well) |
+| `rerank_timeout_ms` | `2000` | past this, engine order is kept (`rerank: skipped: timeout`) |
+| `log_text` | `false` | `.kode/router-log.jsonl` stores a sha256 of the task unless this is set |
+
+### `[router.tiers]`
+
+Maps the router's `light` / `standard` / `heavy` answer to a model tier name
+from `[agent.subagents.models.<name>]`. An unmapped answer runs the root
+`[model]`.
+
+```toml
+[router.tiers]
+light = "luna"
+heavy = "terra"
+```
+
+Effort: the router adjusts `[model].effort` per task only when you have set
+it (proof the provider accepts effort). Plan: the router can turn plan mode
+on for a task, never off, and only when someone can approve the plan (the
+TUI, or `kode exec` on an interactive terminal — never piped/CI runs). Pin
+everything with `enabled = false`.
+
+Only tasks the model actually routed are written to `.kode/router-log.jsonl`;
+static-only decisions (models missing, disabled, cancelled) are not logged.
+
 ## `[permissions]`
 
 | Key | Type | Default | Effect |

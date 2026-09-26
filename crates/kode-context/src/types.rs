@@ -53,6 +53,8 @@ pub struct ContextStats {
     pub memories_dropped: usize,
     pub sections_truncated: usize,
     pub sections_dropped: usize,
+    /// "off" | "ok" | "skipped: <reason>" | "failed: <reason>"
+    pub rerank_status: String,
 }
 
 /// The result of [`crate::ContextCompiler::compile`]: a deterministic,
@@ -169,6 +171,7 @@ mod tests {
                 memories_dropped: 0,
                 sections_truncated: 0,
                 sections_dropped: 0,
+                rerank_status: "off".to_string(),
             },
         };
         let rendered = compiled.render().unwrap();

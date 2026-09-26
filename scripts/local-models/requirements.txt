@@ -1,0 +1,7 @@
+torch>=2.3
+transformers>=4.48
+safetensors>=0.4
+huggingface_hub>=0.24
+onnx>=1.16
+onnxruntime>=1.22
+numpy>=1.26

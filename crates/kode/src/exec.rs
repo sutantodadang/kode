@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use kode_core::CancellationToken;
 use kode_core::config::KodeConfig;
-use kode_core::event::{EventBus, KodeEvent};
+use kode_core::event::{EventBus, KodeEvent, router_summary};
 use kode_memory::EngineeringMemory;
 use kode_tools::permission::PermissionHandler;
 use tokio::sync::broadcast::error::RecvError;
@@ -135,6 +135,9 @@ pub async fn run(
                 }
                 Ok(KodeEvent::Note { text }) => {
                     eprintln!("◆ {text}");
+                }
+                Ok(KodeEvent::RouterDecision { answers }) => {
+                    eprintln!("◆ {}", router_summary(&answers));
                 }
                 Ok(KodeEvent::VerifyStep {
                     name,

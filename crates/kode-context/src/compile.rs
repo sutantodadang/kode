@@ -1,12 +1,14 @@
 use std::cmp::Ordering;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use kode_intel::error::IntelError;
-use kode_intel::{CodeContextRequest, CodeIntelligence};
+use kode_intel::{CodeContextRequest, CodeIntelligence, CodeSearchResult};
 use kode_memory::{EngineeringMemory, Memory, MemoryKind, MemoryQuery, Provenance};
 
 use crate::git;
+use crate::rerank::{ContextReranker, RerankOutcome};
 use crate::types::{
     CompiledContext, ContextRequest, ContextSection, ContextSource, ContextStats, estimate_tokens,
 };
@@ -18,6 +20,19 @@ const MIN_TRUNCATE_BUDGET: usize = 200;
 
 /// Number of memories requested per `EngineeringMemory::search` call.
 const MEMORY_SEARCH_LIMIT: u32 = 12;
+
+/// Candidates scored per task. Measured on an RTX 4070 SUPER (DirectML,
+/// batched): 24 ≈ 0.8 s warm / 1.6 s cold, 36 ≈ 1.3 s, 66 ≈ 2.3 s — so 24
+/// stays inside the default 2 s `rerank_timeout_ms`.
+const MAX_RERANK_CANDIDATES: u32 = 24;
+/// With a reranker, fetch this many memories, then keep the best
+/// `MEMORY_SEARCH_LIMIT` after reranking.
+const RERANK_MEMORY_FETCH: u32 = 16;
+/// zindeks `search` hits fetched for the reranked code section.
+const CODE_HITS_FETCH: u32 = 8;
+const CODE_HITS_KEEP: usize = 6;
+const _: () = assert!(RERANK_MEMORY_FETCH + CODE_HITS_FETCH <= MAX_RERANK_CANDIDATES);
+const _: () = assert!(RERANK_MEMORY_FETCH >= MEMORY_SEARCH_LIMIT);
 
 /// Per-memory body is truncated to this many characters when formatted into
 /// a section bullet.
@@ -36,6 +51,7 @@ pub struct ContextCompiler {
     intel: Option<Arc<dyn CodeIntelligence>>,
     memory: Option<Arc<dyn EngineeringMemory>>,
     budget_tokens: usize,
+    reranker: Option<(Arc<dyn ContextReranker>, Duration)>,
 }
 
 impl ContextCompiler {
@@ -48,7 +64,15 @@ impl ContextCompiler {
             intel,
             memory,
             budget_tokens,
+            reranker: None,
         }
+    }
+
+    /// Reranks memories and zindeks search hits against the task, bounded
+    /// by `timeout`. Without this, compile behaves exactly as before.
+    pub fn with_reranker(mut self, reranker: Arc<dyn ContextReranker>, timeout: Duration) -> Self {
+        self.reranker = Some((reranker, timeout));
+        self
     }
 
     pub async fn compile(&self, request: &ContextRequest, root: &Path) -> CompiledContext {
@@ -82,7 +106,11 @@ impl ContextCompiler {
                                 text: request.task.clone(),
                                 repository,
                                 kind: None,
-                                limit: MEMORY_SEARCH_LIMIT,
+                                limit: if self.reranker.is_some() {
+                                    RERANK_MEMORY_FETCH
+                                } else {
+                                    MEMORY_SEARCH_LIMIT
+                                },
                             })
                             .await,
                     )
@@ -90,8 +118,71 @@ impl ContextCompiler {
                 None => None,
             }
         };
+        let hits_fut = async {
+            match (&self.intel, &self.reranker) {
+                (Some(intel), Some(_)) => Some(intel.search(&request.task, CODE_HITS_FETCH).await),
+                _ => None,
+            }
+        };
 
-        let (git_state, intel_result, memory_result) = tokio::join!(git_fut, intel_fut, memory_fut);
+        let (git_state, intel_result, mut memory_result, hits_result) =
+            tokio::join!(git_fut, intel_fut, memory_fut, hits_fut);
+
+        let mut rerank_status = "off".to_string();
+        let mut ranked_hits: Vec<CodeSearchResult> = Vec::new();
+        if let Some((reranker, timeout)) = &self.reranker {
+            let mut memories: Vec<Memory> = match &mut memory_result {
+                Some(Ok(m)) => std::mem::take(m),
+                _ => Vec::new(),
+            };
+            let hits: Vec<CodeSearchResult> = match hits_result {
+                Some(Ok(h)) => h,
+                _ => Vec::new(),
+            };
+            let docs: Vec<String> = memories
+                .iter()
+                .map(|m| format!("{}\n{}", m.summary, m.body))
+                .chain(hits.iter().map(|h| format!("{}\n{}", h.path, h.snippet)))
+                .collect();
+            rerank_status = "ok".to_string();
+            if !docs.is_empty() {
+                let outcome = tokio::time::timeout(*timeout, reranker.rerank(&request.task, &docs))
+                    .await
+                    .unwrap_or_else(|_| RerankOutcome::Skipped("timeout".to_string()));
+                match outcome {
+                    RerankOutcome::Scored(scores) if scores.len() == docs.len() => {
+                        let (memory_scores, hit_scores) = scores.split_at(memories.len());
+                        for (m, s) in memories.iter_mut().zip(memory_scores) {
+                            m.score = *s;
+                        }
+                        memories.sort_by(|a, b| {
+                            b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal)
+                        });
+                        let mut scored: Vec<(f32, CodeSearchResult)> =
+                            hit_scores.iter().copied().zip(hits).collect();
+                        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+                        ranked_hits = scored
+                            .into_iter()
+                            .take(CODE_HITS_KEEP)
+                            .map(|(_, h)| h)
+                            .collect();
+                    }
+                    RerankOutcome::Scored(scores) => {
+                        rerank_status = format!(
+                            "failed: {} scores for {} candidates",
+                            scores.len(),
+                            docs.len()
+                        );
+                    }
+                    RerankOutcome::Skipped(reason) => rerank_status = format!("skipped: {reason}"),
+                    RerankOutcome::Failed(reason) => rerank_status = format!("failed: {reason}"),
+                }
+            }
+            memories.truncate(MEMORY_SEARCH_LIMIT as usize);
+            if let Some(Ok(m)) = &mut memory_result {
+                *m = memories;
+            }
+        }
 
         // The vector is empty for non-memory sections; memory candidates
         // retain their item boundaries so budgeting can account for exactly
@@ -141,6 +232,24 @@ impl ContextCompiler {
             Some(Err(e)) => {
                 intel_status = format!("unavailable: {e}");
             }
+        }
+
+        if !ranked_hits.is_empty() {
+            let body = ranked_hits
+                .iter()
+                .map(|h| format!("### {}\n{}", h.path, h.snippet.trim()))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let tokens = estimate_tokens(&body);
+            candidates.push((
+                ContextSection {
+                    source: ContextSource::CodeIntelligence,
+                    title: "Relevant code (reranked)".to_string(),
+                    body,
+                    tokens,
+                },
+                Vec::new(),
+            ));
         }
 
         match memory_result {
@@ -277,6 +386,7 @@ impl ContextCompiler {
                 memories_dropped: memories_retrieved.saturating_sub(memories_retained),
                 sections_truncated,
                 sections_dropped: sections_retrieved.saturating_sub(sections_retained),
+                rerank_status,
             },
         }
     }
@@ -831,5 +941,166 @@ mod tests {
         let compiled = compiler.compile(&request(), &dir).await;
 
         assert!(compiled.summary_line().contains("ingat"));
+    }
+
+    struct FixedReranker(RerankOutcome);
+
+    #[async_trait::async_trait]
+    impl ContextReranker for FixedReranker {
+        async fn rerank(&self, _query: &str, _docs: &[String]) -> RerankOutcome {
+            match &self.0 {
+                RerankOutcome::Scored(s) => RerankOutcome::Scored(s.clone()),
+                RerankOutcome::Skipped(r) => RerankOutcome::Skipped(r.clone()),
+                RerankOutcome::Failed(r) => RerankOutcome::Failed(r.clone()),
+            }
+        }
+    }
+
+    struct SlowReranker;
+
+    #[async_trait::async_trait]
+    impl ContextReranker for SlowReranker {
+        async fn rerank(&self, _query: &str, docs: &[String]) -> RerankOutcome {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            RerankOutcome::Scored(vec![0.0; docs.len()])
+        }
+    }
+
+    fn hit(path: &str) -> kode_intel::CodeSearchResult {
+        kode_intel::CodeSearchResult {
+            path: path.to_string(),
+            snippet: format!("fn in {path}"),
+            score: 1.0,
+        }
+    }
+
+    fn rule(summary: &str) -> Memory {
+        new_memory(
+            Some(MemoryKind::ProjectRule),
+            Some(Provenance::ExplicitUser),
+            summary,
+            summary,
+            0.5,
+        )
+    }
+
+    #[tokio::test]
+    async fn without_reranker_status_is_off_and_limit_unchanged() {
+        use kode_memory::MockEngineeringMemory;
+        let dir = temp_dir("rerank-off");
+        let memory = Arc::new(MockEngineeringMemory::default());
+        let compiler = ContextCompiler::new(None, Some(memory.clone()), 16_000);
+        let compiled = compiler.compile(&request(), &dir).await;
+        assert_eq!(compiled.stats.rerank_status, "off");
+        assert_eq!(
+            memory.searched_snapshot().await[0].limit,
+            MEMORY_SEARCH_LIMIT
+        );
+    }
+
+    #[tokio::test]
+    async fn reranker_reorders_memories_and_adds_ranked_code_section() {
+        use kode_memory::MockEngineeringMemory;
+        let dir = temp_dir("rerank-ok");
+        let intel = MockCodeIntelligence {
+            search_results: vec![hit("a.rs"), hit("b.rs")],
+            ..Default::default()
+        };
+        let memory = Arc::new(MockEngineeringMemory {
+            search_results: vec![rule("first by engine"), rule("second by engine")],
+            ..Default::default()
+        });
+        // docs order: 2 memories, then 2 hits.
+        let reranker = Arc::new(FixedReranker(RerankOutcome::Scored(vec![
+            0.1, 0.9, 0.2, 0.8,
+        ])));
+        let compiler = ContextCompiler::new(Some(Arc::new(intel)), Some(memory.clone()), 16_000)
+            .with_reranker(reranker, std::time::Duration::from_secs(2));
+        let compiled = compiler.compile(&request(), &dir).await;
+
+        assert_eq!(compiled.stats.rerank_status, "ok");
+        assert_eq!(
+            memory.searched_snapshot().await[0].limit,
+            RERANK_MEMORY_FETCH
+        );
+        let rules = compiled
+            .sections
+            .iter()
+            .find(|s| s.title == "Project rules & conventions")
+            .unwrap();
+        assert!(
+            rules.body.find("second by engine").unwrap()
+                < rules.body.find("first by engine").unwrap()
+        );
+        let code = compiled
+            .sections
+            .iter()
+            .find(|s| s.title == "Relevant code (reranked)")
+            .unwrap();
+        assert!(code.body.find("b.rs").unwrap() < code.body.find("a.rs").unwrap());
+    }
+
+    #[tokio::test]
+    async fn rerank_timeout_is_skipped_and_keeps_engine_order() {
+        use kode_memory::MockEngineeringMemory;
+        let dir = temp_dir("rerank-timeout");
+        let memory = Arc::new(MockEngineeringMemory {
+            search_results: vec![rule("first by engine"), rule("second by engine")],
+            ..Default::default()
+        });
+        let compiler = ContextCompiler::new(None, Some(memory), 16_000)
+            .with_reranker(Arc::new(SlowReranker), std::time::Duration::from_millis(50));
+        let compiled = compiler.compile(&request(), &dir).await;
+        assert_eq!(compiled.stats.rerank_status, "skipped: timeout");
+        assert!(
+            compiled
+                .sections
+                .iter()
+                .all(|s| s.title != "Relevant code (reranked)")
+        );
+        let rules = compiled
+            .sections
+            .iter()
+            .find(|s| s.title == "Project rules & conventions")
+            .unwrap();
+        assert!(
+            rules.body.find("first by engine").unwrap()
+                < rules.body.find("second by engine").unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_score_count_is_failed() {
+        use kode_memory::MockEngineeringMemory;
+        let dir = temp_dir("rerank-count");
+        let memory = Arc::new(MockEngineeringMemory {
+            search_results: vec![rule("only")],
+            ..Default::default()
+        });
+        let compiler = ContextCompiler::new(None, Some(memory), 16_000).with_reranker(
+            Arc::new(FixedReranker(RerankOutcome::Scored(vec![0.1, 0.2]))),
+            std::time::Duration::from_secs(2),
+        );
+        let compiled = compiler.compile(&request(), &dir).await;
+        assert_eq!(
+            compiled.stats.rerank_status,
+            "failed: 2 scores for 1 candidates"
+        );
+    }
+
+    #[tokio::test]
+    async fn skipped_reranker_reports_its_reason() {
+        use kode_memory::MockEngineeringMemory;
+        let dir = temp_dir("rerank-skip");
+        let memory = Arc::new(MockEngineeringMemory {
+            search_results: vec![rule("only")],
+            ..Default::default()
+        });
+        let compiler = ContextCompiler::new(None, Some(memory), 16_000).with_reranker(
+            Arc::new(FixedReranker(RerankOutcome::Skipped("no gpu".to_string()))),
+            std::time::Duration::from_secs(2),
+        );
+        let compiled = compiler.compile(&request(), &dir).await;
+        assert_eq!(compiled.stats.rerank_status, "skipped: no gpu");
     }
 }

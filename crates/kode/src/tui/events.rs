@@ -248,6 +248,22 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
                 .transcript
                 .push(TranscriptLine::new(Gutter::Note, text));
         }
+        KodeEvent::RouterDecision { answers } => {
+            // The ledger was built from the user's plan_mode before routing;
+            // a model "plan" answer turns plan mode on, so show the step.
+            let router_plans = answers.iter().any(|a| {
+                a.key == "plan"
+                    && a.value == "plan"
+                    && a.source == kode_core::event::RouteSource::Laya
+            });
+            if router_plans && state.ledger.steps.iter().all(|(s, _)| *s != TaskStep::Plan) {
+                state.ledger.steps.insert(0, (TaskStep::Plan, false));
+            }
+            state.transcript.push(TranscriptLine::new(
+                Gutter::Note,
+                kode_core::event::router_summary(&answers),
+            ));
+        }
         KodeEvent::SourcedNote { text, source } => {
             let gutter = match source {
                 NoteSource::Zindeks => Gutter::Zindeks,

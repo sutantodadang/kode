@@ -329,6 +329,70 @@ fn note_pushes_note_gutter_line() {
 }
 
 #[test]
+fn router_decision_renders_as_note_line() {
+    use kode_core::event::{RouteAnswer, RouteSource};
+    let mut s = state();
+    apply_event(
+        &mut s,
+        KodeEvent::RouterDecision {
+            answers: vec![RouteAnswer {
+                key: "tier".to_string(),
+                value: "heavy".to_string(),
+                confidence: Some(0.82),
+                source: RouteSource::Laya,
+            }],
+        },
+    );
+    let last = s.transcript.last().expect("a transcript line");
+    assert_eq!(last.gutter, Gutter::Note);
+    assert_eq!(last.text, "router: tier=heavy (laya 0.82)");
+}
+
+#[test]
+fn router_plan_answer_adds_plan_step_to_ledger() {
+    use kode_core::event::{RouteAnswer, RouteSource, TaskStep};
+    let plan = |value: &str, source: RouteSource| KodeEvent::RouterDecision {
+        answers: vec![RouteAnswer {
+            key: "plan".to_string(),
+            value: value.to_string(),
+            confidence: Some(0.9),
+            source,
+        }],
+    };
+
+    let mut s = state();
+    s.start_new_task("refactor providers", false);
+    apply_event(&mut s, plan("plan", RouteSource::Laya));
+    assert_eq!(s.ledger.steps[0], (TaskStep::Plan, false));
+    apply_event(&mut s, plan("plan", RouteSource::Laya));
+    let plans = s
+        .ledger
+        .steps
+        .iter()
+        .filter(|(step, _)| *step == TaskStep::Plan)
+        .count();
+    assert_eq!(plans, 1, "never duplicated");
+
+    let mut direct = state();
+    direct.start_new_task("explain", false);
+    apply_event(
+        &mut direct,
+        plan(
+            "plan",
+            RouteSource::Static("low confidence 0.20".to_string()),
+        ),
+    );
+    apply_event(&mut direct, plan("direct", RouteSource::Laya));
+    assert!(
+        direct
+            .ledger
+            .steps
+            .iter()
+            .all(|(step, _)| *step != TaskStep::Plan)
+    );
+}
+
+#[test]
 fn context_compiled_updates_token_counter() {
     let mut s = state();
     apply_event(

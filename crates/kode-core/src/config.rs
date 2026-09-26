@@ -93,6 +93,24 @@ fn default_verify_fail_fast() -> bool {
     true
 }
 
+fn default_router_min_confidence() -> f32 {
+    0.6
+}
+
+fn default_router_device() -> String {
+    "auto".to_string()
+}
+
+fn default_rerank_timeout_ms() -> u64 {
+    2_000
+}
+
+/// Valid values for `router.device`.
+pub const VALID_ROUTER_DEVICES: &[&str] = &["auto", "cpu", "directml", "cuda", "coreml"];
+
+/// Laya tier answers that `[router.tiers]` may map.
+pub const ROUTER_TIERS: &[&str] = &["light", "standard", "heavy"];
+
 /// Top-level Kode configuration, loaded from `.kode/config.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -105,6 +123,7 @@ pub struct KodeConfig {
     pub mcp: McpConfig,
     pub verify: VerifyConfig,
     pub ui: UiConfig,
+    pub router: RouterConfig,
 }
 
 impl KodeConfig {
@@ -374,6 +393,50 @@ impl Default for SubagentConfig {
 pub struct ModelTierConfig {
     pub provider: String,
     pub model: String,
+}
+
+/// `[router]`: local Laya task routing and Qwen3 context reranking.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RouterConfig {
+    /// `false` = static routing only; local models are never loaded.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Per-question minimum Laya confidence; below it the static value wins.
+    #[serde(default = "default_router_min_confidence")]
+    pub min_confidence: f32,
+    /// One of [`VALID_ROUTER_DEVICES`].
+    #[serde(default = "default_router_device")]
+    pub device: String,
+    #[serde(default = "default_true")]
+    pub rerank: bool,
+    /// The reranker is skipped on CPU unless this is set (it is slow there).
+    #[serde(default)]
+    pub rerank_on_cpu: bool,
+    #[serde(default = "default_rerank_timeout_ms")]
+    pub rerank_timeout_ms: u64,
+    /// `false` stores a sha256 of the task in the router log, not its text.
+    #[serde(default)]
+    pub log_text: bool,
+    /// Router tier (`light` | `standard` | `heavy`) -> name of an
+    /// `[agent.subagents.models.<name>]` entry. Unmapped tiers use `[model]`.
+    #[serde(default)]
+    pub tiers: BTreeMap<String, String>,
+}
+
+impl Default for RouterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_confidence: default_router_min_confidence(),
+            device: default_router_device(),
+            rerank: true,
+            rerank_on_cpu: false,
+            rerank_timeout_ms: default_rerank_timeout_ms(),
+            log_text: false,
+            tiers: BTreeMap::new(),
+        }
+    }
 }
 
 impl AgentConfig {
@@ -895,5 +958,54 @@ effort = "high"
         assert_eq!(cfg.model.model, "");
         assert_eq!(cfg.agent.max_tool_calls, 7);
         assert_eq!(cfg.mcp.servers.get("everything").unwrap().command, "npx");
+    }
+
+    #[test]
+    fn router_defaults_when_section_missing() {
+        let cfg: KodeConfig = toml::from_str("").unwrap();
+        assert!(cfg.router.enabled);
+        assert!((cfg.router.min_confidence - 0.6).abs() < f32::EPSILON);
+        assert_eq!(cfg.router.device, "auto");
+        assert!(cfg.router.rerank);
+        assert!(!cfg.router.rerank_on_cpu);
+        assert_eq!(cfg.router.rerank_timeout_ms, 2_000);
+        assert!(!cfg.router.log_text);
+        assert!(cfg.router.tiers.is_empty());
+    }
+
+    #[test]
+    fn router_section_parses_every_key() {
+        let cfg: KodeConfig = toml::from_str(
+            r#"
+[router]
+enabled = false
+min_confidence = 0.75
+device = "cpu"
+rerank = false
+rerank_on_cpu = true
+rerank_timeout_ms = 500
+log_text = true
+
+[router.tiers]
+light = "luna"
+heavy = "terra"
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.router.enabled);
+        assert!((cfg.router.min_confidence - 0.75).abs() < f32::EPSILON);
+        assert_eq!(cfg.router.device, "cpu");
+        assert!(!cfg.router.rerank);
+        assert!(cfg.router.rerank_on_cpu);
+        assert_eq!(cfg.router.rerank_timeout_ms, 500);
+        assert!(cfg.router.log_text);
+        assert_eq!(
+            cfg.router.tiers.get("light").map(String::as_str),
+            Some("luna")
+        );
+        assert_eq!(
+            cfg.router.tiers.get("heavy").map(String::as_str),
+            Some("terra")
+        );
     }
 }

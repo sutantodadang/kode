@@ -19,6 +19,17 @@ The agent then runs inside a tool sandbox with guardrails for tool-call volume, 
 
 Delegation supports tiered model routing: `[agent.subagents.models.<tier>]` maps a short name to any provider/model pair, and the root selects it per delegation via `delegate_task`'s `model` argument — mechanical child work runs on a cheap executor while judgment stays on the root session model. When a child dies mid-run (e.g. provider quota exhaustion), the failure result carries an `activity_tail` of the child's last tool activities so the root can re-delegate with that as context and resume instead of re-exploring from zero.
 
+Before the model is built, a local router decides the task's tier, effort,
+and whether to plan first. It runs Laya, a non-generative multilingual
+decision model, in-process on ONNX Runtime; each answer carries a calibrated
+confidence and falls back to the static configuration below
+`router.min_confidence`. The same runtime hosts Qwen3-Reranker-0.6B, which
+reorders Ingat memories and zindeks search hits against the task before the
+context budget is applied. Both degrade honestly: a missing model, a failing
+GPU, or a timeout shows up as `static: <reason>` or `rerank: skipped: <reason>`,
+never as a model decision. Every routed task appends one line to
+`.kode/router-log.jsonl`, the data for a future fine-tuned checkpoint.
+
 After edits land, a verification pipeline runs the project's real checks: tests, lint, build: and reports each one honestly: passed, failed, or skipped. A skipped check is never reported as passed. This same honesty rule applies to session replay: when you resume a session, truncated history shows a truncation marker rather than silently pretending the model saw turns it didn't.
 
 ## Event-driven pipeline
