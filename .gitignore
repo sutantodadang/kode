@@ -1,4 +1,5 @@
 /target
+/build/
 .kode/
 .kode/sessions/
 docs/superpowers/

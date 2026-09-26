@@ -911,6 +911,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "kode-local"
+version = "0.4.12"
+dependencies = [
+ "async-trait",
+ "futures",
+ "kode-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "kode-mcp"
 version = "0.4.12"
 dependencies = [
