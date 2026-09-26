@@ -629,7 +629,13 @@ fn render_line(c: &Check) -> String {
         detail.push_str(" \u{2014} "); // " — "
         detail.push_str(fix);
     }
-    format!("  {:<NAME_WIDTH$}{symbol} {detail}", c.name)
+    // Names at or past the column width would otherwise run into the symbol.
+    let gap = if c.name.chars().count() >= NAME_WIDTH {
+        " "
+    } else {
+        ""
+    };
+    format!("  {:<NAME_WIDTH$}{gap}{symbol} {detail}", c.name)
 }
 
 /// Renders a full doctor report as text. Pure: takes checks in the order
@@ -1068,6 +1074,13 @@ mod tests {
         assert!(out.contains(&fail_line));
 
         assert!(out.ends_with("1 problem(s) found.\n"));
+    }
+
+    #[test]
+    fn render_keeps_a_space_after_names_wider_than_the_column() {
+        let long = "laya-multilingual/model.onnx";
+        let out = render(&[Check::warn("Local router", long, "missing", "")]);
+        assert!(out.contains(&format!("  {long} ! missing")), "{out}");
     }
 
     #[test]
