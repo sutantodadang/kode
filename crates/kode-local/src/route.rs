@@ -4,6 +4,7 @@
 
 use async_trait::async_trait;
 use kode_core::event::{RouteAnswer, RouteSource};
+use sha2::{Digest, Sha256};
 
 use crate::sequence::{QType, QuestionDef};
 
@@ -107,6 +108,20 @@ pub fn route_questions() -> Vec<RouteQuestion> {
             },
         },
     ]
+}
+
+/// Identifies the router questions (texts + options). Dataset records and
+/// team models from another version are not comparable.
+pub fn questions_version() -> String {
+    version_of(&route_questions())
+}
+
+pub fn version_of(questions: &[RouteQuestion]) -> String {
+    let defs: Vec<(&str, &QuestionDef)> = questions.iter().map(|q| (q.key, &q.def)).collect();
+    let json = serde_json::to_string(&defs).unwrap_or_default();
+    let digest = Sha256::digest(json.as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    format!("sha256:{hex}")
 }
 
 /// `softmax(logits / temperature)`, as laya `RLAgent.system_one` computes it.
@@ -298,6 +313,22 @@ mod tests {
             input.state(),
             "task: fix the bug\nproject: rust\nuncommitted files: 2"
         );
+    }
+
+    #[test]
+    fn questions_version_is_stable_and_prefixed() {
+        let v = questions_version();
+        assert_eq!(v, questions_version());
+        assert!(v.starts_with("sha256:"));
+        assert_eq!(v.len(), "sha256:".len() + 64);
+    }
+
+    #[test]
+    fn questions_version_changes_when_a_question_changes() {
+        let mut qs = route_questions();
+        let before = version_of(&qs);
+        qs[0].def.instructions.push_str(" (edited)");
+        assert_ne!(before, version_of(&qs));
     }
 
     #[tokio::test]

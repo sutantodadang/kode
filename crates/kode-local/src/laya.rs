@@ -1,7 +1,7 @@
 //! Laya multilingual decision model on ONNX Runtime (batch size 1).
 
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -15,15 +15,15 @@ use crate::error::{LocalError, rt};
 use crate::route::{
     RouteDecision, RouteInput, TaskRouter, resolve_route, route_questions, softmax_with_temperature,
 };
-use crate::sequence::{QType, QuestionDef, SeqTokenizer, Sequence, build_sequence, render_options};
+use crate::sequence::{QuestionDef, SeqTokenizer, Sequence, build_sequence, render_options};
+use crate::temps::Temperatures;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LayaConfig {
     pub max_len: usize,
     pub head_max_len: usize,
-    pub temperature: Vec<f32>,
-    #[serde(default)]
-    pub temperature_by_options: BTreeMap<String, f32>,
+    #[serde(flatten)]
+    pub temps: Temperatures,
     pub cls_id: u32,
     pub sep_id: u32,
     pub mask_id: u32,
@@ -36,23 +36,6 @@ impl LayaConfig {
         let text = std::fs::read_to_string(&path).map_err(|_| LocalError::Missing(path.clone()))?;
         serde_json::from_str(&text)
             .map_err(|e| LocalError::Config(format!("{}: {e}", path.display())))
-    }
-
-    /// laya `temp_bucket`: per-cardinality temperature, else per question type.
-    pub fn temperature_for(&self, qtype: QType, k: usize) -> f32 {
-        let size = if k <= 2 {
-            "2"
-        } else if k <= 5 {
-            "3-5"
-        } else if k <= 10 {
-            "6-10"
-        } else {
-            "11+"
-        };
-        self.temperature_by_options
-            .get(&format!("{}:{size}", qtype.name()))
-            .copied()
-            .unwrap_or_else(|| self.temperature.get(qtype.index()).copied().unwrap_or(1.0))
     }
 }
 
@@ -137,7 +120,11 @@ impl LayaModel {
         build_sequence(&self.tok, state, q, self.cfg.max_len, self.cfg.head_max_len)
     }
 
-    fn logits(&self, state: &str, q: &QuestionDef) -> Result<Vec<f32>, LocalError> {
+    pub fn temperatures(&self) -> &Temperatures {
+        &self.cfg.temps
+    }
+
+    pub fn logits(&self, state: &str, q: &QuestionDef) -> Result<Vec<f32>, LocalError> {
         let seq = self.sequence(state, q);
         let k = seq.markers.len();
         if k != render_options(q).len() {
@@ -160,16 +147,19 @@ impl LayaModel {
 
     pub fn probs(&self, state: &str, q: &QuestionDef) -> Result<Vec<f32>, LocalError> {
         let logits = self.logits(state, q)?;
-        Ok(softmax_with_temperature(
-            &logits,
-            self.cfg.temperature_for(q.qtype, logits.len()),
-        ))
+        let t = self.cfg.temps.get(q.qtype, logits.len());
+        Ok(softmax_with_temperature(&logits, t))
     }
 }
 
 pub struct LayaRouter {
     pub model: Arc<LayaModel>,
     pub min_confidence: f32,
+    /// Overrides the model's own `laya.json` temperatures (team calibration).
+    pub temps: Option<Temperatures>,
+    /// Which model this is, for the decision label: `pinned`, `pinned+cal`,
+    /// `team@1a2b3c4`.
+    pub label: String,
 }
 
 #[async_trait]
@@ -179,63 +169,65 @@ impl TaskRouter for LayaRouter {
         let questions = route_questions();
         let defs: Vec<QuestionDef> = questions.iter().map(|q| q.def.clone()).collect();
         let model = self.model.clone();
+        let temps = self
+            .temps
+            .clone()
+            .unwrap_or_else(|| self.model.temperatures().clone());
         let state = input.state();
         let probs = tokio::task::spawn_blocking(move || {
             defs.iter()
-                .map(|d| model.probs(&state, d))
+                .map(|d| {
+                    model
+                        .logits(&state, d)
+                        .map(|z| softmax_with_temperature(&z, temps.get(d.qtype, z.len())))
+                })
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| format!("inference error: {e}"))
         })
         .await
         .unwrap_or_else(|e| Err(format!("inference task failed: {e}")));
         let mut decision = resolve_route(&questions, probs, self.min_confidence);
-        decision.device = self.model.device().label();
+        decision.device = format!("laya {} · {}", self.label, self.model.device().label());
         decision.latency_ms = started.elapsed().as_millis() as u64;
         decision
     }
 }
 
-static LAYA: OnceLock<Arc<LayaModel>> = OnceLock::new();
+static LAYA: OnceLock<Mutex<HashMap<PathBuf, Arc<LayaModel>>>> = OnceLock::new();
 
-/// Loads Laya once per process and reuses it across tasks. Failures are not
-/// cached, so running `kode setup` mid-session takes effect on the next task.
-/// ponytail: the first successful device choice sticks; changing
-/// `router.device` needs a restart.
+/// Loads a Laya model once per directory per process. Failures are not
+/// cached, so `kode setup` mid-session takes effect on the next task.
+/// ponytail: two tasks racing on a cold directory may both load it; the
+/// second insert wins, which is harmless.
 pub fn shared_laya(dir: &Path, pref: DevicePref) -> Result<Arc<LayaModel>, LocalError> {
-    if let Some(model) = LAYA.get() {
+    let cache = LAYA.get_or_init(Default::default);
+    if let Some(model) = cache.lock().map_err(|_| LocalError::Poisoned)?.get(dir) {
         return Ok(model.clone());
     }
     let model = Arc::new(LayaModel::load(dir, pref)?);
-    Ok(LAYA.get_or_init(|| model).clone())
+    cache
+        .lock()
+        .map_err(|_| LocalError::Poisoned)?
+        .insert(dir.to_path_buf(), model.clone());
+    Ok(model)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn cfg(temps: &[(&str, f32)]) -> LayaConfig {
-        LayaConfig {
-            max_len: 1024,
-            head_max_len: 256,
-            temperature: vec![1.5, 2.0, 3.0],
-            temperature_by_options: temps.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
-            cls_id: 1,
-            sep_id: 2,
-            mask_id: 3,
-            mask_token: "<mask>".to_string(),
-        }
-    }
-
     #[test]
-    fn temperature_prefers_cardinality_bucket_then_qtype() {
-        let c = cfg(&[("choice:3-5", 0.7)]);
-        assert!((c.temperature_for(QType::Choice, 3) - 0.7).abs() < 1e-6);
-        assert!((c.temperature_for(QType::Choice, 2) - 1.5).abs() < 1e-6);
-        assert!((c.temperature_for(QType::Score, 3) - 2.0).abs() < 1e-6);
-        assert!((c.temperature_for(QType::Noul, 2) - 3.0).abs() < 1e-6);
-        assert!(
-            (cfg(&[("choice:11+", 0.5)]).temperature_for(QType::Choice, 14) - 0.5).abs() < 1e-6
-        );
+    fn laya_json_temperatures_flatten_into_config() {
+        use crate::sequence::QType;
+        let dir = std::env::temp_dir().join(format!("kode-laya-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("laya.json"),
+            r#"{"max_len":1024,"head_max_len":256,"temperature":[1.2,1.0,1.0],"temperature_by_options":{},"cls_id":2,"sep_id":1,"mask_id":4,"mask_token":"<mask>"}"#,
+        )
+        .unwrap();
+        let cfg = LayaConfig::load(&dir).unwrap();
+        assert!((cfg.temps.get(QType::Choice, 3) - 1.2).abs() < 1e-6);
     }
 
     #[test]

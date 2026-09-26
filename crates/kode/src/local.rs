@@ -79,6 +79,8 @@ pub async fn load(cfg: &RouterConfig) -> LocalStack {
     let router: Arc<dyn TaskRouter> = Arc::new(LayaRouter {
         model: laya,
         min_confidence: cfg.min_confidence,
+        temps: None,
+        label: "pinned".to_string(),
     });
 
     let reranker = if cfg.rerank {
