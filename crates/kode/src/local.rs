@@ -16,6 +16,11 @@ use kode_local::route::{StaticRouter, TaskRouter};
 /// ponytail: CPU reranks only the first 10 candidates; the rest sort last.
 const CPU_RERANK_CAP: usize = 10;
 
+/// Laya runs one short sequence per question: on an RTX 4070 SUPER it took
+/// ~190 ms for three questions on CPU vs ~280 ms on DirectML (GPU launch
+/// overhead dominates). `router.device` therefore applies to the reranker.
+const LAYA_DEVICE: DevicePref = DevicePref::Cpu;
+
 pub struct LocalStack {
     pub router: Arc<dyn TaskRouter>,
     pub reranker: Option<Arc<dyn ContextReranker>>,
@@ -65,7 +70,8 @@ pub async fn load(cfg: &RouterConfig) -> LocalStack {
         Ok(dir) => dir,
         Err(e) => return static_stack(reason_of(&e), notes),
     };
-    let laya = match tokio::task::spawn_blocking(move || shared_laya(&laya_dir, pref)).await {
+    let laya = match tokio::task::spawn_blocking(move || shared_laya(&laya_dir, LAYA_DEVICE)).await
+    {
         Ok(Ok(model)) => model,
         Ok(Err(e)) => return static_stack(reason_of(&e), notes),
         Err(e) => return static_stack(format!("laya load task failed: {e}"), notes),

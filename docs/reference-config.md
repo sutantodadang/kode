@@ -147,9 +147,9 @@ decision model) and Qwen3-Reranker-0.6B on ONNX Runtime; install them with
 |---|---|---|
 | `enabled` | `true` | `false` = static routing, local models never loaded. Builds with no pinned models behave as `false` |
 | `min_confidence` | `0.6` | per answer; below it the static value is used (`static: low confidence …`) |
-| `device` | `"auto"` | `auto` \| `cpu` \| `directml` \| `cuda` \| `coreml`; a failing GPU falls back to CPU |
-| `rerank` | `true` | rerank Ingat memories and zindeks search hits before budgeting |
-| `rerank_on_cpu` | `false` | the reranker is slow on CPU; it is skipped there unless this is set (then max 10 candidates) |
+| `device` | `"auto"` | reranker device: `auto` \| `cpu` \| `directml` \| `cuda` \| `coreml`; a failing GPU falls back to CPU. Laya always runs on CPU (faster than GPU for its short sequences) |
+| `rerank` | `true` | rerank up to 24 candidates (16 Ingat memories, 8 zindeks search hits) before budgeting; keeps the best 12 memories and 6 hits |
+| `rerank_on_cpu` | `false` | the reranker is slow on CPU (~0.8 s per candidate); it is skipped there unless this is set (then max 10 candidates — raise `rerank_timeout_ms` to ~10000 as well) |
 | `rerank_timeout_ms` | `2000` | past this, engine order is kept (`rerank: skipped: timeout`) |
 | `log_text` | `false` | `.kode/router-log.jsonl` stores a sha256 of the task unless this is set |
 

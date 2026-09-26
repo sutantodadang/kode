@@ -21,12 +21,18 @@ const MIN_TRUNCATE_BUDGET: usize = 200;
 /// Number of memories requested per `EngineeringMemory::search` call.
 const MEMORY_SEARCH_LIMIT: u32 = 12;
 
-/// With a reranker, fetch this many times more memories, then keep the
-/// best `MEMORY_SEARCH_LIMIT` after reranking.
-const RERANK_FETCH_FACTOR: u32 = 3;
+/// Candidates scored per task. Measured on an RTX 4070 SUPER (DirectML,
+/// batched): 24 ≈ 0.8 s warm / 1.6 s cold, 36 ≈ 1.3 s, 66 ≈ 2.3 s — so 24
+/// stays inside the default 2 s `rerank_timeout_ms`.
+const MAX_RERANK_CANDIDATES: u32 = 24;
+/// With a reranker, fetch this many memories, then keep the best
+/// `MEMORY_SEARCH_LIMIT` after reranking.
+const RERANK_MEMORY_FETCH: u32 = 16;
 /// zindeks `search` hits fetched for the reranked code section.
-const CODE_HITS_FETCH: u32 = 30;
-const CODE_HITS_KEEP: usize = 10;
+const CODE_HITS_FETCH: u32 = 8;
+const CODE_HITS_KEEP: usize = 6;
+const _: () = assert!(RERANK_MEMORY_FETCH + CODE_HITS_FETCH <= MAX_RERANK_CANDIDATES);
+const _: () = assert!(RERANK_MEMORY_FETCH >= MEMORY_SEARCH_LIMIT);
 
 /// Per-memory body is truncated to this many characters when formatted into
 /// a section bullet.
@@ -101,7 +107,7 @@ impl ContextCompiler {
                                 repository,
                                 kind: None,
                                 limit: if self.reranker.is_some() {
-                                    MEMORY_SEARCH_LIMIT * RERANK_FETCH_FACTOR
+                                    RERANK_MEMORY_FETCH
                                 } else {
                                     MEMORY_SEARCH_LIMIT
                                 },
@@ -1015,7 +1021,7 @@ mod tests {
         assert_eq!(compiled.stats.rerank_status, "ok");
         assert_eq!(
             memory.searched_snapshot().await[0].limit,
-            MEMORY_SEARCH_LIMIT * 3
+            RERANK_MEMORY_FETCH
         );
         let rules = compiled
             .sections

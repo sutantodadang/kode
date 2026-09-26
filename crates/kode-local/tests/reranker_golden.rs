@@ -70,3 +70,31 @@ fn relevant_candidates_rank_first() {
         assert!(scores[0] > scores[1], "{}: {scores:?}", s.query);
     }
 }
+
+#[test]
+#[ignore]
+fn batched_scores_match_one_by_one() {
+    let (reranker, fx) = load();
+    // Mixed lengths (incl. the long doc) force left padding across batches.
+    let docs: Vec<String> = fx
+        .cases
+        .iter()
+        .map(|c| c.doc.clone())
+        .chain(
+            fx.sanity
+                .iter()
+                .flat_map(|s| [s.relevant.clone(), s.irrelevant.clone()]),
+        )
+        .collect();
+    let query = "fix the context budget truncation";
+    let batched = reranker.score_all(query, &docs).unwrap();
+    assert_eq!(batched.len(), docs.len());
+    for (i, d) in docs.iter().enumerate() {
+        let single = reranker.score(query, d).unwrap();
+        assert!(
+            (batched[i] - single).abs() <= 1e-3,
+            "doc {i}: batched {} vs single {single}",
+            batched[i]
+        );
+    }
+}

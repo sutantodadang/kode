@@ -1,5 +1,5 @@
 //! Qwen3-Reranker-0.6B (slim export: `[b, 2]` no/yes logits) on ONNX
-//! Runtime, one candidate per run.
+//! Runtime, candidates batched with left padding.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -85,27 +85,71 @@ impl QwenReranker {
     }
 
     pub fn score(&self, query: &str, doc: &str) -> Result<f32, LocalError> {
-        let ids: Vec<i64> = self
-            .input_ids(query, doc)
-            .iter()
-            .map(|&x| i64::from(x))
-            .collect();
-        let n = ids.len();
+        let ids = self.input_ids(query, doc);
+        Ok(self.run(&[&ids])?[0])
+    }
+
+    /// One forward pass over left-padded sequences; P(yes) per row. The
+    /// graph scores the last position, which left padding keeps real, and
+    /// RoPE is shift-invariant, so padded rows match unpadded scores
+    /// (checked in `tests/reranker_golden.rs`).
+    fn run(&self, seqs: &[&[u32]]) -> Result<Vec<f32>, LocalError> {
+        let (ids, mask, width) = left_pad(seqs);
+        let rows = seqs.len();
         let inputs = ort::inputs![
-            "input_ids" => Tensor::from_array((vec![1usize, n], ids.into_boxed_slice())).map_err(rt)?,
-            "attention_mask" => Tensor::from_array((vec![1usize, n], vec![1i64; n].into_boxed_slice())).map_err(rt)?,
+            "input_ids" => Tensor::from_array((vec![rows, width], ids.into_boxed_slice())).map_err(rt)?,
+            "attention_mask" => Tensor::from_array((vec![rows, width], mask.into_boxed_slice())).map_err(rt)?,
         ];
         let mut session = self.session.lock().map_err(|_| LocalError::Poisoned)?;
         let outputs = session.run(inputs).map_err(rt)?;
         let (_, data) = outputs["yes_no"].try_extract_tensor::<f32>().map_err(rt)?;
-        Ok(p_yes(data[0], data[1]))
+        Ok(data
+            .chunks(2)
+            .take(rows)
+            .map(|z| p_yes(z[0], z[1]))
+            .collect())
     }
 
-    /// ponytail: one sequence per candidate; batch with left padding if
-    /// rerank latency ever matters.
+    /// Scores in batches of similar-length candidates (little padding).
     pub fn score_all(&self, query: &str, docs: &[String]) -> Result<Vec<f32>, LocalError> {
-        docs.iter().map(|d| self.score(query, d)).collect()
+        let seqs: Vec<Vec<u32>> = docs.iter().map(|d| self.input_ids(query, d)).collect();
+        let lens: Vec<usize> = seqs.iter().map(Vec::len).collect();
+        let mut scores = vec![0.0; docs.len()];
+        for batch in length_batches(&lens, BATCH_SIZE) {
+            let rows: Vec<&[u32]> = batch.iter().map(|&i| seqs[i].as_slice()).collect();
+            for (&i, s) in batch.iter().zip(self.run(&rows)?) {
+                scores[i] = s;
+            }
+        }
+        Ok(scores)
     }
+}
+
+/// Candidates per forward pass. ponytail: fixed; tune if GPU memory or
+/// latency says otherwise.
+const BATCH_SIZE: usize = 8;
+
+/// Left-pads to the longest sequence. Returns `(ids, mask, width)`, row
+/// major. The pad id is irrelevant: padded positions are masked out.
+fn left_pad(seqs: &[&[u32]]) -> (Vec<i64>, Vec<i64>, usize) {
+    let width = seqs.iter().map(|s| s.len()).max().unwrap_or(0);
+    let mut ids = Vec::with_capacity(seqs.len() * width);
+    let mut mask = Vec::with_capacity(seqs.len() * width);
+    for s in seqs {
+        let pad = width - s.len();
+        ids.extend(std::iter::repeat_n(0i64, pad));
+        ids.extend(s.iter().map(|&x| i64::from(x)));
+        mask.extend(std::iter::repeat_n(0i64, pad));
+        mask.extend(std::iter::repeat_n(1i64, s.len()));
+    }
+    (ids, mask, width)
+}
+
+/// Indices grouped into batches of similar length, shortest first.
+fn length_batches(lens: &[usize], batch: usize) -> Vec<Vec<usize>> {
+    let mut order: Vec<usize> = (0..lens.len()).collect();
+    order.sort_by_key(|&i| lens[i]);
+    order.chunks(batch.max(1)).map(<[usize]>::to_vec).collect()
 }
 
 static RERANKER: OnceLock<Arc<QwenReranker>> = OnceLock::new();
@@ -132,5 +176,23 @@ mod tests {
             (p_yes(1000.0, 1000.0) - 0.5).abs() < 1e-6,
             "must not overflow"
         );
+    }
+
+    #[test]
+    fn left_pad_right_aligns_every_sequence() {
+        let (ids, mask, width) = left_pad(&[&[5, 6], &[7]]);
+        assert_eq!(width, 2);
+        assert_eq!(ids, vec![5, 6, 0, 7]);
+        assert_eq!(mask, vec![1, 1, 0, 1]);
+    }
+
+    #[test]
+    fn length_batches_group_similar_lengths_shortest_first() {
+        assert_eq!(
+            length_batches(&[5, 1, 3, 2], 2),
+            vec![vec![1, 3], vec![2, 0]]
+        );
+        assert_eq!(length_batches(&[4, 4, 4], 8), vec![vec![0, 1, 2]]);
+        assert!(length_batches(&[], 8).is_empty());
     }
 }
