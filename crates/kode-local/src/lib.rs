@@ -8,6 +8,7 @@ pub mod device;
 pub mod error;
 pub mod laya;
 pub mod log;
+pub mod manifest;
 pub mod models;
 pub mod pins;
 pub mod rerank;
