@@ -30,14 +30,41 @@ tok = agent.tok
 cfg = agent.cfg
 
 
+def head_layer(layer, x, keep):
+    """Pre-LN nn.TransformerEncoderLayer, re-expressed for ONNX export.
+
+    torch's MultiheadAttention bakes the traced sequence length into its
+    reshapes, so the exported graph only works for the example length. This
+    uses the layer's own weights with length-free reshapes; the parity check
+    below compares it against the untouched reference model.
+    """
+    attn = layer.self_attn
+    nh = attn.num_heads
+    hd = attn.embed_dim // nh
+    q, k, v = torch.nn.functional.linear(layer.norm1(x), attn.in_proj_weight, attn.in_proj_bias).chunk(3, dim=-1)
+    q, k, v = (t.unflatten(-1, (nh, hd)).transpose(1, 2) for t in (q, k, v))
+    a = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=keep)
+    x = x + attn.out_proj(a.transpose(1, 2).flatten(2))
+    return x + layer.linear2(layer.activation(layer.linear1(layer.norm2(x))))
+
+
 class Wrapped(torch.nn.Module):
+    """DecisionModel.forward (logits only) with an export-safe head."""
+
     def __init__(self, m):
         super().__init__()
         self.m = m
 
     def forward(self, input_ids, attention_mask, marker_pos, marker_mask, qtype):
-        logits, _ = self.m(input_ids, attention_mask, marker_pos, marker_mask.bool(), qtype)
-        return logits
+        m = self.m
+        h = m.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        h = h + m.type_emb(qtype)[:, None, :]
+        keep = attention_mask.bool()[:, None, None, :]
+        for layer in m.head.layers:
+            h = head_layer(layer, h, keep)
+        idx = marker_pos.clamp(min=0)[:, :, None].expand(-1, -1, h.size(-1))
+        logits = m.scorer(torch.gather(h, 1, idx)).squeeze(-1).float()
+        return logits.masked_fill(~marker_mask.bool(), -1e4)
 
 
 def to_internal(q):
@@ -108,6 +135,20 @@ STATES = [
 CASES = [(s, q) for s in STATES for q in (TIER, EFFORT, PLAN)]
 CASES += [(STATES[2], MANY), (STATES[5], NOUL), (STATES[1], SCORE5)]
 
+# ---- reference ------------------------------------------------------------
+# Computed before export: after torch.onnx.export the in-process model no
+# longer reproduces a fresh load (observed 0.33 logit drift), while the
+# exported graph matches a fresh load to ~1e-5.
+golden, refs = [], []
+with torch.no_grad():
+    for s, q in CASES:
+        ids, markers, t = tensors(s, q)
+        assert len(markers) == len(render_options(to_internal(q))), "options did not fit"
+        ref = model(t[0], t[1], t[2], t[3].bool(), t[4])[0][0].numpy()
+        refs.append((t, ref))
+        golden.append({"state": s, "question": q, "input_ids": ids, "markers": markers,
+                       "probs": probs_for(ref.tolist(), q)})
+
 # ---- export ---------------------------------------------------------------
 _, _, example = tensors(STATES[2], TIER)
 onnx_path = os.path.join(OUT, "model.onnx")
@@ -122,18 +163,11 @@ torch.onnx.export(
 
 # ---- parity torch vs onnx + golden fixtures --------------------------------
 sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
-golden = []
 worst = 0.0
-with torch.no_grad():
-    for s, q in CASES:
-        ids, markers, t = tensors(s, q)
-        assert len(markers) == len(render_options(to_internal(q))), "options did not fit"
-        ref = model(t[0], t[1], t[2], t[3].bool(), t[4])[0][0].numpy()
-        got = sess.run(["logits"], {n: v.numpy() for n, v in zip(
-            ["input_ids", "attention_mask", "marker_pos", "marker_mask", "qtype"], t)})[0][0]
-        worst = max(worst, float(np.abs(ref - got).max()))
-        golden.append({"state": s, "question": q, "input_ids": ids, "markers": markers,
-                       "probs": probs_for(ref.tolist(), q)})
+for t, ref in refs:
+    got = sess.run(["logits"], {n: v.numpy() for n, v in zip(
+        ["input_ids", "attention_mask", "marker_pos", "marker_mask", "qtype"], t)})[0][0]
+    worst = max(worst, float(np.abs(ref - got).max()))
 print("max |torch - onnx| =", worst)
 assert worst < 1e-4, "ONNX export diverges from PyTorch"
 

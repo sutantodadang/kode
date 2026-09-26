@@ -95,6 +95,10 @@ torch.onnx.export(
 )
 m = onnx.load(raw, load_external_data=True)
 onnx_path = os.path.join(OUT, "model.onnx")
+# onnx appends external data to an existing file; a rerun would double it.
+for stale in (onnx_path, os.path.join(OUT, "model.onnx.data")):
+    if os.path.exists(stale):
+        os.remove(stale)
 onnx.save_model(m, onnx_path, save_as_external_data=True, all_tensors_to_one_file=True,
                 location="model.onnx.data", size_threshold=1024)
 shutil.rmtree(tmp)
@@ -121,6 +125,7 @@ assert worst < 1e-4, "reranker export diverges from the official scoring"
 for s in SANITY:
     assert reference_score(input_ids(s["query"], s["relevant"])) > reference_score(input_ids(s["query"], s["irrelevant"])), s
 
+os.makedirs(os.path.dirname(FIXTURES), exist_ok=True)
 with open(FIXTURES, "w", encoding="utf-8") as f:
     json.dump({"cases": cases, "sanity": SANITY}, f, ensure_ascii=False)
 tok_dir = snapshot_download(REPO, allow_patterns=["tokenizer.json"])
