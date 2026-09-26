@@ -9,17 +9,6 @@ const HEDGE_PHRASES: &[&str] = &[
     "maybe", "probably", "i think", "might be", "possibly", "could be", "not sure", "perhaps",
 ];
 
-const SECRET_INDICATORS: &[&str] = &[
-    "api_key",
-    "api key",
-    "apikey",
-    "password",
-    "secret",
-    "token=",
-    "bearer ",
-    "-----begin",
-];
-
 /// Evaluates whether an agent-initiated memory (summary + body) should be
 /// stored. Applies only to [`crate::Provenance::AgentInference`] writes —
 /// explicit user writes (`kode remember`) bypass this policy entirely.
@@ -44,10 +33,8 @@ pub fn evaluate(summary: &str, body: &str) -> PolicyDecision {
         }
     }
 
-    for indicator in SECRET_INDICATORS {
-        if lower.contains(indicator) {
-            return PolicyDecision::Reject("possible secret — never store credentials".to_string());
-        }
+    if kode_core::secrets::looks_like_secret(&lower) {
+        return PolicyDecision::Reject("possible secret — never store credentials".to_string());
     }
 
     PolicyDecision::Accept

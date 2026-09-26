@@ -5,6 +5,7 @@ pub mod event;
 pub mod input;
 pub mod paths;
 pub mod process;
+pub mod secrets;
 
 pub use cancel::{CancellationToken, cancel_on_ctrl_c};
 pub use config::KodeConfig;
