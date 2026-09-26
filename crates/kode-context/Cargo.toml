@@ -10,6 +10,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
+async-trait = { workspace = true }
 kode-core = { workspace = true }
 kode-intel = { path = "../kode-intel" }
 kode-memory = { path = "../kode-memory" }

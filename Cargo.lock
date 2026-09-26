@@ -1059,6 +1059,7 @@ dependencies = [
 name = "kode-context"
 version = "0.4.12"
 dependencies = [
+ "async-trait",
  "futures",
  "kode-core",
  "kode-intel",
