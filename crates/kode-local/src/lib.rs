@@ -7,6 +7,7 @@ pub mod error;
 pub mod laya;
 pub mod models;
 pub mod pins;
+pub mod rerank;
 pub mod route;
 pub mod sequence;
 
