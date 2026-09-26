@@ -128,6 +128,18 @@ mapping, the ONNX Runtime install, and every pinned model file.
 kode doctor
 ```
 
+## `kode router`
+
+| Command | Does |
+|---|---|
+| `kode router status` | dataset counts, splits, thresholds (calibrate 50, train 300), active team model |
+| `kode router correct <id\|last> key=value…` | fix a record's labels (`tier`, `effort`, `plan`); a correction beats the teacher |
+| `kode router calibrate [--write]` | fit the pinned model's temperatures on the team dataset (Rust, CPU); `--write` saves `.kode/router/team-model.json` |
+| `kode router train [--remote]` | fine-tune Laya (`uv`, CUDA GPU; or HF Jobs with `--remote`), calibrate, and gate against the current model |
+| `kode router publish <id> --to hf:<repo>\|path:<dir>\|lfs:<dir>` | share a candidate that passed the gate and write the team manifest |
+
+In the TUI, `/router` shows the last record and `/router tier=heavy` corrects it.
+
 ## `kode setup`
 
 Install or bootstrap the zindeks and Ingat engines. Consent-gated: prompts before downloading anything unless `--yes` is passed.
