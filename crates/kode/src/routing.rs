@@ -34,8 +34,14 @@ fn from_laya<'a>(d: &'a RouteDecision, key: &str) -> Option<&'a str> {
 
 /// Applies model answers only; static answers leave the config untouched.
 /// Effort changes only when `[model].effort` is set (the provider accepts
-/// it); the router can turn plan mode on but never off.
-pub fn apply_route(config: &KodeConfig, plan_mode: bool, d: &RouteDecision) -> Applied {
+/// it); the router can turn plan mode on but never off, and only when
+/// someone is there to approve the plan (`interactive`).
+pub fn apply_route(
+    config: &KodeConfig,
+    plan_mode: bool,
+    d: &RouteDecision,
+    interactive: bool,
+) -> Applied {
     let mut out = config.clone();
     let mut notes = Vec::new();
     if let Some(tier) = from_laya(d, "tier")
@@ -56,7 +62,7 @@ pub fn apply_route(config: &KodeConfig, plan_mode: bool, d: &RouteDecision) -> A
     {
         out.model.effort = effort.to_string();
     }
-    let plan_mode = plan_mode || from_laya(d, "plan") == Some("plan");
+    let plan_mode = plan_mode || (interactive && from_laya(d, "plan") == Some("plan"));
     Applied {
         config: out,
         plan_mode,
@@ -89,7 +95,13 @@ async fn build_route_input(task: &str, cwd: &Path) -> RouteInput {
     }
 }
 
-/// Routes one task. With `router.enabled = false` nothing is loaded and no
+/// The router runs only when enabled and this build pins models; otherwise
+/// every task would announce a `kode setup` that has nothing to install.
+pub fn router_active(router: &RouterConfig, models_pinned: bool) -> bool {
+    router.enabled && models_pinned
+}
+
+/// Routes one task. With the router inactive nothing is loaded and no
 /// event is emitted.
 pub async fn route_task(
     input: &UserInput,
@@ -99,7 +111,7 @@ pub async fn route_task(
     events: &EventBus,
     cancel: &CancellationToken,
 ) -> Routed {
-    if !config.router.enabled {
+    if !router_active(&config.router, !kode_local::pins::MODEL_FILES.is_empty()) {
         return Routed {
             applied: Applied {
                 config: config.clone(),
@@ -119,7 +131,10 @@ pub async fn route_task(
     events.emit(KodeEvent::RouterDecision {
         answers: decision.answers.clone(),
     });
-    let applied = apply_route(config, plan_mode, &decision);
+    // TUI always runs on a terminal; headless `exec` only has an approver
+    // when stdin is one.
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let applied = apply_route(config, plan_mode, &decision, interactive);
     for text in &applied.notes {
         events.emit(KodeEvent::Note { text: text.clone() });
     }
@@ -148,6 +163,8 @@ pub fn outcome_of(result: &anyhow::Result<TaskOutcome>) -> Outcome {
 }
 
 /// Appends the router log line; returns a note instead of failing the task.
+/// Static-only decisions carry no probabilities (no fine-tune value) and
+/// are not written.
 pub fn log_route(
     cwd: &Path,
     router: &RouterConfig,
@@ -155,6 +172,9 @@ pub fn log_route(
     decision: &RouteDecision,
     outcome: Outcome,
 ) -> Option<String> {
+    if decision.probs.is_empty() {
+        return None;
+    }
     let path = cwd.join(".kode").join("router-log.jsonl");
     append(&path, &log_line(decision, task, router.log_text, outcome))
         .err()
@@ -204,7 +224,7 @@ mod tests {
 
     #[test]
     fn mapped_tier_switches_root_model() {
-        let a = apply_route(&base(), false, &decision(2, 1, 1));
+        let a = apply_route(&base(), false, &decision(2, 1, 1), true);
         assert_eq!(a.config.model.provider, "anthropic");
         assert_eq!(a.config.model.model, "big");
         assert!(a.notes.is_empty());
@@ -212,7 +232,7 @@ mod tests {
 
     #[test]
     fn unmapped_tier_keeps_root_model() {
-        let a = apply_route(&base(), false, &decision(0, 1, 1));
+        let a = apply_route(&base(), false, &decision(0, 1, 1), true);
         assert_eq!(a.config.model.model, "root-model");
     }
 
@@ -222,7 +242,7 @@ mod tests {
         c.router
             .tiers
             .insert("heavy".to_string(), "missing".to_string());
-        let a = apply_route(&c, false, &decision(2, 1, 1));
+        let a = apply_route(&c, false, &decision(2, 1, 1), true);
         assert_eq!(a.config.model.model, "root-model");
         assert_eq!(a.notes.len(), 1);
         assert!(a.notes[0].contains("missing"));
@@ -232,7 +252,7 @@ mod tests {
     fn effort_changes_only_when_already_configured() {
         let mut c = base();
         assert_eq!(
-            apply_route(&c, false, &decision(1, 2, 1))
+            apply_route(&c, false, &decision(1, 2, 1), true)
                 .config
                 .model
                 .effort,
@@ -240,7 +260,7 @@ mod tests {
         );
         c.model.effort = "medium".to_string();
         assert_eq!(
-            apply_route(&c, false, &decision(1, 2, 1))
+            apply_route(&c, false, &decision(1, 2, 1), true)
                 .config
                 .model
                 .effort,
@@ -250,9 +270,9 @@ mod tests {
 
     #[test]
     fn plan_is_enabled_by_router_but_never_disabled() {
-        assert!(apply_route(&base(), false, &decision(1, 1, 0)).plan_mode);
-        assert!(!apply_route(&base(), false, &decision(1, 1, 1)).plan_mode);
-        assert!(apply_route(&base(), true, &decision(1, 1, 1)).plan_mode);
+        assert!(apply_route(&base(), false, &decision(1, 1, 0), true).plan_mode);
+        assert!(!apply_route(&base(), false, &decision(1, 1, 1), true).plan_mode);
+        assert!(apply_route(&base(), true, &decision(1, 1, 1), true).plan_mode);
     }
 
     #[test]
@@ -260,7 +280,7 @@ mod tests {
         let mut c = base();
         c.model.effort = "medium".to_string();
         let d = resolve_route(&route_questions(), Err("disabled".to_string()), 0.6);
-        let a = apply_route(&c, false, &d);
+        let a = apply_route(&c, false, &d, true);
         assert_eq!(a.config, c);
         assert!(!a.plan_mode);
     }
@@ -334,5 +354,45 @@ mod tests {
             outcome_of(&Err(anyhow::anyhow!("x"))),
         );
         assert!(note.unwrap().starts_with("router log not written"));
+    }
+
+    #[test]
+    fn router_plan_ignored_without_interactive_approver() {
+        // Headless exec (piped stdin, CI) cannot approve a plan: an
+        // unrequested plan phase would read EOF and cancel the task.
+        assert!(!apply_route(&base(), false, &decision(1, 1, 0), false).plan_mode);
+        assert!(apply_route(&base(), true, &decision(1, 1, 1), false).plan_mode);
+    }
+
+    #[test]
+    fn router_inactive_without_pinned_models() {
+        let cfg = RouterConfig::default();
+        assert!(router_active(&cfg, true));
+        assert!(!router_active(&cfg, false));
+        let disabled = RouterConfig {
+            enabled: false,
+            ..RouterConfig::default()
+        };
+        assert!(!router_active(&disabled, true));
+    }
+
+    #[test]
+    fn static_only_decision_is_not_logged() {
+        let dir = std::env::temp_dir().join(format!("kode-routing-static-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = resolve_route(&route_questions(), Err("not installed".to_string()), 0.6);
+        let note = log_route(
+            &dir,
+            &RouterConfig::default(),
+            "t",
+            &d,
+            outcome_of(&Err(anyhow::anyhow!("x"))),
+        );
+        assert!(note.is_none());
+        assert!(
+            !dir.join(".kode").exists(),
+            "no log dir for static-only routing"
+        );
     }
 }

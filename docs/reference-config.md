@@ -145,7 +145,7 @@ decision model) and Qwen3-Reranker-0.6B on ONNX Runtime; install them with
 
 | Key | Default | Meaning |
 |---|---|---|
-| `enabled` | `true` | `false` = static routing, local models never loaded |
+| `enabled` | `true` | `false` = static routing, local models never loaded. Builds with no pinned models behave as `false` |
 | `min_confidence` | `0.6` | per answer; below it the static value is used (`static: low confidence …`) |
 | `device` | `"auto"` | `auto` \| `cpu` \| `directml` \| `cuda` \| `coreml`; a failing GPU falls back to CPU |
 | `rerank` | `true` | rerank Ingat memories and zindeks search hits before budgeting |
@@ -167,7 +167,12 @@ heavy = "terra"
 
 Effort: the router adjusts `[model].effort` per task only when you have set
 it (proof the provider accepts effort). Plan: the router can turn plan mode
-on for a task, never off. Pin everything with `enabled = false`.
+on for a task, never off, and only when someone can approve the plan (the
+TUI, or `kode exec` on an interactive terminal — never piped/CI runs). Pin
+everything with `enabled = false`.
+
+Only tasks the model actually routed are written to `.kode/router-log.jsonl`;
+static-only decisions (models missing, disabled, cancelled) are not logged.
 
 ## `[permissions]`
 
