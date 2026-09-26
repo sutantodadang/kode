@@ -1,8 +1,14 @@
 use std::path::Path;
 use std::time::Duration;
 
-use kode_core::config::{KodeConfig, McpServerConfig, ModelConfig, ZindeksConfig};
+use kode_core::config::{
+    KodeConfig, McpServerConfig, ModelConfig, ROUTER_TIERS, RouterConfig, SubagentConfig,
+    VALID_ROUTER_DEVICES, ZindeksConfig,
+};
 use kode_intel::{CodeIntelligence, ZindeksAdapter};
+use kode_local::device::{DevicePref, describe_plan, init_runtime};
+use kode_local::models::{LocalPaths, installed_runtime, verify_file};
+use kode_local::pins::{MODEL_FILES, MODELS_REVISION, ORT_VERSION};
 use kode_memory::{EngineeringMemory, IngatAdapter};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -131,6 +137,7 @@ pub async fn run(cwd: &Path) -> anyhow::Result<()> {
     }
 
     collect_mcp_checks(&mut checks, &config).await;
+    collect_local_checks(&mut checks, &config).await;
 
     checks.push(git_binary_check().await);
     checks.push(git_repository_check(cwd));
@@ -654,6 +661,120 @@ pub fn render(checks: &[Check]) -> String {
     out
 }
 
+// --- local router -----------------------------------------------------------
+
+const LOCAL: &str = "Local router";
+
+fn device_check(device: &str) -> Check {
+    match DevicePref::parse(device) {
+        Some(pref) => Check::pass(LOCAL, "device", describe_plan(pref, std::env::consts::OS)),
+        None => Check::fail(
+            LOCAL,
+            "device",
+            format!("unknown router.device '{device}'"),
+            format!(
+                "set router.device to one of: {}",
+                VALID_ROUTER_DEVICES.join(", ")
+            ),
+        ),
+    }
+}
+
+fn tier_checks(router: &RouterConfig, subagents: &SubagentConfig) -> Vec<Check> {
+    router
+        .tiers
+        .iter()
+        .map(|(tier, name)| {
+            let label = format!("tier {tier}");
+            if !ROUTER_TIERS.contains(&tier.as_str()) {
+                Check::fail(
+                    LOCAL,
+                    label,
+                    format!("'{tier}' is not a router tier"),
+                    format!("use one of: {}", ROUTER_TIERS.join(", ")),
+                )
+            } else if subagents.models.contains_key(name) {
+                Check::pass(LOCAL, label, format!("→ {name}"))
+            } else {
+                Check::fail(
+                    LOCAL,
+                    label,
+                    format!("'{name}' is not in [agent.subagents.models]"),
+                    format!("add [agent.subagents.models.{name}] or fix [router.tiers]"),
+                )
+            }
+        })
+        .collect()
+}
+
+async fn collect_local_checks(checks: &mut Vec<Check>, config: &KodeConfig) {
+    let router = &config.router;
+    if !router.enabled {
+        checks.push(Check::warn(
+            LOCAL,
+            "router",
+            "disabled in config — static routing",
+            "",
+        ));
+        return;
+    }
+    checks.push(device_check(&router.device));
+    checks.extend(tier_checks(router, &config.agent.subagents));
+    if MODEL_FILES.is_empty() {
+        checks.push(Check::warn(
+            LOCAL,
+            "models",
+            "this build pins no local models — static routing",
+            "",
+        ));
+        return;
+    }
+    let Some(paths) = LocalPaths::from_home() else {
+        checks.push(Check::fail(
+            LOCAL,
+            "home",
+            "cannot resolve ~/.kode",
+            "set HOME / USERPROFILE",
+        ));
+        return;
+    };
+    match installed_runtime(&paths, ORT_VERSION) {
+        Some((variant, dylib)) => match init_runtime(&dylib) {
+            Ok(()) => checks.push(Check::pass(
+                LOCAL,
+                "onnx runtime",
+                format!("{ORT_VERSION} ({variant})"),
+            )),
+            Err(e) => checks.push(Check::fail(
+                LOCAL,
+                "onnx runtime",
+                e.to_string(),
+                "re-run: kode setup",
+            )),
+        },
+        None => checks.push(Check::warn(
+            LOCAL,
+            "onnx runtime",
+            "not installed — static routing",
+            "run: kode setup",
+        )),
+    }
+    let root = paths.models_dir(MODELS_REVISION);
+    for f in MODEL_FILES {
+        let path = root.join(f.path);
+        let check =
+            match tokio::task::spawn_blocking(move || verify_file(&path, f.sha256, f.size)).await {
+                Ok(Ok(())) => Check::pass(LOCAL, f.path, "verified"),
+                Ok(Err(kode_local::LocalError::Missing(_))) => {
+                    Check::warn(LOCAL, f.path, "missing — static routing", "run: kode setup")
+                }
+                Ok(Err(e)) => Check::fail(LOCAL, f.path, e.to_string(), "re-run: kode setup"),
+                Err(e) => Check::fail(LOCAL, f.path, format!("check failed: {e}"), ""),
+            };
+        checks.push(check);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -981,5 +1102,45 @@ mod tests {
         let out = render(&checks);
         assert_eq!(out.matches("A\n").count(), 1);
         assert_eq!(out.matches("B\n").count(), 1);
+    }
+
+    #[test]
+    fn device_check_rejects_unknown_device() {
+        assert_eq!(device_check("auto").status, CheckStatus::Pass);
+        let bad = device_check("vulkan");
+        assert_eq!(bad.status, CheckStatus::Fail);
+        assert!(bad.fix.unwrap().contains("auto"));
+    }
+
+    #[test]
+    fn tier_checks_flag_bad_tier_and_missing_model_name() {
+        use kode_core::config::{ModelTierConfig, RouterConfig, SubagentConfig};
+        let mut router = RouterConfig::default();
+        router
+            .tiers
+            .insert("heavy".to_string(), "terra".to_string());
+        router.tiers.insert("huge".to_string(), "terra".to_string());
+        router
+            .tiers
+            .insert("light".to_string(), "missing".to_string());
+        let mut sub = SubagentConfig::default();
+        sub.models.insert(
+            "terra".to_string(),
+            ModelTierConfig {
+                provider: "anthropic".to_string(),
+                model: "big".to_string(),
+            },
+        );
+        let checks = tier_checks(&router, &sub);
+        let status = |name: &str| {
+            checks
+                .iter()
+                .find(|c| c.name.contains(name))
+                .unwrap()
+                .status
+        };
+        assert_eq!(status("heavy"), CheckStatus::Pass);
+        assert_eq!(status("huge"), CheckStatus::Fail);
+        assert_eq!(status("light"), CheckStatus::Fail);
     }
 }

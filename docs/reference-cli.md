@@ -121,6 +121,9 @@ kode verify
 
 Run diagnostic checks across config, LLM auth, zindeks, Ingat, git, and environment. Useful right after install or when something feels wrong.
 
+The **Local router** section checks `router.device`, each `[router.tiers]`
+mapping, the ONNX Runtime install, and every pinned model file.
+
 ```
 kode doctor
 ```
@@ -137,6 +140,12 @@ Install or bootstrap the zindeks and Ingat engines. Consent-gated: prompts befor
 kode setup
 kode setup --yes
 ```
+
+`kode setup` also offers the local router artefacts (~4 GB): ONNX Runtime
+1.22.0 for your platform (DirectML on Windows, CUDA on Linux when `nvidia-smi`
+is present, CoreML on macOS) plus the Laya and Qwen3-Reranker models, into
+`~/.kode/`. Every file is sha256-verified; a failed download leaves nothing
+behind. Declining keeps static routing.
 
 ## `kode update`
 

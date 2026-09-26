@@ -2,7 +2,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use kode_core::config::{IngatConfig, KodeConfig, ZindeksConfig};
+use kode_core::config::{IngatConfig, KodeConfig, RouterConfig, ZindeksConfig};
+use kode_local::models::{LocalPaths, install_models, install_runtime, select_runtime};
+use kode_local::pins::{MODEL_FILES, MODELS_REPO, MODELS_REVISION, ORT_VERSION, RUNTIMES};
 use kode_memory::{EngineeringMemory, IngatAdapter};
 
 const ZINDEKS_RELEASES_BASE: &str =
@@ -20,8 +22,75 @@ pub async fn run(yes: bool, cwd: &Path) -> anyhow::Result<()> {
 
     setup_zindeks(&config.zindeks, yes).await?;
     setup_ingat(&config.ingat, yes).await?;
+    setup_local(&config.router, yes).await?;
 
     println!("setup complete — run: kode status");
+    Ok(())
+}
+
+// --- local router -------------------------------------------------------
+
+async fn nvidia_present() -> bool {
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new("nvidia-smi")
+            .arg("-L")
+            .output(),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .is_some_and(|o| o.status.success())
+}
+
+async fn setup_local(cfg: &RouterConfig, yes: bool) -> anyhow::Result<()> {
+    if !cfg.enabled {
+        println!("local router: disabled in config — skipped");
+        return Ok(());
+    }
+    if MODEL_FILES.is_empty() {
+        println!("local router: this build pins no models — skipped");
+        return Ok(());
+    }
+    let paths = LocalPaths::from_home()
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve ~/.kode (no HOME/USERPROFILE)"))?;
+    let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
+    let Some(runtime) = select_runtime(RUNTIMES, os, arch, nvidia_present().await) else {
+        println!("local router: no ONNX Runtime build for {os}/{arch} — static routing");
+        return Ok(());
+    };
+    let bytes: u64 = runtime.archives.iter().map(|a| a.size).sum::<u64>()
+        + MODEL_FILES.iter().map(|f| f.size).sum::<u64>();
+    if !confirm(
+        &format!(
+            "download local router models + ONNX Runtime {ORT_VERSION} ({}, {:.1} GB) to {}?",
+            runtime.variant,
+            bytes as f64 / 1e9,
+            paths.root.display()
+        ),
+        yes,
+    )
+    .await
+    {
+        println!("local router: skipped — Kode routes statically");
+        return Ok(());
+    }
+    // No total timeout: the reranker is ~2.4 GB.
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .build()?;
+    let mut report = |line: String| println!("  downloading {line}…");
+    install_runtime(&client, &paths, ORT_VERSION, runtime, &mut report).await?;
+    install_models(
+        &client,
+        &paths,
+        MODELS_REPO,
+        MODELS_REVISION,
+        MODEL_FILES,
+        &mut report,
+    )
+    .await?;
+    println!("local router: ready ({})", runtime.variant);
     Ok(())
 }
 
