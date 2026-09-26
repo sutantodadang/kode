@@ -306,9 +306,22 @@ pub async fn install_models(
     Ok(())
 }
 
+/// On Windows, the system bsdtar (`%SystemRoot%\System32\tar.exe`) reads
+/// the .zip/.nupkg runtime packages; a `tar` earlier on PATH may be GNU tar
+/// (Git Bash, MSYS2), which cannot. Elsewhere `tar` only sees .tgz.
+fn tar_program(windows: bool, system_root: Option<&std::ffi::OsStr>) -> PathBuf {
+    if windows && let Some(root) = system_root {
+        let bsdtar = Path::new(root).join("System32").join("tar.exe");
+        if bsdtar.is_file() {
+            return bsdtar;
+        }
+    }
+    PathBuf::from("tar")
+}
+
 async fn extract(archive: &Path, into: &Path) -> Result<(), LocalError> {
-    // `tar` handles .tgz everywhere and .zip/.nupkg on Windows (bsdtar).
-    let out = tokio::process::Command::new("tar")
+    let tar = tar_program(cfg!(windows), std::env::var_os("SystemRoot").as_deref());
+    let out = tokio::process::Command::new(tar)
         .arg("-xf")
         .arg(archive)
         .arg("-C")
@@ -551,6 +564,26 @@ mod tests {
             verify_model_dir(&paths, "rev", &[], LAYA_DIR),
             Err(LocalError::NotPinned)
         ));
+    }
+
+    #[test]
+    fn windows_extracts_with_system_bsdtar_not_path_tar() {
+        let root = temp_dir("sysroot");
+        let bsdtar = root.join("System32").join("tar.exe");
+        std::fs::create_dir_all(bsdtar.parent().unwrap()).unwrap();
+        std::fs::write(&bsdtar, b"").unwrap();
+        assert_eq!(tar_program(true, Some(root.as_os_str())), bsdtar);
+        // No system bsdtar (or not Windows): fall back to PATH lookup.
+        let empty = temp_dir("sysroot-empty");
+        assert_eq!(
+            tar_program(true, Some(empty.as_os_str())),
+            PathBuf::from("tar")
+        );
+        assert_eq!(tar_program(true, None), PathBuf::from("tar"));
+        assert_eq!(
+            tar_program(false, Some(root.as_os_str())),
+            PathBuf::from("tar")
+        );
     }
 
     #[test]
