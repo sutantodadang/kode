@@ -1024,6 +1024,7 @@ dependencies = [
  "kode-context",
  "kode-core",
  "kode-intel",
+ "kode-local",
  "kode-mcp",
  "kode-memory",
  "kode-model",

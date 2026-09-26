@@ -285,9 +285,61 @@ pub async fn run_task_with_input(
     cancel: CancellationToken,
     history: &[kode_agent::HistoryTurn],
     plan_mode: bool,
-    mut steering: Option<mpsc::UnboundedReceiver<UserInput>>,
+    steering: Option<mpsc::UnboundedReceiver<UserInput>>,
 ) -> anyhow::Result<TaskOutcome> {
-    let model = ModelFactory::create(config)?;
+    let routed = crate::routing::route_task(input, cwd, config, plan_mode, &events, &cancel).await;
+    let result = execute_task(
+        input,
+        cwd,
+        &routed.applied.config,
+        events.clone(),
+        handler,
+        cancel,
+        history,
+        routed.applied.plan_mode,
+        steering,
+        config,
+        routed.reranker,
+    )
+    .await;
+    if let Some(decision) = &routed.decision
+        && let Some(text) = crate::routing::log_route(
+            cwd,
+            &config.router,
+            &input.text,
+            decision,
+            crate::routing::outcome_of(&result),
+        )
+    {
+        events.emit(KodeEvent::Note { text });
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_task(
+    input: &UserInput,
+    cwd: &Path,
+    config: &KodeConfig,
+    events: EventBus,
+    handler: Arc<dyn PermissionHandler>,
+    cancel: CancellationToken,
+    history: &[kode_agent::HistoryTurn],
+    plan_mode: bool,
+    mut steering: Option<mpsc::UnboundedReceiver<UserInput>>,
+    fallback_config: &KodeConfig,
+    reranker: Option<Arc<dyn kode_context::ContextReranker>>,
+) -> anyhow::Result<TaskOutcome> {
+    let model = match ModelFactory::create(config) {
+        Ok(model) => model,
+        Err(error) if config.model != fallback_config.model => {
+            events.emit(KodeEvent::Note {
+                text: format!("router-selected model unavailable: {error} — using the root model"),
+            });
+            ModelFactory::create(fallback_config)?
+        }
+        Err(error) => return Err(error),
+    };
     let detected_context_window = if config.agent.max_context_tokens == 0 {
         kode_model::catalog::context_window_tokens(&config.model.provider, &config.model.model)
             .await
@@ -478,7 +530,14 @@ pub async fn run_task_with_input(
         Agent::new(model.clone(), tools, events.clone(), &agent_config).with_effort(effort.clone());
 
     events.emit(KodeEvent::ContextCompilationStarted);
-    let compiler = ContextCompiler::new(intel, memory, agent_config.context_budget_tokens as usize);
+    let mut compiler =
+        ContextCompiler::new(intel, memory, agent_config.context_budget_tokens as usize);
+    if let Some(reranker) = reranker {
+        compiler = compiler.with_reranker(
+            reranker,
+            Duration::from_millis(config.router.rerank_timeout_ms),
+        );
+    }
     let compiled = compiler
         .compile(
             &ContextRequest {
@@ -499,6 +558,9 @@ pub async fn run_task_with_input(
     events.emit(KodeEvent::Note {
         text: compiled.summary_line(),
     });
+    if let Some(text) = crate::routing::rerank_note(&compiled.stats.rerank_status) {
+        events.emit(KodeEvent::Note { text });
+    }
     events.emit(KodeEvent::TaskProgress {
         step: TaskStep::Understand,
         done: true,

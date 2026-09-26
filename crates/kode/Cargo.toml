@@ -12,6 +12,7 @@ kode-tools = { path = "../kode-tools" }
 kode-intel = { path = "../kode-intel" }
 kode-mcp = { path = "../kode-mcp" }
 kode-context = { path = "../kode-context" }
+kode-local = { path = "../kode-local" }
 kode-memory = { path = "../kode-memory" }
 kode-verify = { path = "../kode-verify" }
 clap = { workspace = true }

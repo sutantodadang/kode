@@ -137,6 +137,38 @@ tool activities) alongside the error; feed it back as `context` on a
 re-delegate so the replacement resumes instead of re-exploring from zero.
 The bundled `tiered-exec` skill documents the routing conventions.
 
+## `[router]`
+
+Local, in-process routing and context reranking. Runs Laya (a multilingual
+decision model) and Qwen3-Reranker-0.6B on ONNX Runtime; install them with
+`kode setup` (~4 GB). Without them Kode routes statically and says so.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | `false` = static routing, local models never loaded |
+| `min_confidence` | `0.6` | per answer; below it the static value is used (`static: low confidence …`) |
+| `device` | `"auto"` | `auto` \| `cpu` \| `directml` \| `cuda` \| `coreml`; a failing GPU falls back to CPU |
+| `rerank` | `true` | rerank Ingat memories and zindeks search hits before budgeting |
+| `rerank_on_cpu` | `false` | the reranker is slow on CPU; it is skipped there unless this is set (then max 10 candidates) |
+| `rerank_timeout_ms` | `2000` | past this, engine order is kept (`rerank: skipped: timeout`) |
+| `log_text` | `false` | `.kode/router-log.jsonl` stores a sha256 of the task unless this is set |
+
+### `[router.tiers]`
+
+Maps the router's `light` / `standard` / `heavy` answer to a model tier name
+from `[agent.subagents.models.<name>]`. An unmapped answer runs the root
+`[model]`.
+
+```toml
+[router.tiers]
+light = "luna"
+heavy = "terra"
+```
+
+Effort: the router adjusts `[model].effort` per task only when you have set
+it (proof the provider accepts effort). Plan: the router can turn plan mode
+on for a task, never off. Pin everything with `enabled = false`.
+
 ## `[permissions]`
 
 | Key | Type | Default | Effect |
