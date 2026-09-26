@@ -174,6 +174,24 @@ everything with `enabled = false`.
 Only tasks the model actually routed are written to `.kode/router-log.jsonl`;
 static-only decisions (models missing, disabled, cancelled) are not logged.
 
+### `[router.training]`
+
+Team opt-in to improve the router from real tasks. Off by default because
+it commits task text to the repo and adds one short model call per task.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | after each routed, completed task, ask the task's model for hindsight labels and append a record to `.kode/router/dataset.jsonl` |
+| `hf_dataset` | `""` | private HF dataset repo for `kode router train --remote` |
+
+Records whose text looks like a credential are never stored.
+
+```toml
+[router.training]
+enabled = true
+hf_dataset = "my-team/kode-router-data"
+```
+
 ## `[permissions]`
 
 | Key | Type | Default | Effect |

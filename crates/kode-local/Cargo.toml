@@ -14,6 +14,7 @@ tokio = { workspace = true }
 reqwest = { workspace = true }
 futures = { workspace = true }
 sha2 = { workspace = true }
+ulid = { workspace = true }
 ort = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dynamic", "directml", "cuda", "coreml"] }
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 tracing = { workspace = true }

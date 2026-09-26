@@ -3,7 +3,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use kode_core::config::{IngatConfig, KodeConfig, RouterConfig, ZindeksConfig};
-use kode_local::models::{LocalPaths, install_models, install_runtime, select_runtime};
+use kode_local::manifest::{
+    ManifestKind, Source, checkpoint_dir, read_manifest, verify_checkpoint,
+};
+use kode_local::models::{
+    LocalPaths, download_verified, install_models, install_runtime, model_url, select_runtime,
+};
 use kode_local::pins::{MODEL_FILES, MODELS_REPO, MODELS_REVISION, ORT_VERSION, RUNTIMES};
 use kode_memory::{EngineeringMemory, IngatAdapter};
 
@@ -23,8 +28,96 @@ pub async fn run(yes: bool, cwd: &Path) -> anyhow::Result<()> {
     setup_zindeks(&config.zindeks, yes).await?;
     setup_ingat(&config.ingat, yes).await?;
     setup_local(&config.router, yes).await?;
+    setup_team_model(cwd, yes).await?;
 
     println!("setup complete — run: kode status");
+    Ok(())
+}
+
+// --- team router model --------------------------------------------------
+
+/// The HF token for private team repos: `HF_TOKEN`, else the `hf` CLI's
+/// stored login. Never printed.
+pub(crate) fn hf_token() -> Option<String> {
+    if let Ok(t) = std::env::var("HF_TOKEN")
+        && !t.trim().is_empty()
+    {
+        return Some(t.trim().to_string());
+    }
+    let out = std::process::Command::new("hf")
+        .args(["auth", "token"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .map(str::to_string)
+}
+
+pub(crate) fn hf_client() -> anyhow::Result<reqwest::Client> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(token) = hf_token() {
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {token}").parse()?,
+        );
+    }
+    Ok(reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .default_headers(headers)
+        .build()?)
+}
+
+async fn setup_team_model(cwd: &Path, yes: bool) -> anyhow::Result<()> {
+    let manifest = match read_manifest(cwd) {
+        Ok(Some(m)) if m.kind == ManifestKind::Checkpoint => m,
+        Ok(_) => return Ok(()),
+        Err(e) => {
+            println!("team router model: manifest unreadable ({e}) — skipped");
+            return Ok(());
+        }
+    };
+    let Some(source @ Source::Hf { repo, revision }) = manifest.source.as_ref() else {
+        return Ok(()); // path / repo_path sources are read in place
+    };
+    let paths = LocalPaths::from_home()
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve ~/.kode (no HOME/USERPROFILE)"))?;
+    let dir = checkpoint_dir(source, cwd, &paths);
+    let short = &revision[..revision.len().min(7)];
+    if verify_checkpoint(&dir, &manifest.files).is_ok() {
+        println!("team router model: present ({repo}@{short})");
+        return Ok(());
+    }
+    let bytes: u64 = manifest.files.iter().map(|f| f.size).sum();
+    if !confirm(
+        &format!(
+            "download team router model {repo}@{short} ({:.1} GB)?",
+            bytes as f64 / 1e9
+        ),
+        yes,
+    )
+    .await
+    {
+        println!("team router model: skipped — Kode uses the pinned model");
+        return Ok(());
+    }
+    let client = hf_client()?;
+    for f in &manifest.files {
+        println!("  downloading {}…", f.path);
+        download_verified(
+            &client,
+            &model_url(repo, revision, &f.path),
+            &dir.join(&f.path),
+            &f.sha256,
+            f.size,
+        )
+        .await?;
+    }
+    println!("team router model: ready ({repo}@{short})");
     Ok(())
 }
 

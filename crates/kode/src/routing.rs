@@ -24,6 +24,7 @@ pub struct Routed {
     pub applied: Applied,
     pub reranker: Option<Arc<dyn ContextReranker>>,
     pub decision: Option<RouteDecision>,
+    pub route_input: Option<RouteInput>,
 }
 
 fn from_laya<'a>(d: &'a RouteDecision, key: &str) -> Option<&'a str> {
@@ -120,9 +121,10 @@ pub async fn route_task(
             },
             reranker: None,
             decision: None,
+            route_input: None,
         };
     }
-    let stack = crate::local::load(&config.router).await;
+    let stack = crate::local::load(&config.router, cwd).await;
     for text in &stack.notes {
         events.emit(KodeEvent::Note { text: text.clone() });
     }
@@ -142,6 +144,7 @@ pub async fn route_task(
         applied,
         reranker: stack.reranker,
         decision: Some(decision),
+        route_input: Some(route_input),
     }
 }
 

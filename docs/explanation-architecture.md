@@ -30,6 +30,17 @@ GPU, or a timeout shows up as `static: <reason>` or `rerank: skipped: <reason>`,
 never as a model decision. Every routed task appends one line to
 `.kode/router-log.jsonl`, the data for a future fine-tuned checkpoint.
 
+Teams can improve the router from their own work. With
+`[router.training] enabled`, each routed task that completes is labeled in
+hindsight by the task's own model (what tier, effort, and plan would have
+been right, knowing what happened) and appended to a committed dataset;
+anyone can correct a label, and corrections win. Calibration and the
+acceptance gate run natively in Rust; only fine-tuning runs in Python,
+locally through `uv` or on HF Jobs. A fine-tuned model is used only if it
+beats the current one on a held-out split, and a committed manifest tells
+every teammate's Kode which model to load, falling back to the pinned model
+with a note whenever the team model cannot be used.
+
 After edits land, a verification pipeline runs the project's real checks: tests, lint, build: and reports each one honestly: passed, failed, or skipped. A skipped check is never reported as passed. This same honesty rule applies to session replay: when you resume a session, truncated history shows a truncation marker rather than silently pretending the model saw turns it didn't.
 
 ## Event-driven pipeline

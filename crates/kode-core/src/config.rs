@@ -422,6 +422,8 @@ pub struct RouterConfig {
     /// `[agent.subagents.models.<name>]` entry. Unmapped tiers use `[model]`.
     #[serde(default)]
     pub tiers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub training: RouterTrainingConfig,
 }
 
 impl Default for RouterConfig {
@@ -435,8 +437,19 @@ impl Default for RouterConfig {
             rerank_timeout_ms: default_rerank_timeout_ms(),
             log_text: false,
             tiers: BTreeMap::new(),
+            training: RouterTrainingConfig::default(),
         }
     }
+}
+
+/// `[router.training]`: team opt-in to collect hindsight-labeled router
+/// decisions in `.kode/router/dataset.jsonl` (task text is committed).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RouterTrainingConfig {
+    pub enabled: bool,
+    /// Private HF dataset repo used by `kode router train --remote`.
+    pub hf_dataset: String,
 }
 
 impl AgentConfig {
@@ -1007,5 +1020,22 @@ heavy = "terra"
             cfg.router.tiers.get("heavy").map(String::as_str),
             Some("terra")
         );
+    }
+
+    #[test]
+    fn router_training_defaults_off() {
+        let cfg: KodeConfig = toml::from_str("").unwrap();
+        assert!(!cfg.router.training.enabled);
+        assert!(cfg.router.training.hf_dataset.is_empty());
+    }
+
+    #[test]
+    fn router_training_section_parses() {
+        let cfg: KodeConfig = toml::from_str(
+            "[router.training]\nenabled = true\nhf_dataset = \"team/kode-router-data\"\n",
+        )
+        .unwrap();
+        assert!(cfg.router.training.enabled);
+        assert_eq!(cfg.router.training.hf_dataset, "team/kode-router-data");
     }
 }

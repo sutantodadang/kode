@@ -25,6 +25,8 @@ pub enum SlashCommand {
     Plan,
     /// `/image <path>` — attaches an image file to the next user turn.
     Image(String),
+    /// `/router [key=value…]` — show or correct the last router training record.
+    Router(String),
     Help,
     /// `/name [args]` where `name` isn't a builtin. Resolved against
     /// discovered custom commands at handle time (not parse time) — an
@@ -41,7 +43,7 @@ pub enum SlashCommand {
 /// [`SLASH_COMMANDS`]. Custom commands never shadow these; discovery
 /// filters them out up front.
 pub const BUILTIN_COMMAND_NAMES: &[&str] = &[
-    "model", "effort", "provider", "copy", "resume", "plan", "image", "help",
+    "model", "effort", "provider", "copy", "resume", "plan", "image", "router", "help",
 ];
 
 /// The providers `/provider` accepts, in picker display order.
@@ -68,6 +70,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/plan",
         "toggle plan mode (plan first, then approve to run)",
     ),
+    ("/router", "show or correct the last router decision"),
     ("/help", "list commands + shortcuts"),
 ];
 
@@ -123,6 +126,7 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "/resume" => SlashCommand::Resume,
         "/plan" => SlashCommand::Plan,
         "/image" => SlashCommand::Image(rest.to_string()),
+        "/router" => SlashCommand::Router(rest.to_string()),
         "/help" => SlashCommand::Help,
         other => {
             let name = other.trim_start_matches('/').to_lowercase();
@@ -509,6 +513,19 @@ pub(crate) fn handle_slash_command(
             }
         }
         SlashCommand::Copy => perform_copy(state),
+        SlashCommand::Router(args) => {
+            let lines = if args.trim().is_empty() {
+                crate::router_cmd::describe_last(cwd)
+            } else {
+                let parts: Vec<String> = args.split_whitespace().map(str::to_string).collect();
+                vec![crate::router_cmd::correct(cwd, "last", &parts).unwrap_or_else(|e| e)]
+            };
+            for line in lines {
+                state
+                    .transcript
+                    .push(TranscriptLine::new(Gutter::Note, line));
+            }
+        }
         SlashCommand::Resume => {
             let metas = crate::session::list(cwd, 20);
             if metas.is_empty() {

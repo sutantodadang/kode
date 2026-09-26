@@ -8,11 +8,14 @@ mod local;
 mod models;
 mod pipeline;
 mod remember;
+mod router_cmd;
 mod routing;
 mod session;
 mod setup;
 mod status;
 mod team_memory;
+mod trainer;
+mod training;
 mod tui;
 mod update;
 mod verify;
@@ -109,6 +112,44 @@ enum Command {
     Memory {
         #[command(subcommand)]
         cmd: MemoryCmd,
+    },
+    /// Team router training: status, corrections, calibration, training.
+    Router {
+        #[command(subcommand)]
+        cmd: RouterCmd,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum RouterCmd {
+    /// Dataset counts, splits, thresholds, and the active team model.
+    Status,
+    /// Correct a record's labels: `kode router correct last tier=heavy`.
+    Correct {
+        /// A record id, or `last` (your newest record).
+        target: String,
+        /// key=value pairs: tier, effort, plan.
+        assignments: Vec<String>,
+    },
+    /// Fit the pinned model's temperatures on the team dataset.
+    Calibrate {
+        /// Write `.kode/router/team-model.json` (commit it to share).
+        #[arg(long)]
+        write: bool,
+    },
+    /// Fine-tune Laya on the team dataset, calibrate, and gate the result.
+    Train {
+        /// Train on HF Jobs (needs `hf` and [router.training] hf_dataset).
+        #[arg(long)]
+        remote: bool,
+    },
+    /// Share a candidate that passed the gate and write the team manifest.
+    Publish {
+        /// Candidate id (see `kode router train` output).
+        candidate: String,
+        /// hf:<owner/repo> | path:<dir> | lfs:<repo-relative dir>
+        #[arg(long)]
+        to: String,
     },
 }
 
@@ -228,6 +269,34 @@ async fn main() -> anyhow::Result<()> {
                 team_memory::print_status(&cwd);
             }
         },
+        Some(Command::Router { cmd }) => {
+            let cwd = std::env::current_dir()?;
+            match cmd {
+                RouterCmd::Status => {
+                    for line in router_cmd::status_lines(&cwd) {
+                        println!("{line}");
+                    }
+                }
+                RouterCmd::Correct {
+                    target,
+                    assignments,
+                } => {
+                    println!(
+                        "{}",
+                        router_cmd::correct(&cwd, &target, &assignments)
+                            .map_err(anyhow::Error::msg)?
+                    );
+                }
+                RouterCmd::Calibrate { write } => router_cmd::calibrate_cmd(&cwd, write).await?,
+                RouterCmd::Train { remote } => {
+                    let config = kode_core::KodeConfig::load(&cwd)?;
+                    router_cmd::train_cmd(&cwd, &config, remote).await?;
+                }
+                RouterCmd::Publish { candidate, to } => {
+                    router_cmd::publish_cmd(&cwd, &candidate, &to).await?;
+                }
+            }
+        }
     }
 
     Ok(())

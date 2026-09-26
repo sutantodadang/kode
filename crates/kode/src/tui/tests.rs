@@ -1230,6 +1230,50 @@ fn parse_slash_command_plan() {
 }
 
 #[test]
+fn parse_slash_command_router_keeps_arguments() {
+    assert_eq!(
+        parse_slash_command("/router"),
+        Some(SlashCommand::Router(String::new()))
+    );
+    assert_eq!(
+        parse_slash_command("/router tier=heavy plan=plan"),
+        Some(SlashCommand::Router("tier=heavy plan=plan".to_string()))
+    );
+}
+
+#[test]
+fn handle_slash_command_router_without_records_notes_it() {
+    let dir = temp_project_dir();
+    let mut s = state();
+    let mut cfg = KodeConfig::default();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    handle_slash_command(
+        &mut s,
+        &dir,
+        &mut cfg,
+        &tx,
+        SlashCommand::Router(String::new()),
+    );
+    assert!(
+        s.transcript
+            .iter()
+            .any(|l| l.text.contains("no router training records yet"))
+    );
+    handle_slash_command(
+        &mut s,
+        &dir,
+        &mut cfg,
+        &tx,
+        SlashCommand::Router("tier=heavy".to_string()),
+    );
+    assert!(
+        s.transcript
+            .iter()
+            .any(|l| l.text.contains("no router training record yet"))
+    );
+}
+
+#[test]
 fn parse_slash_command_non_builtin_name_is_custom() {
     // Non-builtin names parse as `Custom` — resolved against discovered
     // commands at handle time, not parse time. An unmatched name still
