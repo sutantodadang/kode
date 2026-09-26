@@ -248,6 +248,12 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
                 .transcript
                 .push(TranscriptLine::new(Gutter::Note, text));
         }
+        KodeEvent::RouterDecision { answers } => {
+            state.transcript.push(TranscriptLine::new(
+                Gutter::Note,
+                kode_core::event::router_summary(&answers),
+            ));
+        }
         KodeEvent::SourcedNote { text, source } => {
             let gutter = match source {
                 NoteSource::Zindeks => Gutter::Zindeks,

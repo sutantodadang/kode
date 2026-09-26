@@ -329,6 +329,26 @@ fn note_pushes_note_gutter_line() {
 }
 
 #[test]
+fn router_decision_renders_as_note_line() {
+    use kode_core::event::{RouteAnswer, RouteSource};
+    let mut s = state();
+    apply_event(
+        &mut s,
+        KodeEvent::RouterDecision {
+            answers: vec![RouteAnswer {
+                key: "tier".to_string(),
+                value: "heavy".to_string(),
+                confidence: Some(0.82),
+                source: RouteSource::Laya,
+            }],
+        },
+    );
+    let last = s.transcript.last().expect("a transcript line");
+    assert_eq!(last.gutter, Gutter::Note);
+    assert_eq!(last.text, "router: tier=heavy (laya 0.82)");
+}
+
+#[test]
 fn context_compiled_updates_token_counter() {
     let mut s = state();
     apply_event(

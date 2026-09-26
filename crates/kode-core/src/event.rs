@@ -26,6 +26,41 @@ pub enum NoteSource {
     Git,
 }
 
+/// Where one routing answer came from. `Static` carries the reason the
+/// model's answer was not used (disabled, not installed, low confidence…).
+#[derive(Debug, Clone, PartialEq)]
+pub enum RouteSource {
+    Laya,
+    Static(String),
+}
+
+/// One routed decision (`tier`, `effort`, or `plan`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteAnswer {
+    pub key: String,
+    pub value: String,
+    /// Laya confidence (1 - normalized entropy) when the model ran.
+    pub confidence: Option<f32>,
+    pub source: RouteSource,
+}
+
+impl RouteAnswer {
+    /// `tier=heavy (laya 0.82)` / `plan=direct (static: low confidence 0.41)`.
+    pub fn describe(&self) -> String {
+        let origin = match &self.source {
+            RouteSource::Laya => format!("laya {:.2}", self.confidence.unwrap_or(0.0)),
+            RouteSource::Static(reason) => format!("static: {reason}"),
+        };
+        format!("{}={} ({origin})", self.key, self.value)
+    }
+}
+
+/// One-line, frontend-agnostic rendering of a routing decision.
+pub fn router_summary(answers: &[RouteAnswer]) -> String {
+    let parts: Vec<String> = answers.iter().map(RouteAnswer::describe).collect();
+    format!("router: {}", parts.join(" · "))
+}
+
 /// Events emitted during an agent run.
 #[derive(Debug, Clone)]
 pub enum KodeEvent {
@@ -92,6 +127,11 @@ pub enum KodeEvent {
     /// they see fit, e.g. `◆ {text}`).
     Note {
         text: String,
+    },
+    /// The local router's per-task decision, emitted once before the model
+    /// is built. Frontends render [`router_summary`] of it.
+    RouterDecision {
+        answers: Vec<RouteAnswer>,
     },
     /// A `Note` with known single-engine provenance (zindeks/ingat/git),
     /// emitted where the pipeline can attribute the fact to exactly one
@@ -198,5 +238,33 @@ mod tests {
             }
             other => panic!("expected SourcedNote, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn router_summary_labels_every_source() {
+        let answers = vec![
+            RouteAnswer {
+                key: "tier".to_string(),
+                value: "heavy".to_string(),
+                confidence: Some(0.82),
+                source: RouteSource::Laya,
+            },
+            RouteAnswer {
+                key: "plan".to_string(),
+                value: "direct".to_string(),
+                confidence: Some(0.41),
+                source: RouteSource::Static("low confidence 0.41".to_string()),
+            },
+            RouteAnswer {
+                key: "effort".to_string(),
+                value: "config".to_string(),
+                confidence: None,
+                source: RouteSource::Static("models not installed — run `kode setup`".to_string()),
+            },
+        ];
+        assert_eq!(
+            router_summary(&answers),
+            "router: tier=heavy (laya 0.82) · plan=direct (static: low confidence 0.41) · effort=config (static: models not installed — run `kode setup`)"
+        );
     }
 }
