@@ -12,6 +12,7 @@ pub mod pins;
 pub mod rerank;
 pub mod route;
 pub mod sequence;
+pub mod teacher;
 pub mod temps;
 
 pub use error::LocalError;
