@@ -3,10 +3,20 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use kode_local::calibrate::{MIN_CALIBRATE, MIN_TRAIN};
-use kode_local::dataset::{self, Correction, Line, Split, split_of};
-use kode_local::manifest::{ManifestKind, Source, read_manifest};
+use anyhow::Context;
+use kode_local::calibrate::{
+    Calibration, MIN_CALIBRATE, MIN_EVAL_DECISIONS, MIN_TRAIN, build_items, calibrate,
+};
+use kode_local::dataset::{self, Correction, Labeled, Line, Split, split_of};
+use kode_local::device::{DevicePref, init_runtime};
+use kode_local::laya::{LayaModel, shared_laya};
+use kode_local::manifest::{
+    ManifestKind, Source, TeamModel, manifest_path, read_manifest, write_manifest,
+};
+use kode_local::models::{LAYA_DIR, LocalPaths, installed_runtime, verify_model_dir};
+use kode_local::pins::{MODEL_FILES, MODELS_REVISION, ORT_VERSION};
 use kode_local::route::{questions_version, route_questions};
 
 pub fn candidates_dir(root: &Path) -> PathBuf {
@@ -190,10 +200,125 @@ pub fn status_lines(root: &Path) -> Vec<String> {
     ]
 }
 
+pub fn load_examples(root: &Path) -> anyhow::Result<Vec<Labeled>> {
+    let path = dataset::dataset_path(root);
+    let ds = dataset::read(&path).with_context(|| path.display().to_string())?;
+    Ok(dataset::labeled(&ds, &questions_version()).examples)
+}
+
+pub async fn load_pinned_laya() -> anyhow::Result<Arc<LayaModel>> {
+    let paths = LocalPaths::from_home().context("cannot resolve ~/.kode")?;
+    let (_, dylib) = installed_runtime(&paths, ORT_VERSION)
+        .context("onnx runtime not installed — run `kode setup`")?;
+    init_runtime(&dylib)?;
+    let dir = verify_model_dir(&paths, MODELS_REVISION, MODEL_FILES, LAYA_DIR)?;
+    Ok(tokio::task::spawn_blocking(move || shared_laya(&dir, DevicePref::Cpu)).await??)
+}
+
+pub fn calibration_lines(c: &Calibration) -> Vec<String> {
+    let m = |label: &str, x: &kode_local::calibrate::Metrics| {
+        format!(
+            "{label} accuracy {:.3} · ECE {:.3} (n={})",
+            x.accuracy, x.ece, x.n
+        )
+    };
+    let t = &c.temps.temperature;
+    let mut lines = vec![
+        format!("fit on {} decisions (train + calibration splits)", c.n_fit),
+        m("before:", &c.before),
+        m("after: ", &c.after),
+        format!(
+            "temperatures: choice {:.2} · score {:.2} · noul {:.2}",
+            t.first().copied().unwrap_or(1.0),
+            t.get(1).copied().unwrap_or(1.0),
+            t.get(2).copied().unwrap_or(1.0)
+        ),
+    ];
+    for (bucket, value) in &c.temps.temperature_by_options {
+        lines.push(format!("  {bucket}: {value:.2}"));
+    }
+    if c.before.n < MIN_EVAL_DECISIONS {
+        lines.push(format!(
+            "note: the eval split has {} decisions (< {MIN_EVAL_DECISIONS}); these numbers are noisy",
+            c.before.n
+        ));
+    }
+    lines
+}
+
+pub fn calibration_manifest(c: &Calibration) -> anyhow::Result<TeamModel> {
+    Ok(TeamModel {
+        kind: ManifestKind::Calibration,
+        base_revision: MODELS_REVISION.to_string(),
+        questions_version: questions_version(),
+        source: None,
+        files: vec![],
+        temps: c.temps.clone(),
+        report: serde_json::to_value(c)?,
+    })
+}
+
+pub async fn calibrate_cmd(root: &Path, write: bool) -> anyhow::Result<()> {
+    let examples = load_examples(root)?;
+    if examples.len() < MIN_CALIBRATE {
+        anyhow::bail!(
+            "calibration needs {MIN_CALIBRATE} labeled records; the dataset has {}",
+            examples.len()
+        );
+    }
+    if write
+        && let Ok(Some(m)) = read_manifest(root)
+        && m.kind == ManifestKind::Checkpoint
+    {
+        anyhow::bail!(
+            "a team checkpoint is active (it was calibrated by `kode router train`); remove {} to calibrate the pinned model instead",
+            manifest_path(root).display()
+        );
+    }
+    let model = load_pinned_laya().await?;
+    let current = model.temperatures().clone();
+    let items =
+        tokio::task::spawn_blocking(move || build_items(model.as_ref(), &examples)).await??;
+    let result = calibrate(&items, &current, &[Split::Train, Split::Calib]);
+    for line in calibration_lines(&result) {
+        println!("{line}");
+    }
+    if write {
+        write_manifest(root, &calibration_manifest(&result)?)?;
+        println!(
+            "wrote {} — commit it to share with the team",
+            manifest_path(root).display()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kode_local::calibrate::{Calibration, Metrics};
     use kode_local::dataset::{Line, Record, TaskSummary, TeacherLabel, append, dataset_path};
+    use kode_local::temps::Temperatures;
+
+    fn cal() -> Calibration {
+        Calibration {
+            temps: Temperatures {
+                temperature: vec![1.4, 0.8, 1.0],
+                temperature_by_options: Default::default(),
+            },
+            before: Metrics {
+                n: 120,
+                accuracy: 0.55,
+                ece: 0.21,
+            },
+            after: Metrics {
+                n: 120,
+                accuracy: 0.55,
+                ece: 0.06,
+            },
+            n_fit: 900,
+        }
+    }
 
     fn root(label: &str) -> PathBuf {
         let dir =
@@ -313,5 +438,31 @@ mod tests {
         assert!(text.contains("r1"));
         assert!(text.contains("tier=heavy"));
         assert!(text.contains("plan=direct"));
+    }
+
+    #[test]
+    fn calibration_lines_show_before_after_and_temperatures() {
+        let text = calibration_lines(&cal()).join("\n");
+        assert!(text.contains("fit on 900 decisions"));
+        assert!(text.contains("before: accuracy 0.550 · ECE 0.210 (n=120)"));
+        assert!(text.contains("after:  accuracy 0.550 · ECE 0.060 (n=120)"));
+        assert!(text.contains("choice 1.40"));
+    }
+
+    #[test]
+    fn calibration_manifest_targets_the_pinned_revision() {
+        let m = calibration_manifest(&cal()).unwrap();
+        assert_eq!(m.kind, ManifestKind::Calibration);
+        assert_eq!(m.base_revision, kode_local::pins::MODELS_REVISION);
+        assert_eq!(m.questions_version, questions_version());
+        assert_eq!(m.temps.temperature, vec![1.4, 0.8, 1.0]);
+        assert_eq!(m.report["after"]["ece"], serde_json::json!(0.06));
+    }
+
+    #[test]
+    fn load_examples_counts_only_current_version() {
+        let dir = root("examples");
+        seed(&dir, "r1", 1);
+        assert_eq!(load_examples(&dir).unwrap().len(), 1);
     }
 }

@@ -130,6 +130,12 @@ enum RouterCmd {
         /// key=value pairs: tier, effort, plan.
         assignments: Vec<String>,
     },
+    /// Fit the pinned model's temperatures on the team dataset.
+    Calibrate {
+        /// Write `.kode/router/team-model.json` (commit it to share).
+        #[arg(long)]
+        write: bool,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -266,6 +272,7 @@ async fn main() -> anyhow::Result<()> {
                             .map_err(anyhow::Error::msg)?
                     );
                 }
+                RouterCmd::Calibrate { write } => router_cmd::calibrate_cmd(&cwd, write).await?,
             }
         }
     }
