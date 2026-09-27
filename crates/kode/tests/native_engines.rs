@@ -124,15 +124,22 @@ async fn native_memory_and_code_share_one_process() {
     let code_store = temp("combined-code-store");
     let mem_db = temp("combined-mem").join("memory.sqlite3");
 
-    // zindeks: open, index, query.
     let code = EmbeddedZindeks::open(&library, &repo, &code_store, false).expect("open zindeks");
-    code.index_repository().await.expect("index repository");
-
-    // ingat: 20 durable writes in the same process.
     let memory_backend = EmbeddedIngat::open(&mem_db).expect("open embedded memory");
-    for index in 0..20 {
-        memory_backend.remember(&memory(index)).await.unwrap();
-    }
+    let writes = async {
+        for index in 0..20 {
+            memory_backend.remember(&memory(index)).await.unwrap();
+        }
+    };
+    let queries = async {
+        code.index_repository().await.expect("index repository");
+        for _ in 0..20 {
+            let results = code.search("answer", 5).await.expect("code search");
+            assert!(!results.is_empty(), "expected indexed answer function");
+            assert!(results.iter().all(|r| !r.path.is_empty()));
+        }
+    };
+    tokio::join!(writes, queries);
 
     // Code queries run alongside the committed memories.
     let code_health = code.health().await.expect("code health");
@@ -152,6 +159,8 @@ async fn native_memory_and_code_share_one_process() {
     assert_eq!(mem_stats.total, 20);
     memory_backend.health().await.expect("memory health");
 
+    drop(code);
+    drop(memory_backend);
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&code_store);
     if let Some(parent) = mem_db.parent() {

@@ -48,6 +48,11 @@ jobs:
             asset: zindeks-ffi-linux-x86_64.tar.gz
             sha: 7e1281d0249e1f5d0caabe42a1bcb9e0a28082b77f1e1ee265cc201f82b0d0ea
             lib: libzindeks.so
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            asset: zindeks-ffi-linux-aarch64.tar.gz
+            sha: 7983af13c2903a9f5046fcaf9e0025ca567bf64a2796ae00fc1cc84a53d2652c
+            lib: libzindeks.so
           - name: windows-x86_64
             os: windows-latest
             asset: zindeks-ffi-windows-x86_64.tar.gz
@@ -89,3 +94,8 @@ jobs:
 
       - name: Combined native-engine gate
         run: cargo test -p kode --test native_engines -- --ignored
+
+      - name: Fresh native install CLI gate
+        env:
+          KODE_SETUP_QA_HOME: ${{ runner.temp }}
+        run: cargo test -p kode --test setup_real -- --ignored

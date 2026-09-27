@@ -91,5 +91,34 @@ async fn embedded_index_then_query_works() {
         "outline missing expected symbols: {outline:?}"
     );
 
+    // Poll once to enqueue native work, then cancel its reply and close the
+    // adapter. Closing must drain the work before unloading the library.
+    for index in 0..200 {
+        std::fs::write(
+            repo.join(format!("src/cancel_{index}.rs")),
+            format!("pub fn cancel_{index}() -> u32 {{ {index} }}\n"),
+        )
+        .unwrap();
+    }
+    {
+        use std::future::Future;
+        let mut request = Box::pin(backend.index_repository());
+        let state =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(request.as_mut().poll(cx))).await;
+        assert!(
+            state.is_pending(),
+            "expected queued index work before cancellation"
+        );
+    }
+    drop(backend);
+    let reopened = EmbeddedZindeks::open(&library, &repo, &store, false)
+        .expect("reopen after canceled request and shutdown");
+    assert!(reopened.health().await.unwrap().documents >= 201);
+    reopened
+        .ensure_bound()
+        .await
+        .expect("rebind after cancellation");
+    drop(reopened);
     let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&store);
 }

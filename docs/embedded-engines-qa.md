@@ -2,8 +2,10 @@
 
 Status: **partial** — the combined native session is verified on Windows
 x86_64 (local) and on Linux x86_64, Windows x86_64 and macOS aarch64 in CI
-against the released zindeks asset. The fresh-host, multi-process recovery and
-optional router/model gates are recorded as unverified below, not claimed.
+against the released zindeks asset. Remaining platform/release gates are
+recorded below. Fresh installation,
+multi-process recovery and router/model checks also passed locally on
+2026-09-27; see [the merge QA record](merge-qa-2026-09-27.md).
 
 ## Pinned upstreams
 
@@ -64,8 +66,10 @@ zig build ffi-test      # ok (export allowlist + C ABI smoke)
 ## CI gate
 
 `.github/workflows/ci.yml` job `native-engines` runs a matrix of
-**linux-x86_64, windows-x86_64 and macos-aarch64**, downloads the pinned v0.10.2
-asset for each, verifies its SHA-256, and runs both `--ignored` gates.
+**linux-x86_64, linux-aarch64, windows-x86_64 and macos-aarch64**, downloads
+the pinned v0.10.2 asset for each, verifies its SHA-256, and runs the real engine
+and fresh-install CLI gates. The ARM64 and fresh-install additions still need
+a CI run; the previously verified matrix had three targets.
 
 The v0.10.1 linux FFI assets were musl-linked (`DT_NEEDED libc.so`) and failed
 to `dlopen` on glibc runners (`.../libc.so: invalid ELF header`); v0.10.2 builds
@@ -73,13 +77,12 @@ the linux assets with the `-gnu` ABI (needs `libc.so.6`).
 
 ## Not yet verified (unrun manual gates)
 
-- **Fresh-host install**: `kode setup` downloading + checksum-verifying the
-  embedded library, then `kode index`, was not exercised end-to-end here.
-- **Two-process recovery**: concurrent writers, busy owner >5s, interrupted
-  import, newer-schema rejection — covered by unit/integration tests in
-  `kode-memory`/`ingat-core`, not by a scripted multi-process run here.
-- **Router/model parity**: `kode-local` Laya/reranker golden tests remain
-  optional (`#[ignore]`, require installed models) and were not run.
+- **Updated platform CI**: the installer fix, strengthened native tests,
+  Linux ARM64 and fresh-install gates need the next CI run.
+- **Full release acceptance**: power-loss simulation, legacy export with a
+  locked source, performance measurements and manual TUI acceptance remain
+  unrun. The merge QA record lists the local scenarios and model checks that
+  have now passed.
 
 ## Notes
 

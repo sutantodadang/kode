@@ -12,7 +12,7 @@ use kode_local::models::{
 use kode_local::pins::{MODEL_FILES, MODELS_REPO, MODELS_REVISION, ORT_VERSION, RUNTIMES};
 
 const ZINDEKS_RELEASES_BASE: &str =
-    "https://github.com/sutantodadang/zindeks/releases/latest/download";
+    "https://github.com/sutantodadang/zindeks/releases/download/v0.10.2";
 
 /// Runs `kode setup`: a consent-gated installer/bootstrapper for Kode's
 /// engines (zindeks for code intelligence, native Ingat for engineering
@@ -249,7 +249,14 @@ async fn setup_zindeks_embedded(cfg: &ZindeksConfig, yes: bool) -> anyhow::Resul
         return Ok(());
     }
 
-    let tmp = std::env::temp_dir().join(format!("kode-setup-zindeks-{}", std::process::id()));
+    // Stage on the install volume: rename cannot cross Windows drive letters.
+    let tmp = runtime_root
+        .parent()
+        .expect("zindeks runtime directory has a parent")
+        .join(format!(
+            "kode-setup-zindeks-{}",
+            kode_local::dataset::new_id()
+        ));
     tokio::fs::create_dir_all(&tmp).await?;
 
     let client = reqwest::Client::builder()
