@@ -525,6 +525,18 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
 
     terminal.draw(|f| draw(f, &mut state, cwd))?;
 
+    // Warm the process-wide Laya cache while the user composes the first
+    // task. Drawing/input never waits for model loading.
+    if !config.model.model.is_empty()
+        && crate::routing::router_active(&config.router, !kode_local::pins::MODEL_FILES.is_empty())
+    {
+        let router_config = config.router.clone();
+        let root = cwd.to_path_buf();
+        tokio::spawn(async move {
+            let _ = guard_task(async { Ok(crate::local::load(&router_config, &root).await) }).await;
+        });
+    }
+
     'outer: loop {
         tokio::select! {
             biased;

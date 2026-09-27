@@ -640,17 +640,95 @@ pub(crate) fn line_rows(line: &Line<'static>, width: u16) -> u16 {
     )
 }
 
-/// Sums `line_rows` across every line of `lines` at `width` columns — the
-/// transcript's exact total wrapped-row count, used for scroll clamping and
-/// scrollbar sizing.
-pub(crate) fn total_wrapped_rows(lines: &[Line<'static>], width: u16) -> usize {
-    if width == 0 {
-        return 0;
+#[derive(Default)]
+pub(crate) struct TranscriptCache {
+    width: u16,
+    lines: Vec<CachedTranscriptLine>,
+}
+
+struct CachedTranscriptLine {
+    source: TranscriptLine,
+    entries: Vec<(Line<'static>, Option<usize>, [u16; 2])>,
+}
+
+impl TranscriptCache {
+    fn update(&mut self, transcript: &[TranscriptLine], width: u16) {
+        // ponytail: linear equality scan; revision counters if very long
+        // histories make this scan dominate rendering.
+        if self.width != width {
+            self.lines.clear();
+            self.width = width;
+        }
+        self.lines.truncate(transcript.len());
+        for (index, source) in transcript.iter().enumerate() {
+            if self
+                .lines
+                .get(index)
+                .is_some_and(|cached| cached.source == *source)
+            {
+                continue;
+            }
+            let header = !source.tool_children.is_empty();
+            let mut entries = vec![(transcript_line_to_ratatui(source), header.then_some(index))];
+            if header && source.expanded {
+                entries.extend(source.tool_children.iter().map(|child| {
+                    (
+                        transcript_line_to_ratatui(&TranscriptLine::new(
+                            Gutter::Tool,
+                            format!("  {child}"),
+                        )),
+                        None,
+                    )
+                }));
+            }
+            let cached = CachedTranscriptLine {
+                source: source.clone(),
+                entries: entries
+                    .into_iter()
+                    .map(|(line, index)| {
+                        let rows = [
+                            line_rows(&line, width),
+                            line_rows(&line, width.saturating_sub(1)),
+                        ];
+                        (line, index, rows)
+                    })
+                    .collect(),
+            };
+            if index < self.lines.len() {
+                self.lines[index] = cached;
+            } else {
+                self.lines.push(cached);
+            }
+        }
     }
-    lines
-        .iter()
-        .map(|line| line_rows(line, width) as usize)
-        .sum()
+}
+
+/// Keep ratatui's exact wrapping, but skip logical lines above the viewport.
+pub(crate) fn visible_transcript_lines(
+    lines: &[&Line<'static>],
+    rows: &[u16],
+    scroll: u16,
+    height: u16,
+) -> (Vec<Line<'static>>, u16) {
+    let mut start = 0usize;
+    let scroll = usize::from(scroll);
+    let end = scroll + usize::from(height);
+    let mut offset = 0;
+    let mut visible = Vec::new();
+    for (line, count) in lines.iter().zip(rows) {
+        let next = start + usize::from(*count);
+        if next > scroll && start < end {
+            if visible.is_empty() {
+                offset = scroll.saturating_sub(start) as u16;
+            }
+            visible.push((*line).clone());
+        }
+        start = next;
+        if start >= end {
+            break;
+        }
+    }
+    (visible, offset)
 }
 
 pub(crate) const MAX_INPUT_LINES: usize = 6;
@@ -1186,34 +1264,55 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
         // expandable tool-group header (`Some`) — everything else
         // (prose, plain tool lines, expanded children, the stream line,
         // the spinner label) is `None`.
-        let mut entries: Vec<(Line<'static>, Option<usize>)> = Vec::new();
-        if show_empty_state(&state.transcript, state.running) {
-            entries.extend(empty_state_lines(state).into_iter().map(|l| (l, None)));
-        }
-        for (i, line) in state.transcript.iter().enumerate() {
-            let is_header = !line.tool_children.is_empty();
-            entries.push((
-                transcript_line_to_ratatui(line),
-                if is_header { Some(i) } else { None },
-            ));
-            if is_header && line.expanded {
-                for child in &line.tool_children {
-                    let child_line = TranscriptLine::new(Gutter::Tool, format!("  {child}"));
-                    entries.push((transcript_line_to_ratatui(&child_line), None));
-                }
-            }
-        }
-        if !state.current_stream.is_empty() {
-            entries.push((
-                transcript_line_to_ratatui(&TranscriptLine::new(
-                    Gutter::Prose,
-                    state.current_stream.clone(),
-                )),
-                None,
-            ));
-        }
-        let (text_lines, indices): (Vec<Line>, Vec<Option<usize>>) = entries.into_iter().unzip();
         let transcript_area = areas[idx];
+        state
+            .transcript_cache
+            .update(&state.transcript, transcript_area.width);
+        let mut extra = Vec::new();
+        if show_empty_state(&state.transcript, state.running) {
+            extra.extend(empty_state_lines(state));
+        }
+        let empty_len = extra.len();
+        if !state.current_stream.is_empty() {
+            extra.push(transcript_line_to_ratatui(&TranscriptLine::new(
+                Gutter::Prose,
+                state.current_stream.clone(),
+            )));
+        }
+        let mut text_lines = Vec::new();
+        let mut indices = Vec::new();
+        let mut full_rows = Vec::new();
+        let mut narrow_rows = Vec::new();
+        let measured_extra: Vec<_> = extra
+            .iter()
+            .map(|line| {
+                (
+                    line,
+                    None,
+                    [
+                        line_rows(line, transcript_area.width),
+                        line_rows(line, transcript_area.width.saturating_sub(1)),
+                    ],
+                )
+            })
+            .collect();
+        let cached = state
+            .transcript_cache
+            .lines
+            .iter()
+            .flat_map(|cached| &cached.entries)
+            .map(|(line, index, rows)| (line, *index, *rows));
+        for (line, index, rows) in measured_extra[..empty_len]
+            .iter()
+            .copied()
+            .chain(cached)
+            .chain(measured_extra[empty_len..].iter().copied())
+        {
+            text_lines.push(line);
+            indices.push(index);
+            full_rows.push(rows[0]);
+            narrow_rows.push(rows[1]);
+        }
 
         // Decide, at the full transcript width, whether a scrollbar column
         // needs reserving. If it does, the text area narrows by one column
@@ -1221,7 +1320,7 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
         // test math all agree with what's actually rendered (narrowing can
         // only add wrapped lines, never remove the overflow, so this never
         // flaps).
-        let total_lines_full = lines_as_u16(total_wrapped_rows(&text_lines, transcript_area.width));
+        let total_lines_full = lines_as_u16(full_rows.iter().map(|n| usize::from(*n)).sum());
         let scrollbar_needed = total_lines_full > transcript_area.height;
         let (text_area, scrollbar_area) = if scrollbar_needed && transcript_area.width > 1 {
             let cols = Layout::horizontal([Constraint::Min(1), Constraint::Length(1)])
@@ -1230,8 +1329,13 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
         } else {
             (transcript_area, None)
         };
+        let row_counts = if scrollbar_area.is_some() {
+            narrow_rows
+        } else {
+            full_rows
+        };
         let total_lines = if scrollbar_area.is_some() {
-            lines_as_u16(total_wrapped_rows(&text_lines, text_area.width))
+            lines_as_u16(row_counts.iter().map(|n| usize::from(*n)).sum())
         } else {
             total_lines_full
         };
@@ -1248,10 +1352,10 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
         // Per-line row counts at the width actually rendered, paired with
         // each line's transcript index (if it's a clickable group header)
         // — `handle_mouse`'s click hit-test walks this.
-        let rows: Vec<(u16, Option<usize>)> = text_lines
+        let rows: Vec<(u16, Option<usize>)> = row_counts
             .iter()
             .zip(indices.iter())
-            .map(|(l, idx)| (line_rows(l, text_area.width), *idx))
+            .map(|(count, idx)| (*count, *idx))
             .collect();
         state.transcript_hit = Some(TranscriptHit {
             area: text_area,
@@ -1259,10 +1363,12 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
             rows,
         });
 
-        let transcript = Paragraph::new(text_lines)
+        let (visible, offset) =
+            visible_transcript_lines(&text_lines, &row_counts, state.scroll, viewport_height);
+        let transcript = Paragraph::new(visible)
             .wrap(Wrap { trim: false })
             .block(Block::default().borders(Borders::NONE))
-            .scroll((state.scroll, 0));
+            .scroll((offset, 0));
         f.render_widget(transcript, text_area);
 
         if let Some(area) = scrollbar_area

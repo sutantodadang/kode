@@ -153,9 +153,16 @@ fn length_batches(lens: &[usize], batch: usize) -> Vec<Vec<usize>> {
 }
 
 static RERANKER: OnceLock<Arc<QwenReranker>> = OnceLock::new();
+static RERANKER_LOAD: Mutex<()> = Mutex::new(());
 
 /// Process-wide reranker; failures are not cached (see `shared_laya`).
 pub fn shared_reranker(dir: &Path, pref: DevicePref) -> Result<Arc<QwenReranker>, LocalError> {
+    if let Some(model) = RERANKER.get() {
+        return Ok(model.clone());
+    }
+    // A timed-out cold load may still run when the next task starts.
+    // Serialize initialization so it cannot allocate a second model.
+    let _loading = RERANKER_LOAD.lock().map_err(|_| LocalError::Poisoned)?;
     if let Some(model) = RERANKER.get() {
         return Ok(model.clone());
     }

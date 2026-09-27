@@ -32,6 +32,119 @@ fn render_at_minimum_size(state: &mut AppState) {
 }
 
 #[test]
+#[ignore = "manual transcript render latency measurement"]
+fn transcript_render_latency() {
+    for count in [100, 2_000] {
+        let mut app = state();
+        for i in 0..count {
+            app.transcript.push(TranscriptLine::new(
+                Gutter::Prose,
+                format!(
+                    "line {i}: {}",
+                    "some engineering context and tool output ".repeat(4)
+                ),
+            ));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|f| draw(f, &mut app, std::path::Path::new(".")))
+            .unwrap();
+        let mut samples = Vec::new();
+        for _ in 0..15 {
+            let started = Instant::now();
+            terminal
+                .draw(|f| draw(f, &mut app, std::path::Path::new(".")))
+                .unwrap();
+            samples.push(started.elapsed().as_micros());
+        }
+        samples.sort();
+        assert!(
+            samples[7] < 100_000,
+            "warm redraw exceeded the 100ms interaction budget"
+        );
+        println!(
+            "transcript {count} lines: median {}us, p95 {}us",
+            samples[7], samples[14]
+        );
+    }
+}
+
+#[test]
+fn visible_transcript_matches_full_wrapping_at_every_scroll() {
+    use ratatui::layout::Rect;
+    use ratatui::widgets::{Paragraph, Wrap};
+    let lines = vec![
+        Line::from("short"),
+        Line::from("Unicode 界界 and long words which wrap across several rows"),
+        Line::from(""),
+        Line::from("last line"),
+    ];
+    for width in [1, 10, 60] {
+        let rows: Vec<_> = lines.iter().map(|l| line_rows(l, width)).collect();
+        let refs: Vec<_> = lines.iter().collect();
+        for scroll in 0..rows.iter().copied().sum::<u16>() {
+            let area = Rect::new(0, 0, width, 3);
+            let mut expected = ratatui::buffer::Buffer::empty(area);
+            let mut actual = expected.clone();
+            use ratatui::widgets::Widget;
+            Paragraph::new(lines.clone())
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0))
+                .render(area, &mut expected);
+            let (visible, offset) = visible_transcript_lines(&refs, &rows, scroll, 3);
+            Paragraph::new(visible)
+                .wrap(Wrap { trim: false })
+                .scroll((offset, 0))
+                .render(area, &mut actual);
+            assert_eq!(actual, expected, "width {width}, scroll {scroll}");
+        }
+    }
+}
+
+#[test]
+fn transcript_cache_tracks_edits_expansion_stream_resize_and_clear() {
+    let mut app = state();
+    app.transcript
+        .push(TranscriptLine::new(Gutter::Note, "first"));
+    let mut tool = TranscriptLine::new(Gutter::Tool, "tools");
+    tool.tool_children = vec!["read src/lib.rs".to_string(), "inspect config".to_string()];
+    app.transcript.push(tool);
+    for step in 0..6 {
+        match step {
+            1 => app.transcript[0].text = "other".to_string(),
+            2 => app.transcript[1].expanded = true,
+            3 => {
+                app.current_stream = "streaming now".to_string();
+                app.transcript[1].tool_ok = Some(false);
+            }
+            5 => app.transcript.clear(),
+            _ => {}
+        }
+        let width = if step == 4 { 25 } else { 60 };
+        let mut fresh = state();
+        fresh.transcript = app.transcript.clone();
+        fresh.current_stream = app.current_stream.clone();
+        let mut actual = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        let mut expected = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        actual
+            .draw(|f| draw(f, &mut app, std::path::Path::new(".")))
+            .unwrap();
+        expected
+            .draw(|f| draw(f, &mut fresh, std::path::Path::new(".")))
+            .unwrap();
+        assert_eq!(
+            actual.backend().buffer(),
+            expected.backend().buffer(),
+            "step {step}"
+        );
+        assert_eq!(
+            app.transcript_hit.as_ref().unwrap().rows,
+            fresh.transcript_hit.as_ref().unwrap().rows
+        );
+    }
+}
+
+#[test]
 fn contextual_workbench_renders_major_states_at_60_by_20() {
     let mut idle = state();
     render_at_minimum_size(&mut idle);

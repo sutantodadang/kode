@@ -197,18 +197,16 @@ static LAYA: OnceLock<Mutex<HashMap<PathBuf, Arc<LayaModel>>>> = OnceLock::new()
 
 /// Loads a Laya model once per directory per process. Failures are not
 /// cached, so `kode setup` mid-session takes effect on the next task.
-/// ponytail: two tasks racing on a cold directory may both load it; the
-/// second insert wins, which is harmless.
+/// ponytail: cold loads serialize; per-directory locks if many checkpoints
+/// ever need to load concurrently.
 pub fn shared_laya(dir: &Path, pref: DevicePref) -> Result<Arc<LayaModel>, LocalError> {
     let cache = LAYA.get_or_init(Default::default);
-    if let Some(model) = cache.lock().map_err(|_| LocalError::Poisoned)?.get(dir) {
+    let mut cache = cache.lock().map_err(|_| LocalError::Poisoned)?;
+    if let Some(model) = cache.get(dir) {
         return Ok(model.clone());
     }
     let model = Arc::new(LayaModel::load(dir, pref)?);
-    cache
-        .lock()
-        .map_err(|_| LocalError::Poisoned)?
-        .insert(dir.to_path_buf(), model.clone());
+    cache.insert(dir.to_path_buf(), model.clone());
     Ok(model)
 }
 
