@@ -62,7 +62,7 @@ jobs:
           url="https://github.com/sutantodadang/zindeks/releases/download/v0.10.1/${ASSET}"
           curl -fsSL "$url" -o "$RUNNER_TEMP/zindeks/${ASSET}"
           echo "${SHA}  $RUNNER_TEMP/zindeks/${ASSET}" | sha256sum -c -
-          tar -xzf "$RUNNER_TEMP/zindeks/${ASSET}" -C "$RUNNER_TEMP/zindeks"
+          tar --force-local -xzf "$RUNNER_TEMP/zindeks/${ASSET}" -C "$RUNNER_TEMP/zindeks"
           lib=$(find "$RUNNER_TEMP/zindeks" -name zindeks.dll | head -n1)
           echo "KODE_ZINDEKS_DYLIB=${lib}" >> "$GITHUB_ENV"
 
