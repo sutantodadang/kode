@@ -58,13 +58,14 @@ jobs:
           SHA: 551ef2c2cb03a70ca367de912ac8a72ebc101a4d3a2d93cbd9b690f0ddd23b7c
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/zindeks"
+          tmp=$(cygpath -u "$RUNNER_TEMP")
+          mkdir -p "$tmp/zindeks"
           url="https://github.com/sutantodadang/zindeks/releases/download/v0.10.1/${ASSET}"
-          curl -fsSL "$url" -o "$RUNNER_TEMP/zindeks/${ASSET}"
-          echo "${SHA}  $RUNNER_TEMP/zindeks/${ASSET}" | sha256sum -c -
-          tar --force-local -xzf "$RUNNER_TEMP/zindeks/${ASSET}" -C "$RUNNER_TEMP/zindeks"
-          lib=$(find "$RUNNER_TEMP/zindeks" -name zindeks.dll | head -n1)
-          echo "KODE_ZINDEKS_DYLIB=${lib}" >> "$GITHUB_ENV"
+          curl -fsSL "$url" -o "$tmp/zindeks/${ASSET}"
+          echo "${SHA}  $tmp/zindeks/${ASSET}" | sha256sum -c -
+          tar -xzf "$tmp/zindeks/${ASSET}" -C "$tmp/zindeks"
+          lib=$(find "$tmp/zindeks" -name zindeks.dll | head -n1)
+          echo "KODE_ZINDEKS_DYLIB=$(cygpath -w "$lib")" >> "$GITHUB_ENV"
 
       - name: Embedded zindeks real-engine gate
         run: cargo test -p kode-intel --test embedded_real -- --ignored
