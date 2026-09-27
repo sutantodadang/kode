@@ -1,25 +1,26 @@
 # Embedded engines — QA and release acceptance
 
 Status: **partial** — the combined native session is verified on Windows
-x86_64 against the released zindeks asset. Linux/macOS targets and the
+x86_64 (local) and on Linux x86_64, Windows x86_64 and macOS aarch64 in CI
+against the released zindeks asset. The fresh-host, multi-process recovery and
 optional router/model gates are recorded as unverified below, not claimed.
 
 ## Pinned upstreams
 
 | Component | Revision | Artifact |
 | --- | --- | --- |
-| zindeks | tag `v0.10.1` = `6d9f9137c7b3f4f52b94cbd3f476be16e327c4d0` | four ABI 1 assets (see checksums) |
+| zindeks | tag `v0.10.2` = `e79bc89a3b68870448db5c69d4420ec509484959` | four ABI 1 assets (see checksums) |
 | ingat-core | `9be69c00c420abceb61218ea43fba7cb363512c2` (v0.2.0), features `sqlite-store` | git dependency in `crates/kode-memory/Cargo.toml` |
 | Kode | workspace `0.4.12` | — |
 
-### zindeks v0.10.1 FFI asset SHA-256
+### zindeks v0.10.2 FFI asset SHA-256
 
 | Target | SHA-256 |
 | --- | --- |
-| x86_64 Windows MSVC | `551ef2c2cb03a70ca367de912ac8a72ebc101a4d3a2d93cbd9b690f0ddd23b7c` |
-| x86_64 Linux GNU | `0fe903a78dc0a3bba0c3401df3b73a50f9c15e190c2154194b923ab84d31246b` |
-| aarch64 Linux GNU | `93fb4104120bb9e56d1b78fe963b6cfefef32e5e11fb45f0e1982904cf99d515` |
-| aarch64 macOS | `cbc9069e2dbd55aa2adbcfb6ac0080494ba0dba8db41f64ae37735f77e0b181a` |
+| x86_64 Windows MSVC | `eb8d84bba5981ca54900b261f3f0c93c32b13c259de063b8312860105a89f849` |
+| x86_64 Linux GNU | `7e1281d0249e1f5d0caabe42a1bcb9e0a28082b77f1e1ee265cc201f82b0d0ea` |
+| aarch64 Linux GNU | `7983af13c2903a9f5046fcaf9e0025ca567bf64a2796ae00fc1cc84a53d2652c` |
+| aarch64 macOS | `3a6c733f53710bb303bc12c1d0d641d859ea75711a3396473f21aeb4f4780085` |
 
 Each archive contains the shared library, `include/zindeks.h`,
 `NOTICE.sqlite.md` and `metadata.json` (`abi_version=1`, `sqlite=3.53.4`).
@@ -62,21 +63,16 @@ zig build ffi-test      # ok (export allowlist + C ABI smoke)
 
 ## CI gate
 
-`.github/workflows/ci.yml` job `native-engines` runs on **windows-x86_64**,
-downloads the pinned asset above, verifies its SHA-256, and runs both
-`--ignored` gates.
+`.github/workflows/ci.yml` job `native-engines` runs a matrix of
+**linux-x86_64, windows-x86_64 and macos-aarch64**, downloads the pinned v0.10.2
+asset for each, verifies its SHA-256, and runs both `--ignored` gates.
 
-**Linux asset is currently broken upstream**: the v0.10.1
-`zindeks-ffi-linux-{x86_64,aarch64}` libraries were built with Zig's default
-`*-linux` target, which links **musl** (`DT_NEEDED libc.so`). On a glibc runner
-`dlopen` fails with `.../libc.so: invalid ELF header`. The fix (build the linux
-FFI assets with the `-gnu` ABI so they need `libc.so.6`) is committed upstream
-and the gate moves to a Linux/Windows matrix once a gnu-ABI asset is published.
+The v0.10.1 linux FFI assets were musl-linked (`DT_NEEDED libc.so`) and failed
+to `dlopen` on glibc runners (`.../libc.so: invalid ELF header`); v0.10.2 builds
+the linux assets with the `-gnu` ABI (needs `libc.so.6`).
 
 ## Not yet verified (unrun manual gates)
 
-- **Linux / macOS release targets**: the linux assets need the upstream gnu-ABI
-  rebuild above; macOS aarch64 was not run here. Windows x86_64 is verified.
 - **Fresh-host install**: `kode setup` downloading + checksum-verifying the
   embedded library, then `kode index`, was not exercised end-to-end here.
 - **Two-process recovery**: concurrent writers, busy owner >5s, interrupted

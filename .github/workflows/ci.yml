@@ -36,14 +36,28 @@ jobs:
 
   # Real-engine gate: downloads the pinned zindeks asset (checksum-verified)
   # and runs the combined native-engine tests that are `#[ignore]` by default.
-  #
-  # Runs on Windows x86_64 against the released asset. The Linux assets are
-  # currently musl-linked (DT_NEEDED libc.so) and fail to dlopen on glibc
-  # runners; that is fixed upstream and will move this gate to a Linux/Windows
-  # matrix once a gnu-ABI asset is published. macOS remains a manual gate.
   native-engines:
-    name: native engines (windows-x86_64)
-    runs-on: windows-latest
+    name: native engines (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            asset: zindeks-ffi-linux-x86_64.tar.gz
+            sha: 7e1281d0249e1f5d0caabe42a1bcb9e0a28082b77f1e1ee265cc201f82b0d0ea
+            lib: libzindeks.so
+          - name: windows-x86_64
+            os: windows-latest
+            asset: zindeks-ffi-windows-x86_64.tar.gz
+            sha: eb8d84bba5981ca54900b261f3f0c93c32b13c259de063b8312860105a89f849
+            lib: zindeks.dll
+          - name: macos-aarch64
+            os: macos-latest
+            asset: zindeks-ffi-macos-aarch64.tar.gz
+            sha: 3a6c733f53710bb303bc12c1d0d641d859ea75711a3396473f21aeb4f4780085
+            lib: libzindeks.dylib
     steps:
       - uses: actions/checkout@v4
 
@@ -54,18 +68,21 @@ jobs:
       - name: Download and verify pinned zindeks asset
         shell: bash
         env:
-          ASSET: zindeks-ffi-windows-x86_64.tar.gz
-          SHA: 551ef2c2cb03a70ca367de912ac8a72ebc101a4d3a2d93cbd9b690f0ddd23b7c
+          ASSET: ${{ matrix.asset }}
+          SHA: ${{ matrix.sha }}
+          LIB: ${{ matrix.lib }}
         run: |
           set -euo pipefail
-          tmp=$(cygpath -u "$RUNNER_TEMP")
+          tmp="$RUNNER_TEMP"
+          if command -v cygpath >/dev/null 2>&1; then tmp=$(cygpath -u "$RUNNER_TEMP"); fi
           mkdir -p "$tmp/zindeks"
-          url="https://github.com/sutantodadang/zindeks/releases/download/v0.10.1/${ASSET}"
+          url="https://github.com/sutantodadang/zindeks/releases/download/v0.10.2/${ASSET}"
           curl -fsSL "$url" -o "$tmp/zindeks/${ASSET}"
           echo "${SHA}  $tmp/zindeks/${ASSET}" | sha256sum -c -
           tar -xzf "$tmp/zindeks/${ASSET}" -C "$tmp/zindeks"
-          lib=$(find "$tmp/zindeks" -name zindeks.dll | head -n1)
-          echo "KODE_ZINDEKS_DYLIB=$(cygpath -w "$lib")" >> "$GITHUB_ENV"
+          lib=$(find "$tmp/zindeks" -name "$LIB" | head -n1)
+          if command -v cygpath >/dev/null 2>&1; then lib=$(cygpath -w "$lib"); fi
+          echo "KODE_ZINDEKS_DYLIB=$lib" >> "$GITHUB_ENV"
 
       - name: Embedded zindeks real-engine gate
         run: cargo test -p kode-intel --test embedded_real -- --ignored
