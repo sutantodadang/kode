@@ -60,11 +60,23 @@ zig build test          # ok (accuracy scorecard 1.00)
 zig build ffi-test      # ok (export allowlist + C ABI smoke)
 ```
 
+## CI gate
+
+`.github/workflows/ci.yml` job `native-engines` runs on **windows-x86_64**,
+downloads the pinned asset above, verifies its SHA-256, and runs both
+`--ignored` gates.
+
+**Linux asset is currently broken upstream**: the v0.10.1
+`zindeks-ffi-linux-{x86_64,aarch64}` libraries were built with Zig's default
+`*-linux` target, which links **musl** (`DT_NEEDED libc.so`). On a glibc runner
+`dlopen` fails with `.../libc.so: invalid ELF header`. The fix (build the linux
+FFI assets with the `-gnu` ABI so they need `libc.so.6`) is committed upstream
+and the gate moves to a Linux/Windows matrix once a gnu-ABI asset is published.
+
 ## Not yet verified (unrun manual gates)
 
-- **Four release targets**: only Windows x86_64 was executed here. Linux
-  x86_64/aarch64 and macOS aarch64 assets are published with checksums but were
-  not run on those platforms in this session.
+- **Linux / macOS release targets**: the linux assets need the upstream gnu-ABI
+  rebuild above; macOS aarch64 was not run here. Windows x86_64 is verified.
 - **Fresh-host install**: `kode setup` downloading + checksum-verifying the
   embedded library, then `kode index`, was not exercised end-to-end here.
 - **Two-process recovery**: concurrent writers, busy owner >5s, interrupted

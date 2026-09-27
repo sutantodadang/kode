@@ -36,11 +36,14 @@ jobs:
 
   # Real-engine gate: downloads the pinned zindeks asset (checksum-verified)
   # and runs the combined native-engine tests that are `#[ignore]` by default.
-  # Only linux-x86_64 is automated here; the Windows/macOS assets are the same
-  # published artifacts and remain a manual release gate.
+  #
+  # Runs on Windows x86_64 against the released asset. The Linux assets are
+  # currently musl-linked (DT_NEEDED libc.so) and fail to dlopen on glibc
+  # runners; that is fixed upstream and will move this gate to a Linux/Windows
+  # matrix once a gnu-ABI asset is published. macOS remains a manual gate.
   native-engines:
-    name: native engines (linux-x86_64)
-    runs-on: ubuntu-latest
+    name: native engines (windows-x86_64)
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -49,9 +52,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Download and verify pinned zindeks asset
+        shell: bash
         env:
-          ASSET: zindeks-ffi-linux-x86_64.tar.gz
-          SHA: 0fe903a78dc0a3bba0c3401df3b73a50f9c15e190c2154194b923ab84d31246b
+          ASSET: zindeks-ffi-windows-x86_64.tar.gz
+          SHA: 551ef2c2cb03a70ca367de912ac8a72ebc101a4d3a2d93cbd9b690f0ddd23b7c
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/zindeks"
@@ -59,7 +63,7 @@ jobs:
           curl -fsSL "$url" -o "$RUNNER_TEMP/zindeks/${ASSET}"
           echo "${SHA}  $RUNNER_TEMP/zindeks/${ASSET}" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/zindeks/${ASSET}" -C "$RUNNER_TEMP/zindeks"
-          lib=$(find "$RUNNER_TEMP/zindeks" -name libzindeks.so | head -n1)
+          lib=$(find "$RUNNER_TEMP/zindeks" -name zindeks.dll | head -n1)
           echo "KODE_ZINDEKS_DYLIB=${lib}" >> "$GITHUB_ENV"
 
       - name: Embedded zindeks real-engine gate
