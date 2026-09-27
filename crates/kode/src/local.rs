@@ -12,7 +12,7 @@ use kode_local::laya::{LayaModel, LayaRouter, shared_laya};
 use kode_local::manifest::{ModelChoice, choose};
 use kode_local::models::{LAYA_DIR, LocalPaths, RERANKER_DIR, installed_runtime, verify_model_dir};
 use kode_local::pins::{MODEL_FILES, MODELS_REVISION, ORT_VERSION};
-use kode_local::rerank::{QwenReranker, shared_reranker};
+use kode_local::rerank::shared_reranker;
 use kode_local::route::{StaticRouter, TaskRouter, questions_version};
 
 /// ponytail: CPU reranks only the first 10 candidates; the rest sort last.
@@ -95,31 +95,15 @@ pub async fn load(cfg: &RouterConfig, root: &Path) -> LocalStack {
         label,
     });
 
-    let reranker = if cfg.rerank {
-        match verify_model_dir(&paths, MODELS_REVISION, MODEL_FILES, RERANKER_DIR) {
-            Ok(dir) => match tokio::task::spawn_blocking(move || shared_reranker(&dir, pref)).await
-            {
-                Ok(Ok(model)) => Some(Arc::new(LocalReranker {
-                    model,
-                    allow_cpu: cfg.rerank_on_cpu,
-                }) as Arc<dyn ContextReranker>),
-                Ok(Err(e)) => {
-                    notes.push(format!("reranker unavailable: {}", reason_of(&e)));
-                    None
-                }
-                Err(e) => {
-                    notes.push(format!("reranker unavailable: load task failed: {e}"));
-                    None
-                }
-            },
-            Err(e) => {
-                notes.push(format!("reranker unavailable: {}", reason_of(&e)));
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // Model verification/loading belongs inside the context rerank timeout,
+    // rather than delaying every route before context candidates exist.
+    let reranker = cfg.rerank.then(|| {
+        Arc::new(LocalReranker {
+            paths: Arc::new(paths),
+            pref,
+            allow_cpu: cfg.rerank_on_cpu,
+        }) as Arc<dyn ContextReranker>
+    });
 
     LocalStack {
         router,
@@ -143,35 +127,125 @@ async fn load_pinned(paths: &LocalPaths) -> Result<Arc<LayaModel>, String> {
 }
 
 pub struct LocalReranker {
-    model: Arc<QwenReranker>,
+    paths: Arc<LocalPaths>,
+    pref: DevicePref,
     allow_cpu: bool,
 }
 
 #[async_trait::async_trait]
 impl ContextReranker for LocalReranker {
     async fn rerank(&self, query: &str, docs: &[String]) -> RerankOutcome {
-        let gpu = self.model.device().is_gpu();
-        if !gpu && !self.allow_cpu {
+        if self.pref == DevicePref::Cpu && !self.allow_cpu {
             return RerankOutcome::Skipped(
                 "no gpu (set router.rerank_on_cpu = true to rerank on cpu)".to_string(),
             );
         }
-        let limit = if gpu {
-            docs.len()
-        } else {
-            docs.len().min(CPU_RERANK_CAP)
-        };
-        let model = self.model.clone();
+        if docs.is_empty() {
+            return RerankOutcome::Scored(Vec::new());
+        }
+        let paths = self.paths.clone();
+        let pref = self.pref;
+        let allow_cpu = self.allow_cpu;
         let query = query.to_string();
-        let head: Vec<String> = docs[..limit].to_vec();
-        let total = docs.len();
-        match tokio::task::spawn_blocking(move || model.score_all(&query, &head)).await {
-            Ok(Ok(mut scores)) => {
-                scores.resize(total, f32::NEG_INFINITY);
-                RerankOutcome::Scored(scores)
-            }
-            Ok(Err(e)) => RerankOutcome::Failed(e.to_string()),
+        let docs = docs.to_vec();
+        match tokio::task::spawn_blocking(move || {
+            let run = || {
+                let dir = verify_model_dir(&paths, MODELS_REVISION, MODEL_FILES, RERANKER_DIR)?;
+                let model = shared_reranker(&dir, pref)?;
+                let gpu = model.device().is_gpu();
+                if !gpu && !allow_cpu {
+                    return Ok(RerankOutcome::Skipped(
+                        "no gpu (set router.rerank_on_cpu = true to rerank on cpu)".to_string(),
+                    ));
+                }
+                let limit = if gpu {
+                    docs.len()
+                } else {
+                    docs.len().min(CPU_RERANK_CAP)
+                };
+                let mut scores = model.score_all(&query, &docs[..limit])?;
+                scores.resize(docs.len(), f32::NEG_INFINITY);
+                Ok::<_, LocalError>(RerankOutcome::Scored(scores))
+            };
+            run().unwrap_or_else(|e| RerankOutcome::Failed(reason_of(&e)))
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
             Err(e) => RerankOutcome::Failed(format!("rerank task failed: {e}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "manual cold/warm route measurement; requires installed local models"]
+    async fn local_stack_latency() {
+        use kode_local::route::RouteInput;
+        let cfg = RouterConfig {
+            device: "cpu".to_string(),
+            min_confidence: 0.0,
+            ..Default::default()
+        };
+        let root = std::env::temp_dir();
+        let started = std::time::Instant::now();
+        let stack = load(&cfg, &root).await;
+        println!("cold local stack: {}ms", started.elapsed().as_millis());
+        let input = RouteInput {
+            task: "explain the answer function".to_string(),
+            project: "rust".to_string(),
+            changed_files: 0,
+        };
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let warm = load(&cfg, &root).await;
+            let route = warm.router.route(&input).await;
+            assert!(
+                route
+                    .answers
+                    .iter()
+                    .all(|a| a.source == kode_core::event::RouteSource::Laya)
+            );
+            println!(
+                "warm local stack + route: {}ms",
+                started.elapsed().as_millis()
+            );
+        }
+        assert!(stack.reranker.is_some());
+    }
+
+    #[tokio::test]
+    async fn disabled_cpu_rerank_skips_without_loading_missing_models() {
+        let reranker = LocalReranker {
+            paths: Arc::new(LocalPaths {
+                root: std::path::PathBuf::from("missing-qa-models"),
+            }),
+            pref: DevicePref::Cpu,
+            allow_cpu: false,
+        };
+        assert!(
+            matches!(reranker.rerank("query", &["doc".to_string()]).await,
+            RerankOutcome::Skipped(reason) if reason.contains("no gpu"))
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_candidates_do_not_load_missing_models() {
+        let reranker = LocalReranker {
+            paths: Arc::new(LocalPaths {
+                root: std::path::PathBuf::from("missing-qa-models"),
+            }),
+            pref: DevicePref::Cpu,
+            allow_cpu: true,
+        };
+        assert!(matches!(reranker.rerank("query", &[]).await,
+            RerankOutcome::Scored(scores) if scores.is_empty()));
+        assert!(matches!(
+            reranker.rerank("query", &["doc".to_string()]).await,
+            RerankOutcome::Failed(_)
+        ));
     }
 }

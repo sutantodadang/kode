@@ -350,6 +350,7 @@ pub struct PickerLoaded {
 /// it can be unit tested directly.
 pub struct AppState {
     pub transcript: Vec<TranscriptLine>,
+    pub transcript_cache: super::draw::TranscriptCache,
     pub current_stream: String,
     pub status: StatusInfo,
     pub running: bool,
@@ -501,6 +502,7 @@ impl AppState {
     pub fn new(provider: String, model: String, effort: String) -> Self {
         Self {
             transcript: Vec::new(),
+            transcript_cache: Default::default(),
             current_stream: String::new(),
             status: StatusInfo::new(provider, model, effort),
             running: false,
