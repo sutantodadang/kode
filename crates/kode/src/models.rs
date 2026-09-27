@@ -10,8 +10,12 @@ pub async fn run(cwd: &Path) -> anyhow::Result<()> {
     let provider = config.model.provider.clone();
     let current = config.model.model.clone();
 
-    match catalog::list_models(&provider, None).await {
-        Ok(models) => {
+    match catalog::list_catalog(&provider, None).await {
+        Ok(catalog) => {
+            if let Some(note) = catalog.note {
+                println!("({note})");
+            }
+            let models = catalog.models;
             if models.is_empty() {
                 println!("(no models found for provider '{provider}')");
             } else {
