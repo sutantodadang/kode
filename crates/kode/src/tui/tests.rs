@@ -1833,6 +1833,62 @@ async fn handle_slash_command_provider_valid_persists_clears_model_and_opens_pic
 
 // -- verify step events ------------------------------------------------
 
+#[tokio::test]
+async fn reselecting_provider_refetches_and_ignores_previous_catalog() {
+    let dir = temp_project_dir();
+    let mut s = state();
+    let mut cfg = KodeConfig::default();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    apply_provider_selection(&mut s, &dir, &mut cfg, &tx, "codex");
+    let previous = s.picker.request_id;
+    s.picker.items = vec!["old model".into()];
+    apply_provider_selection(&mut s, &dir, &mut cfg, &tx, "codex");
+    let current = s.picker.request_id;
+    assert_ne!(previous, current);
+    assert!(s.picker.items.is_empty());
+    apply_picker_loaded(
+        &mut s,
+        PickerLoaded {
+            request_id: current,
+            items: vec!["gpt-6-sol".into()],
+            note: Some("fallback warning".into()),
+        },
+    );
+    apply_picker_loaded(
+        &mut s,
+        PickerLoaded {
+            request_id: previous,
+            items: vec!["stale".into()],
+            note: None,
+        },
+    );
+    assert_eq!(s.picker.items, ["gpt-6-sol"]);
+    assert_eq!(s.picker.note.as_deref(), Some("fallback warning"));
+    open_provider_picker(&mut s);
+    let providers = s.picker.items.clone();
+    apply_picker_loaded(
+        &mut s,
+        PickerLoaded {
+            request_id: current,
+            items: vec!["late".into()],
+            note: None,
+        },
+    );
+    assert_eq!(s.picker.items, providers);
+    s.picker.kind = PickerKind::Model;
+    s.picker.open = false;
+    let request_id = s.picker.request_id;
+    apply_picker_loaded(
+        &mut s,
+        PickerLoaded {
+            request_id,
+            items: vec!["closed".into()],
+            note: None,
+        },
+    );
+    assert_eq!(s.picker.items, providers);
+}
+
 #[test]
 fn verify_step_passed_pushes_verify_gutter_with_check() {
     let mut s = state();

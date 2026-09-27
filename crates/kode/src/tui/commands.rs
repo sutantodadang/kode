@@ -374,6 +374,8 @@ pub(crate) fn open_picker(
     provider: String,
     tx: &mpsc::UnboundedSender<PickerLoaded>,
 ) {
+    state.picker.request_id = state.picker.request_id.wrapping_add(1);
+    let request_id = state.picker.request_id;
     state.picker.open = true;
     state.picker.kind = PickerKind::Model;
     state.picker.filter.clear();
@@ -383,21 +385,38 @@ pub(crate) fn open_picker(
 
     let tx = tx.clone();
     tokio::spawn(async move {
-        let msg = match kode_model::catalog::list_models(&provider, None).await {
-            Ok(items) => PickerLoaded { items, error: None },
+        let msg = match kode_model::catalog::list_catalog(&provider, None).await {
+            Ok(catalog) => PickerLoaded {
+                request_id,
+                items: catalog.models,
+                note: catalog.note,
+            },
             Err(e) => PickerLoaded {
+                request_id,
                 items: vec![],
-                error: Some(e),
+                note: Some(e),
             },
         };
         let _ = tx.send(msg);
     });
 }
 
+pub(crate) fn apply_picker_loaded(state: &mut AppState, loaded: PickerLoaded) {
+    if state.picker.open
+        && state.picker.kind == PickerKind::Model
+        && state.picker.request_id == loaded.request_id
+    {
+        state.picker.items = loaded.items;
+        state.picker.note = loaded.note;
+        state.picker.selected = 0;
+    }
+}
+
 /// Opens the `/provider` picker: a static list of [`VALID_PROVIDERS`], each
 /// annotated with its auth state via [`provider_auth_state`]. Synchronous —
 /// no catalog fetch, just local disk/env reads.
 pub(crate) fn open_provider_picker(state: &mut AppState) {
+    state.picker.request_id = state.picker.request_id.wrapping_add(1);
     state.picker.open = true;
     state.picker.kind = PickerKind::Provider;
     state.picker.filter.clear();
@@ -534,6 +553,7 @@ pub(crate) fn handle_slash_command(
                     .push(TranscriptLine::new(Gutter::Note, "no sessions to resume"));
             } else {
                 state.picker = PickerState {
+                    request_id: state.picker.request_id.wrapping_add(1),
                     open: true,
                     kind: PickerKind::Session,
                     items: metas

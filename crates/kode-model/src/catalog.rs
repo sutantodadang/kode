@@ -20,8 +20,7 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 static CONTEXT_WINDOW_CACHE: OnceLock<Mutex<HashMap<(String, String), u32>>> = OnceLock::new();
 
-/// Static candidates used when no Anthropic API key is available (OAuth-only
-/// auth) or the live `/v1/models` fetch fails.
+/// Last-resort candidates when both the account and public catalogs fail.
 const ANTHROPIC_FALLBACK_MODELS: &[&str] = &[
     "claude-fable-5",
     "claude-opus-5",
@@ -43,16 +42,43 @@ const ANTIGRAVITY_FALLBACK_MODELS: &[&str] = &[
 /// models. The ChatGPT backend filters its response by this value — an
 /// outdated version can silently return an empty model list — so this needs
 /// occasional bumping to track the current Codex CLI release.
-const CODEX_CLIENT_VERSION: &str = "0.150.0";
+const CODEX_CLIENT_VERSION: &str = "0.155.0";
 
 /// Static candidates used when the live codex model fetch fails or returns
 /// nothing usable (no auth, network error, parse error, empty list).
 const CODEX_FALLBACK_MODELS: &[&str] = &[
+    "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
     "gpt-5.6-sol",
-    "gpt-5.6-codex",
-    "gpt-5.5-codex",
-    "codex-mini-latest",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
 ];
+
+#[derive(Debug)]
+pub struct ModelCatalog {
+    pub models: Vec<String>,
+    /// Explains fallback data; live account catalogs have no warning.
+    pub note: Option<String>,
+}
+
+fn catalog_or_fallback(
+    result: Result<Vec<String>, String>,
+    fallback: &[&str],
+    label: &str,
+) -> ModelCatalog {
+    match result {
+        Ok(models) => ModelCatalog { models, note: None },
+        Err(error) => {
+            tracing::debug!(%error, "using fallback model catalog");
+            ModelCatalog {
+                models: fallback.iter().map(|id| (*id).to_string()).collect(),
+                note: Some(label.to_string()),
+            }
+        }
+    }
+}
 
 /// Lists candidate model ids for `provider`. `api_key_env`, when given,
 /// names an environment variable to read the API key from (used for the
@@ -61,29 +87,51 @@ pub async fn list_models(
     provider: &str,
     api_key_env: Option<String>,
 ) -> Result<Vec<String>, String> {
+    list_catalog(provider, api_key_env)
+        .await
+        .map(|catalog| catalog.models)
+}
+
+/// Always fetches again, including when the same provider is reselected.
+pub async fn list_catalog(
+    provider: &str,
+    api_key_env: Option<String>,
+) -> Result<ModelCatalog, String> {
     match provider {
-        "codex" => Ok(fetch_codex_models().await.unwrap_or_else(|_| {
-            CODEX_FALLBACK_MODELS
-                .iter()
-                .map(|s| s.to_string())
-                .collect()
-        })),
-        "opencode-go" | "opencode" | "kilo" => fetch_models_dev(provider).await,
-        "lmstudio" => fetch_lmstudio().await,
-        "openai" => fetch_openai(api_key_env).await,
-        "anthropic" => Ok(fetch_anthropic_models().await.unwrap_or_else(|_| {
-            ANTHROPIC_FALLBACK_MODELS
-                .iter()
-                .map(|s| s.to_string())
-                .collect()
-        })),
-        "antigravity" => Ok(fetch_antigravity_models().await.unwrap_or_else(|_| {
-            ANTIGRAVITY_FALLBACK_MODELS
-                .iter()
-                .map(|s| s.to_string())
-                .collect()
-        })),
-        other => Err(format!("no model catalog for provider '{other}'")),
+        "codex" => Ok(catalog_or_fallback(
+            fetch_codex_models().await,
+            CODEX_FALLBACK_MODELS,
+            "static fallback; account availability unverified",
+        )),
+        "anthropic" => match fetch_anthropic_models().await {
+            Ok(models) => Ok(ModelCatalog { models, note: None }),
+            Err(error) => {
+                tracing::debug!(%error, "Anthropic account catalog unavailable");
+                let mut catalog = catalog_or_fallback(
+                    fetch_models_dev("anthropic").await,
+                    ANTHROPIC_FALLBACK_MODELS,
+                    "static fallback; account availability unverified",
+                );
+                if catalog.note.is_none() {
+                    catalog.note = Some("public catalog; account availability unverified".into());
+                }
+                Ok(catalog)
+            }
+        },
+        "antigravity" => Ok(catalog_or_fallback(
+            fetch_antigravity_models().await,
+            ANTIGRAVITY_FALLBACK_MODELS,
+            "static fallback; account availability unverified",
+        )),
+        other => {
+            let models = match other {
+                "opencode-go" | "opencode" | "kilo" => fetch_models_dev(other).await,
+                "lmstudio" => fetch_lmstudio().await,
+                "openai" => fetch_openai(api_key_env).await,
+                _ => Err(format!("no model catalog for provider '{other}'")),
+            }?;
+            Ok(ModelCatalog { models, note: None })
+        }
     }
 }
 
@@ -133,10 +181,6 @@ fn inferred_context_window(model: &str) -> Option<u32> {
     }
 }
 
-/// Resolves an Anthropic API key: `ANTHROPIC_API_KEY` from the environment,
-/// else an `"api"`-type key from Kode's own anthropic auth store. Returns
-/// `None` for OAuth-only auth (or no auth at all) — callers fall back to
-/// [`ANTHROPIC_FALLBACK_MODELS`] in that case.
 /// Fetches the live Antigravity model list using the stored OAuth token.
 /// Errors when not logged in or the call fails; callers fall back to
 /// [`ANTIGRAVITY_FALLBACK_MODELS`].
@@ -155,47 +199,75 @@ async fn fetch_antigravity_models() -> Result<Vec<String>, String> {
         .map_err(|e| e.to_string())
 }
 
-fn anthropic_api_key() -> Option<String> {
-    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY")
-        && !key.is_empty()
-    {
-        return Some(key);
-    }
-    let path = crate::anthropic::default_auth_path()?;
-    let content = std::fs::read_to_string(&path).ok()?;
-    let value: Value = serde_json::from_str(&content).ok()?;
-    if value.get("type").and_then(|t| t.as_str()) != Some("api") {
-        return None;
-    }
-    value
-        .get("key")
-        .and_then(|k| k.as_str())
-        .map(|s| s.to_string())
+/// Tries the account catalog with the same auth as inference. If the account
+/// cannot access this endpoint, the caller labels its public/static fallback.
+async fn fetch_anthropic_models() -> Result<Vec<String>, String> {
+    let path = crate::anthropic::default_auth_path()
+        .ok_or_else(|| "no anthropic auth path".to_string())?;
+    let client = reqwest::Client::builder()
+        .timeout(FETCH_TIMEOUT)
+        .build()
+        .map_err(|e| e.to_string())?;
+    tokio::time::timeout(FETCH_TIMEOUT, async {
+        let auth = crate::anthropic::load_fresh(&client, &path)
+            .await
+            .map_err(|e| e.to_string())?;
+        fetch_anthropic_pages(&client, ANTHROPIC_MODELS_URL, &auth).await
+    })
+    .await
+    .map_err(|_| "anthropic models fetch timed out".to_string())?
 }
 
-/// Fetches the live Anthropic model list from `GET /v1/models`. Requires an
-/// API key (env or Kode's own auth store) — OAuth-only auth has no
-/// equivalent endpoint, so callers fall back to
-/// [`ANTHROPIC_FALLBACK_MODELS`] when this errors.
-async fn fetch_anthropic_models() -> Result<Vec<String>, String> {
-    let key = anthropic_api_key().ok_or_else(|| "no anthropic api key found".to_string())?;
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(ANTHROPIC_MODELS_URL)
-        .header("x-api-key", key)
-        .header("anthropic-version", ANTHROPIC_VERSION)
-        .timeout(FETCH_TIMEOUT)
-        .send()
-        .await
-        .map_err(|e| format!("anthropic models fetch failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("anthropic models returned {}", resp.status()));
+async fn fetch_anthropic_pages(
+    client: &reqwest::Client,
+    url: &str,
+    auth: &crate::anthropic::AnthropicAuth,
+) -> Result<Vec<String>, String> {
+    let mut ids = Vec::new();
+    let mut seen_ids = BTreeSet::new();
+    let mut cursors = BTreeSet::new();
+    let mut after = None;
+    loop {
+        let mut request = client
+            .get(url)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .query(&[("limit", "1000")]);
+        for (name, value) in crate::anthropic::auth_headers(auth) {
+            request = request.header(name, value);
+        }
+        if let Some(cursor) = &after {
+            request = request.query(&[("after_id", cursor)]);
+        }
+        let resp = request
+            .send()
+            .await
+            .map_err(|e| format!("anthropic models fetch failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("anthropic models returned {}", resp.status()));
+        }
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| format!("anthropic models read failed: {e}"))?;
+        for id in parse_anthropic_models(&text)? {
+            if seen_ids.insert(id.clone()) {
+                ids.push(id);
+            }
+        }
+        let page: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        if page.get("has_more").and_then(Value::as_bool) != Some(true) {
+            break;
+        }
+        let cursor = page
+            .get("last_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| "anthropic pagination missing last_id".to_string())?;
+        if !cursors.insert(cursor.to_string()) {
+            return Err("anthropic pagination repeated cursor".to_string());
+        }
+        after = Some(cursor.to_string());
     }
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| format!("anthropic models read failed: {e}"))?;
-    let ids = parse_anthropic_models(&text)?;
     if ids.is_empty() {
         return Err("anthropic models list empty".to_string());
     }
@@ -243,10 +315,17 @@ async fn fetch_codex_models_json() -> Result<String, String> {
         .await
         .map_err(|e| e.to_string())?;
 
-    let url = format!("{CODEX_MODELS_URL}?client_version={CODEX_CLIENT_VERSION}");
+    fetch_codex_models_json_at(CODEX_MODELS_URL, &auth).await
+}
+
+async fn fetch_codex_models_json_at(
+    url: &str,
+    auth: &crate::codex::CodexAuth,
+) -> Result<String, String> {
     let client = reqwest::Client::new();
     let resp = client
-        .get(&url)
+        .get(url)
+        .query(&[("client_version", CODEX_CLIENT_VERSION)])
         .bearer_auth(&auth.access_token)
         .header("chatgpt-account-id", &auth.account_id)
         .header("originator", "codex_cli_rs")
@@ -442,14 +521,143 @@ fn parse_openai_models(json: &str) -> Result<Vec<String>, String> {
 mod tests {
     use super::*;
 
+    async fn serve_pages(
+        pages: Vec<&'static str>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/models", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for page in pages {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0 && request.len() < 8192);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                requests.push(String::from_utf8(request).unwrap());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+                    page.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (url, task)
+    }
+
     #[tokio::test]
+    async fn codex_request_uses_current_version_and_account_auth() {
+        let (url, server) = serve_pages(vec![r#"{"models":[{"slug":"gpt-6-sol"}]}"#]).await;
+        let auth = crate::codex::CodexAuth {
+            access_token: "test-token".into(),
+            refresh_token: String::new(),
+            account_id: "test-account".into(),
+            last_refresh: String::new(),
+            api_key: None,
+            auth_mode: "chatgpt".into(),
+        };
+        let json = fetch_codex_models_json_at(&url, &auth).await.unwrap();
+        assert_eq!(parse_codex_models(&json).unwrap(), ["gpt-6-sol"]);
+        let requests = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let request = requests[0].to_ascii_lowercase();
+        assert!(request.contains("client_version=0.155.0"));
+        assert!(request.contains("authorization: bearer test-token"));
+        assert!(request.contains("chatgpt-account-id: test-account"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_catalog_paginates_with_api_key_and_oauth() {
+        use crate::anthropic::AnthropicAuth;
+        for auth in [
+            AnthropicAuth::ApiKey("test-key".into()),
+            AnthropicAuth::OAuth {
+                access_token: "test-token".into(),
+                refresh_token: String::new(),
+                expires_at: u64::MAX,
+            },
+        ] {
+            let (url, server) = serve_pages(vec![
+                r#"{"data":[{"id":"newest"}],"has_more":true,"last_id":"newest"}"#,
+                r#"{"data":[{"id":"newest"},{"id":"older"}],"has_more":false}"#,
+            ])
+            .await;
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap();
+            let ids = fetch_anthropic_pages(&client, &url, &auth).await.unwrap();
+            assert_eq!(ids, ["newest", "older"]);
+            let requests = tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!requests[0].contains("after_id"));
+            assert!(requests[1].contains("after_id=newest"));
+            for request in requests {
+                let request = request.to_ascii_lowercase();
+                assert!(request.contains("limit=1000"));
+                assert!(request.contains("anthropic-version: 2023-06-01"));
+                match &auth {
+                    AnthropicAuth::ApiKey(_) => assert!(request.contains("x-api-key: test-key")),
+                    AnthropicAuth::OAuth { .. } => {
+                        assert!(request.contains("authorization: bearer test-token"));
+                        assert!(request.contains("anthropic-beta: oauth-2025-04-20"));
+                        assert!(!request.contains("x-api-key"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_catalog_rejects_repeated_pagination_cursor() {
+        let page = r#"{"data":[{"id":"one"}],"has_more":true,"last_id":"one"}"#;
+        let (url, server) = serve_pages(vec![page, page]).await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let err = fetch_anthropic_pages(
+            &client,
+            &url,
+            &crate::anthropic::AnthropicAuth::ApiKey("test".into()),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("repeated cursor"));
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn codex_catalog_advertises_gpt6_capable_client() {
+        assert_eq!(CODEX_CLIENT_VERSION, "0.155.0");
+        assert!(CODEX_FALLBACK_MODELS.contains(&"gpt-6-sol"));
+    }
+
+    #[test]
+    fn failed_catalog_is_explicitly_marked_as_fallback() {
+        let catalog = catalog_or_fallback(Err("offline".into()), &["candidate"], "static fallback");
+        assert_eq!(catalog.models, ["candidate"]);
+        assert_eq!(catalog.note.as_deref(), Some("static fallback"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Codex account; run explicitly for catalog QA"]
     async fn list_models_codex_returns_nonempty_list() {
-        // May hit the live codex backend if this machine has codex auth
-        // configured, or fall back to CODEX_FALLBACK_MODELS otherwise —
-        // "gpt-5.6-sol" is present in both, so it's a safe assertion either
-        // way. `list_models` never errors for "codex".
-        let ids = list_models("codex", None).await.unwrap();
-        assert!(ids.contains(&"gpt-5.6-sol".to_string()));
+        let catalog = list_catalog("codex", None).await.unwrap();
+        assert!(catalog.note.is_none(), "{:?}", catalog.note);
+        assert!(!catalog.models.is_empty());
     }
 
     #[test]
@@ -459,7 +667,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert!(ids.contains(&"gpt-5.6-sol".to_string()));
-        assert!(ids.contains(&"codex-mini-latest".to_string()));
+        assert!(ids.contains(&"gpt-6-sol".to_string()));
     }
 
     #[tokio::test]
@@ -588,21 +796,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires network or local Anthropic credentials; run explicitly for catalog QA"]
     async fn list_models_anthropic_falls_back_without_key() {
-        {
-            let _guard = crate::test_support::ENV_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            // SAFETY: test-only; ensures a clean slate for this assertion,
-            // serialized via ENV_LOCK. Released before the `.await` below —
-            // clippy (rightly) flags a std Mutex guard held across an await.
-            unsafe {
-                std::env::remove_var("ANTHROPIC_API_KEY");
-            }
-        }
         let ids = list_models("anthropic", None).await.unwrap();
-        // Never errors for "anthropic" — falls back to the static list when
-        // no key/network is available.
         assert!(!ids.is_empty());
     }
 }

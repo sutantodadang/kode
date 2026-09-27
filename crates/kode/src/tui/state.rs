@@ -330,6 +330,7 @@ pub enum PickerKind {
 /// carries a status line (loading / error) shown above the list.
 #[derive(Debug, Clone, Default)]
 pub struct PickerState {
+    pub request_id: u64,
     pub open: bool,
     pub kind: PickerKind,
     pub filter: String,
@@ -342,8 +343,9 @@ pub struct PickerState {
 /// over an internal channel (the fetch itself runs off the UI task).
 #[derive(Debug, Clone)]
 pub struct PickerLoaded {
+    pub request_id: u64,
     pub items: Vec<String>,
-    pub error: Option<String>,
+    pub note: Option<String>,
 }
 
 /// Pure UI state, driven by `apply_event`. Kept free of any terminal I/O so

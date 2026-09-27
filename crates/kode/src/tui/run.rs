@@ -779,9 +779,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
 
             loaded = picker_rx.recv() => {
                 if let Some(loaded) = loaded {
-                    state.picker.items = loaded.items;
-                    state.picker.note = loaded.error;
-                    state.picker.selected = 0;
+                    apply_picker_loaded(&mut state, loaded);
                 }
             }
 

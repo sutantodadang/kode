@@ -567,10 +567,15 @@ async fn login_opencode_key(provider: &str) -> anyhow::Result<()> {
 /// never fails the (already-successful) login.
 async fn print_available_models(provider: &str) {
     println!("available models:");
-    match kode_model::catalog::list_models(provider, None).await {
-        Ok(models) if models.is_empty() => println!("  (none found)"),
-        Ok(models) => {
-            for line in render_model_lines(&models) {
+    match kode_model::catalog::list_catalog(provider, None).await {
+        Ok(catalog) => {
+            if let Some(note) = catalog.note {
+                println!("  ({note})");
+            }
+            if catalog.models.is_empty() {
+                println!("  (none found)");
+            }
+            for line in render_model_lines(&catalog.models) {
                 println!("{line}");
             }
         }

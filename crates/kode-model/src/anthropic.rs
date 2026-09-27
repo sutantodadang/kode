@@ -272,7 +272,7 @@ fn needs_refresh(expires_at: u64, now: u64) -> bool {
 /// Header name/value pairs to attach for a given auth mode. API-key auth
 /// sends `x-api-key`; OAuth sends a bearer token plus the
 /// `anthropic-beta: oauth-2025-04-20` header (and must NOT send `x-api-key`).
-fn auth_headers(auth: &AnthropicAuth) -> Vec<(&'static str, String)> {
+pub(crate) fn auth_headers(auth: &AnthropicAuth) -> Vec<(&'static str, String)> {
     match auth {
         AnthropicAuth::ApiKey(key) => vec![("x-api-key", key.clone())],
         AnthropicAuth::OAuth { access_token, .. } => vec![
@@ -280,6 +280,16 @@ fn auth_headers(auth: &AnthropicAuth) -> Vec<(&'static str, String)> {
             ("anthropic-beta", "oauth-2025-04-20".to_string()),
         ],
     }
+}
+
+pub(crate) async fn load_fresh(client: &reqwest::Client, path: &Path) -> Result<AnthropicAuth> {
+    let mut auth = load(path)?;
+    if let AnthropicAuth::OAuth { expires_at, .. } = &auth
+        && needs_refresh(*expires_at, now_secs())
+    {
+        refresh_tokens(client, path, &mut auth).await?;
+    }
+    Ok(auth)
 }
 
 #[derive(Debug)]
