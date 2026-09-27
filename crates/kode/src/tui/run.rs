@@ -22,7 +22,6 @@ use kode_context::git::RepoState;
 use kode_core::config::{KodeConfig, PermissionMode};
 use kode_core::event::{EventBus, KodeEvent};
 use kode_core::{CancellationToken, UserInput};
-use kode_memory::EngineeringMemory;
 use kode_tools::permission::PermissionHandler;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -463,18 +462,16 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
     state.ingat_enabled = config.ingat.enabled;
     state.reduced_motion = config.ui.reduced_motion;
 
-    if config.ingat.enabled {
-        let adapter = kode_memory::IngatAdapter::new(&config.ingat);
-        if tokio::time::timeout(Duration::from_secs(3), adapter.health())
+    if let Ok(Some(adapter)) = crate::memory_backend::connect(&config.ingat).await
+        && tokio::time::timeout(Duration::from_secs(3), adapter.health())
             .await
             .is_ok_and(|r| r.is_ok())
-        {
-            let summary = team_memory::import_on_start(&adapter, cwd).await;
-            if let Some(text) = summary.note() {
-                state
-                    .transcript
-                    .push(TranscriptLine::new(Gutter::Ingat, text));
-            }
+    {
+        let summary = team_memory::import_on_start(adapter.as_ref(), cwd).await;
+        if let Some(text) = summary.note() {
+            state
+                .transcript
+                .push(TranscriptLine::new(Gutter::Ingat, text));
         }
     }
 

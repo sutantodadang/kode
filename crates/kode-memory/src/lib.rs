@@ -1,13 +1,18 @@
+pub mod embedded;
 pub mod error;
-pub mod ingat;
+pub mod mapping;
 pub mod mock;
 pub mod policy;
 pub mod tool;
 pub mod types;
 pub mod wire;
 
+pub use embedded::EmbeddedIngat;
 pub use error::{MemoryError, Result};
-pub use ingat::IngatAdapter;
+/// Re-exported so the `kode memory import` CLI can parse an `ingat_export`
+/// JSONL file and hand records to [`EmbeddedIngat::import_record`].
+pub use ingat_core::application::dtos::LegacyExportLine;
+pub use ingat_core::domain::ContextRecord;
 pub use mock::MockEngineeringMemory;
 pub use tool::{MemorySearchTool, RememberTool};
 pub use types::{Memory, MemoryContext, MemoryKind, MemoryQuery, NewMemory, Provenance};

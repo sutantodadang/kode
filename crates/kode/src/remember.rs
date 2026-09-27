@@ -2,9 +2,7 @@ use std::path::Path;
 
 use kode_core::config::KodeConfig;
 use kode_memory::wire::WireEntry;
-use kode_memory::{
-    EngineeringMemory, IngatAdapter, MemoryContext, MemoryKind, NewMemory, Provenance,
-};
+use kode_memory::{MemoryContext, MemoryKind, NewMemory, Provenance};
 
 use crate::team_memory;
 
@@ -49,8 +47,12 @@ pub async fn run(
         team,
     };
 
-    let adapter = IngatAdapter::new(&config.ingat);
-    match adapter.remember(&memory).await {
+    let backend = match crate::memory_backend::connect(&config.ingat).await? {
+        Some(backend) => backend,
+        None => anyhow::bail!("memory is disabled in config — enable [ingat] to remember"),
+    };
+
+    match backend.remember(&memory).await {
         Ok(id) => {
             println!("remembered ({}): {id}", kind.as_kebab());
             if team {
@@ -63,11 +65,8 @@ pub async fn run(
             }
             Ok(())
         }
-        Err(kode_memory::MemoryError::Unavailable(_)) => {
-            anyhow::bail!(
-                "ingat unavailable — start the Ingat service (mcp-service) on {}",
-                config.ingat.url
-            )
+        Err(kode_memory::MemoryError::Unavailable(msg)) => {
+            anyhow::bail!("memory store unavailable: {msg}")
         }
         Err(err) => Err(anyhow::anyhow!(err)),
     }
@@ -116,8 +115,6 @@ async fn git_output(cwd: &Path, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -132,74 +129,19 @@ mod tests {
         dir
     }
 
-    fn find_header_end(buf: &[u8]) -> Option<usize> {
-        buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
-    }
-
-    fn content_length(headers: &str) -> usize {
-        headers
-            .lines()
-            .find_map(|line| {
-                let lower = line.to_ascii_lowercase();
-                lower
-                    .strip_prefix("content-length:")
-                    .and_then(|v| v.trim().parse::<usize>().ok())
-            })
-            .unwrap_or(0)
-    }
-
-    /// Reads a full HTTP/1.1 request (headers + body, by `Content-Length`)
-    /// off `stream` before the caller responds — closing the socket while
-    /// unread request bytes remain can send a `RST` instead of a clean
-    /// `FIN`, corrupting the response on the client side (see the
-    /// equivalent helper in `kode-memory::ingat`'s tests, which this
-    /// mirrors).
-    async fn drain_request(stream: &mut TcpStream) {
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 4096];
-        let header_end = loop {
-            let n = stream.read(&mut chunk).await.unwrap();
-            buf.extend_from_slice(&chunk[..n]);
-            if let Some(pos) = find_header_end(&buf) {
-                break pos;
-            }
-        };
-        let header_text = String::from_utf8_lossy(&buf[..header_end]).to_string();
-        let len = content_length(&header_text);
-        while buf.len() < header_end + len {
-            let n = stream.read(&mut chunk).await.unwrap();
-            buf.extend_from_slice(&chunk[..n]);
-        }
-    }
-
-    /// A minimal one-shot fake `/api/contexts` responder: accepts one
-    /// connection, drains the request, then replies with a canned success
-    /// body. We don't assert on the request here — that's covered
-    /// thoroughly by `kode-memory`'s own adapter tests.
-    async fn one_shot_ok_server() -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            drain_request(&mut stream).await;
-            let body = r#"{"id":"mem-cli","project":"kode","summary":"s","kind":{"Other":"project-rule"},"tags":["kode"],"created_at":"2026-01-01T00:00:00Z"}"#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.flush().await;
-        });
-        format!("http://{addr}")
-    }
-
-    async fn write_ingat_config(dir: &Path, base_url: &str) {
+    /// Writes a `[ingat]` config pointing the native store at a temp file
+    /// under `dir`, so tests never touch the real `~/.kode` store.
+    fn write_ingat_config(dir: &Path) {
         let kode_dir = dir.join(".kode");
         std::fs::create_dir_all(&kode_dir).unwrap();
+        let db = dir
+            .join("memory.sqlite3")
+            .display()
+            .to_string()
+            .replace('\\', "/");
         std::fs::write(
             kode_dir.join("config.toml"),
-            format!("[ingat]\nurl = \"{base_url}\"\n"),
+            format!("[ingat]\nstore_path = \"{db}\"\n"),
         )
         .unwrap();
     }
@@ -207,8 +149,7 @@ mod tests {
     #[tokio::test]
     async fn remember_team_appends_wire_entry_and_prints_share_path() {
         let dir = temp_dir("team");
-        let base = one_shot_ok_server().await;
-        write_ingat_config(&dir, &base).await;
+        write_ingat_config(&dir);
 
         run(
             "always squash-merge feature branches",
@@ -227,13 +168,13 @@ mod tests {
         assert_eq!(entries[0].content, "always squash-merge feature branches");
         assert_eq!(entries[0].kind, "convention");
         assert_eq!(entries[0].provenance, "explicit-user");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn remember_without_team_does_not_write_team_file() {
         let dir = temp_dir("no-team");
-        let base = one_shot_ok_server().await;
-        write_ingat_config(&dir, &base).await;
+        write_ingat_config(&dir);
 
         run(
             "a personal-only note about local setup",
@@ -247,6 +188,7 @@ mod tests {
 
         let path = team_memory::team_file_path(&dir);
         assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

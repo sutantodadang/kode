@@ -25,6 +25,8 @@ async-trait = "0.1"
 sha2 = "0.10"
 ulid = "1"
 getrandom = "0.3"
+libloading = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 kode-core = { path = "crates/kode-core" }

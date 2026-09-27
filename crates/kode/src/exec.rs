@@ -5,7 +5,6 @@ use std::sync::Arc;
 use kode_core::CancellationToken;
 use kode_core::config::KodeConfig;
 use kode_core::event::{EventBus, KodeEvent, router_summary};
-use kode_memory::EngineeringMemory;
 use kode_tools::permission::PermissionHandler;
 use tokio::sync::broadcast::error::RecvError;
 
@@ -51,16 +50,14 @@ pub async fn run(
         config.model.effort = effort;
     }
 
-    if config.ingat.enabled {
-        let adapter = kode_memory::IngatAdapter::new(&config.ingat);
-        if tokio::time::timeout(std::time::Duration::from_secs(3), adapter.health())
+    if let Ok(Some(adapter)) = crate::memory_backend::connect(&config.ingat).await
+        && tokio::time::timeout(std::time::Duration::from_secs(3), adapter.health())
             .await
             .is_ok_and(|r| r.is_ok())
-        {
-            let summary = team_memory::import_on_start(&adapter, cwd).await;
-            if let Some(text) = summary.note() {
-                eprintln!("◆ {text}");
-            }
+    {
+        let summary = team_memory::import_on_start(adapter.as_ref(), cwd).await;
+        if let Some(text) = summary.note() {
+            eprintln!("◆ {text}");
         }
     }
 

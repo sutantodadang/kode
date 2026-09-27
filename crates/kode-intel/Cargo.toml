@@ -12,5 +12,4 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
-kode-core = { workspace = true }
-kode-mcp = { path = "../kode-mcp" }
+libloading = { workspace = true }

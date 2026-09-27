@@ -11,8 +11,11 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
-reqwest = { workspace = true }
 sha2 = { workspace = true }
 ulid = { workspace = true }
+chrono = { workspace = true }
 kode-core = { workspace = true }
 kode-tools = { path = "../kode-tools" }
+# Headless Ingat core, pinned to the merged revision that delivers the
+# concurrent SQLite store + stable hash model (Ingat #13/#14).
+ingat-core = { git = "https://github.com/sutantodadang/Ingat", rev = "9be69c00c420abceb61218ea43fba7cb363512c2", default-features = false, features = ["sqlite-store"] }

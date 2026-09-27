@@ -19,16 +19,3 @@ pub enum MemoryError {
 }
 
 pub type Result<T> = std::result::Result<T, MemoryError>;
-
-/// Maps a low-level `reqwest::Error` to a [`MemoryError`]: connect failures
-/// become `Unavailable` (the Ingat service isn't reachable), timeouts become
-/// `Timeout`, everything else becomes `Protocol`.
-pub(crate) fn map_reqwest_error(err: reqwest::Error) -> MemoryError {
-    if err.is_timeout() {
-        MemoryError::Timeout
-    } else if err.is_connect() {
-        MemoryError::Unavailable(err.to_string())
-    } else {
-        MemoryError::Protocol(err.to_string())
-    }
-}

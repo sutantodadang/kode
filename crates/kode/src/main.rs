@@ -2,9 +2,14 @@ mod attachments;
 mod auth;
 mod custom_commands;
 mod doctor;
+mod engine_assets;
 mod exec;
+mod index_cmd;
+mod intel_backend;
 mod intel_tools;
 mod local;
+mod memory_backend;
+mod memory_import;
 mod models;
 mod pipeline;
 mod remember;
@@ -75,6 +80,9 @@ enum Command {
     Models,
     /// Detect the project and run its verification pipeline.
     Verify,
+    /// Build or refresh the code-intelligence index for this repository in the
+    /// configured zindeks backend (embedded or external).
+    Index,
     /// Run diagnostic checks across config, LLM, zindeks, Ingat, git, and env.
     Doctor,
     /// Install/bootstrap the zindeks and Ingat engines (consent-gated).
@@ -155,8 +163,15 @@ enum RouterCmd {
 
 #[derive(clap::Subcommand)]
 enum MemoryCmd {
-    /// Show team.jsonl entry/corrupt counts and Ingat import support.
+    /// Show team.jsonl entry/corrupt counts.
     Status,
+    /// Import a legacy `ingat_export` JSONL file into Kode's native memory
+    /// store (idempotent by record id; can be rerun to resume).
+    Import {
+        /// Path to the export JSONL file.
+        #[arg(long)]
+        from: std::path::PathBuf,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -247,6 +262,10 @@ async fn main() -> anyhow::Result<()> {
             let cwd = std::env::current_dir()?;
             verify::run(&cwd, token).await?;
         }
+        Some(Command::Index) => {
+            let cwd = std::env::current_dir()?;
+            index_cmd::run(&cwd).await?;
+        }
         Some(Command::Doctor) => {
             let cwd = std::env::current_dir()?;
             doctor::run(&cwd).await?;
@@ -267,6 +286,10 @@ async fn main() -> anyhow::Result<()> {
             MemoryCmd::Status => {
                 let cwd = std::env::current_dir()?;
                 team_memory::print_status(&cwd);
+            }
+            MemoryCmd::Import { from } => {
+                let cwd = std::env::current_dir()?;
+                memory_import::run(&cwd, &from).await?;
             }
         },
         Some(Command::Router { cmd }) => {

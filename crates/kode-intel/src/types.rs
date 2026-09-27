@@ -45,4 +45,11 @@ pub struct IntelHealth {
     pub documents: u64,
     pub symbols: u64,
     pub edges: u64,
+    /// Runtime SQLite version (`health_check.sqlite_version`, zindeks >= 0.10.0).
+    /// `None` when the backend payload predates the field (external legacy
+    /// servers), so doctor reports "unknown" instead of inventing a version.
+    pub sqlite_version: Option<String>,
+    /// Runtime SQLite version number, mirrored from
+    /// `health_check.sqlite_version_number`.
+    pub sqlite_version_number: Option<u32>,
 }
