@@ -1,28 +1,27 @@
 # Embedded engines — QA and release acceptance
 
-Status: **partial** — the combined native session is verified on Windows
-x86_64 (local) and on Linux x86_64, Windows x86_64 and macOS aarch64 in CI
-against the released zindeks asset. Remaining platform/release gates are
-recorded below. Fresh installation,
-multi-process recovery and router/model checks also passed locally on
-2026-09-27; see [the merge QA record](merge-qa-2026-09-27.md).
+Status: **partial** — the v0.10.3 combined native session, warm-index watcher,
+fresh installation, and upgrade from v0.10.2 are verified on Windows x86_64.
+All four release archives and their metadata were checksum-verified; execution
+on other platforms needs the updated CI run. See [the v0.10.3 QA record](zindeks-0.10.3-qa-2026-09-27.md)
+and [the earlier merge QA record](merge-qa-2026-09-27.md).
 
 ## Pinned upstreams
 
 | Component | Revision | Artifact |
 | --- | --- | --- |
-| zindeks | tag `v0.10.2` = `e79bc89a3b68870448db5c69d4420ec509484959` | four ABI 1 assets (see checksums) |
+| zindeks | tag `v0.10.3` = `418da3ff065e956509b0e6746e9c17075d920c19` | four ABI 1 assets (see checksums) |
 | ingat-core | `9be69c00c420abceb61218ea43fba7cb363512c2` (v0.2.0), features `sqlite-store` | git dependency in `crates/kode-memory/Cargo.toml` |
-| Kode | workspace `0.4.12` | — |
+| Kode | workspace `0.5.2` | — |
 
-### zindeks v0.10.2 FFI asset SHA-256
+### zindeks v0.10.3 FFI archive SHA-256
 
 | Target | SHA-256 |
 | --- | --- |
-| x86_64 Windows MSVC | `eb8d84bba5981ca54900b261f3f0c93c32b13c259de063b8312860105a89f849` |
-| x86_64 Linux GNU | `7e1281d0249e1f5d0caabe42a1bcb9e0a28082b77f1e1ee265cc201f82b0d0ea` |
-| aarch64 Linux GNU | `7983af13c2903a9f5046fcaf9e0025ca567bf64a2796ae00fc1cc84a53d2652c` |
-| aarch64 macOS | `3a6c733f53710bb303bc12c1d0d641d859ea75711a3396473f21aeb4f4780085` |
+| x86_64 Windows MSVC | `a40c922774dc7b579eae095d7080075fd508d6c01cfe5dae06aaeb7dbd2b885b` |
+| x86_64 Linux GNU | `ad375454785c4250db529b26c2e1632f1d4c2cffe79022be3407a6b5807aecd2` |
+| aarch64 Linux GNU | `d1affcc9c70063373138c9810b8fad4d621c53f09313a3097f69766cf34b8c26` |
+| aarch64 macOS | `8b5a02a46f4f36f53d1a307ab275511d21ecfa36ddad1a07d096323d849d3c33` |
 
 Each archive contains the shared library, `include/zindeks.h`,
 `NOTICE.sqlite.md` and `metadata.json` (`abi_version=1`, `sqlite=3.53.4`).
@@ -49,6 +48,8 @@ cargo test -p kode --test native_engines -- --ignored          # ok
 - `embedded_real::embedded_index_then_query_works` — open → `ensure_bound`
   (not-indexed) → `index_repository` → `health` (`documents >= 1`,
   `sqlite_version` present) → `get_context` → `file_outline`.
+  Also reopens a warm index with watching enabled, queries context, and verifies
+  that the watcher observes a subsequent file edit before shutdown.
 - `native_engines::native_memory_and_code_share_one_process` — 20 memories
   committed via `EmbeddedIngat` while `EmbeddedZindeks` indexes and queries the
   graph; both backends report healthy; no interposition or fallback.
@@ -67,7 +68,7 @@ zig build ffi-test      # ok (export allowlist + C ABI smoke)
 
 `.github/workflows/ci.yml` job `native-engines` runs a matrix of
 **linux-x86_64, linux-aarch64, windows-x86_64 and macos-aarch64**, downloads
-the pinned v0.10.2 asset for each, verifies its SHA-256, and runs the real engine
+the pinned v0.10.3 asset for each, verifies its SHA-256, and runs the real engine
 and fresh-install CLI gates. The ARM64 and fresh-install additions still need
 a CI run; the previously verified matrix had three targets.
 
