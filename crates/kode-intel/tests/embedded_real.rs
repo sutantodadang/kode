@@ -119,6 +119,34 @@ async fn embedded_index_then_query_works() {
         .await
         .expect("rebind after cancellation");
     drop(reopened);
+
+    // A warm open attaches self-referential search state and starts the
+    // watcher. Those pointers must refer to the final native server address.
+    let watched =
+        EmbeddedZindeks::open(&library, &repo, &store, true).expect("open warm index with watcher");
+    assert!(watched.watching());
+    assert!(watched.health().await.unwrap().documents >= 201);
+    let warm_context = watched
+        .get_context(CodeContextRequest {
+            query: "answer".into(),
+            working_set: vec![],
+            max_tokens: Some(500),
+        })
+        .await
+        .expect("query warm watched index");
+    assert!(!warm_context.text.is_empty());
+    std::fs::write(repo.join("src/watched.rs"), "pub fn watched_update() {}\n").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if watched.health().await.unwrap().documents >= 202 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("watcher applies edit after warm open");
+    drop(watched);
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&store);
 }

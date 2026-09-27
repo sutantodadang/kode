@@ -11,8 +11,7 @@ use kode_local::models::{
 };
 use kode_local::pins::{MODEL_FILES, MODELS_REPO, MODELS_REVISION, ORT_VERSION, RUNTIMES};
 
-const ZINDEKS_RELEASES_BASE: &str =
-    "https://github.com/sutantodadang/zindeks/releases/download/v0.10.2";
+const ZINDEKS_RELEASES_BASE: &str = "https://github.com/sutantodadang/zindeks/releases/download";
 
 /// Runs `kode setup`: a consent-gated installer/bootstrapper for Kode's
 /// engines (zindeks for code intelligence, native Ingat for engineering
@@ -263,8 +262,12 @@ async fn setup_zindeks_embedded(cfg: &ZindeksConfig, yes: bool) -> anyhow::Resul
         .timeout(Duration::from_secs(60))
         .build()?;
 
-    let asset_url = format!("{ZINDEKS_RELEASES_BASE}/{asset}");
-    let sums_url = format!("{ZINDEKS_RELEASES_BASE}/SHA256SUMS");
+    let release_url = format!(
+        "{ZINDEKS_RELEASES_BASE}/v{}",
+        crate::engine_assets::ZINDEKS_VERSION
+    );
+    let asset_url = format!("{release_url}/{asset}");
+    let sums_url = format!("{release_url}/SHA256SUMS");
 
     let bytes = client
         .get(&asset_url)
@@ -319,14 +322,17 @@ async fn setup_zindeks_embedded(cfg: &ZindeksConfig, yes: bool) -> anyhow::Resul
 
     let meta_text = tokio::fs::read_to_string(top.join("metadata.json")).await?;
     let meta: serde_json::Value = serde_json::from_str(&meta_text)?;
-    let revision = meta
-        .get("source_revision")
-        .and_then(|v| v.as_str())
-        .or_else(|| meta.get("zindeks_version").and_then(|v| v.as_str()))
-        .unwrap_or("latest")
-        .to_string();
+    if meta.get("source_revision").and_then(|v| v.as_str())
+        != Some(crate::engine_assets::ZINDEKS_REVISION)
+        || meta.get("zindeks_version").and_then(|v| v.as_str())
+            != Some(crate::engine_assets::ZINDEKS_VERSION)
+        || meta.get("abi_version").and_then(|v| v.as_u64()) != Some(1)
+    {
+        anyhow::bail!("zindeks archive metadata does not match the pinned release/ABI");
+    }
+    let revision = crate::engine_assets::ZINDEKS_REVISION;
 
-    let dest = runtime_root.join(&revision);
+    let dest = runtime_root.join(revision);
     if dest.exists() {
         tokio::fs::remove_dir_all(&dest).await?;
     }
