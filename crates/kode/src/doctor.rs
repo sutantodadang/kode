@@ -5,11 +5,10 @@ use kode_core::config::{
     KodeConfig, McpServerConfig, ModelConfig, ROUTER_TIERS, RouterConfig, SubagentConfig,
     VALID_ROUTER_DEVICES, ZindeksConfig,
 };
-use kode_intel::{CodeIntelligence, ZindeksAdapter};
+use kode_intel::IntelError;
 use kode_local::device::{DevicePref, describe_plan, init_runtime};
 use kode_local::models::{LocalPaths, installed_runtime, verify_file};
 use kode_local::pins::{MODEL_FILES, MODELS_REVISION, ORT_VERSION};
-use kode_memory::{EngineeringMemory, IngatAdapter};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const NAME_WIDTH: usize = 24;
@@ -360,38 +359,40 @@ fn api_key_check(openai_present: bool, kode_present: bool) -> Check {
 
 // --- async collectors -------------------------------------------------------
 
-async fn zindeks_binary_check(cfg: &ZindeksConfig) -> Check {
-    if let Some(version) = crate::setup::probe_version(&cfg.command).await {
-        return Check::pass("Zindeks", "binary", version);
+async fn zindeks_embedded_library_check(cfg: &ZindeksConfig) -> Check {
+    match crate::engine_assets::zindeks_library(cfg) {
+        Ok(path) => Check::pass("Zindeks", "library", path.display().to_string()),
+        Err(err) => Check::fail("Zindeks", "library", err.to_string(), "run: kode setup"),
     }
-
-    if let Some(managed_dir) = kode_core::managed_bin_dir() {
-        let managed_bin = managed_dir.join(if cfg!(windows) {
-            "zindeks.exe"
-        } else {
-            "zindeks"
-        });
-        if let Some(version) = crate::setup::probe_version(&managed_bin).await {
-            return Check::pass("Zindeks", "binary", version);
-        }
-    }
-
-    Check::fail("Zindeks", "binary", "not found", "run: kode setup")
 }
 
 async fn collect_zindeks_checks(checks: &mut Vec<Check>, cwd: &Path, config: &KodeConfig) {
-    checks.push(zindeks_binary_check(&config.zindeks).await);
+    checks.push(zindeks_embedded_library_check(&config.zindeks).await);
+    if let Some(path) = crate::engine_assets::override_path() {
+        checks.push(Check::warn(
+            "Zindeks",
+            "override",
+            format!("{}={}", crate::engine_assets::DYLIB_ENV, path.display()),
+            "",
+        ));
+    }
 
-    let adapter =
-        match tokio::time::timeout(TIMEOUT, ZindeksAdapter::connect(&config.zindeks, cwd)).await {
-            Ok(Ok(adapter)) => {
-                checks.push(Check::pass("Zindeks", "service", "handshake ok"));
-                adapter
+    let backend =
+        match tokio::time::timeout(TIMEOUT, crate::intel_backend::connect(&config.zindeks, cwd))
+            .await
+        {
+            Ok(Ok(Some(backend))) => {
+                checks.push(Check::pass("Zindeks", "engine", "handshake ok"));
+                backend
+            }
+            Ok(Ok(None)) => {
+                checks.push(Check::warn("Zindeks", "engine", "disabled in config", ""));
+                return;
             }
             Ok(Err(err)) => {
                 checks.push(Check::fail(
                     "Zindeks",
-                    "service",
+                    "engine",
                     err.to_string(),
                     "run: kode setup",
                 ));
@@ -400,7 +401,7 @@ async fn collect_zindeks_checks(checks: &mut Vec<Check>, cwd: &Path, config: &Ko
             Err(_) => {
                 checks.push(Check::fail(
                     "Zindeks",
-                    "service",
+                    "engine",
                     "timed out",
                     "run: kode setup",
                 ));
@@ -408,8 +409,11 @@ async fn collect_zindeks_checks(checks: &mut Vec<Check>, cwd: &Path, config: &Ko
             }
         };
 
-    let indexed = match tokio::time::timeout(TIMEOUT, adapter.is_indexed()).await {
-        Ok(Ok(indexed)) => indexed,
+    // `ensure_bound` both binds an indexed repo and reports the not-indexed
+    // case, so doctor never triggers a first-time index.
+    let bound = match tokio::time::timeout(TIMEOUT, backend.ensure_bound()).await {
+        Ok(Ok(())) => true,
+        Ok(Err(IntelError::NotIndexed(_))) => false,
         Ok(Err(err)) => {
             checks.push(Check::fail(
                 "Zindeks",
@@ -430,40 +434,33 @@ async fn collect_zindeks_checks(checks: &mut Vec<Check>, cwd: &Path, config: &Ko
         }
     };
 
-    if !indexed {
+    if !bound {
         checks.push(Check::warn(
             "Zindeks",
             "index",
             "not indexed",
-            "run: zindeks index . (or let kode exec bind it)",
+            "run: kode index",
         ));
         return;
     }
     checks.push(Check::pass("Zindeks", "index", "repository indexed"));
 
-    let bound = match tokio::time::timeout(TIMEOUT, adapter.ensure_bound()).await {
-        Ok(result) => result,
-        Err(_) => Err(kode_intel::IntelError::Timeout),
-    };
-    if let Err(err) = bound {
-        checks.push(Check::fail(
-            "Zindeks",
-            "health",
-            err.to_string(),
-            "run: kode setup",
-        ));
-        return;
-    }
-
-    match tokio::time::timeout(TIMEOUT, adapter.health()).await {
-        Ok(Ok(health)) => checks.push(Check::pass(
-            "Zindeks",
-            "health",
-            format!(
-                "{} docs, {} symbols indexed",
-                health.documents, health.symbols
-            ),
-        )),
+    match tokio::time::timeout(TIMEOUT, backend.health()).await {
+        Ok(Ok(health)) => {
+            let version = health
+                .sqlite_version
+                .as_deref()
+                .map(|v| format!(", sqlite {v}"))
+                .unwrap_or_default();
+            checks.push(Check::pass(
+                "Zindeks",
+                "health",
+                format!(
+                    "{} docs, {} symbols indexed{version}",
+                    health.documents, health.symbols
+                ),
+            ));
+        }
         Ok(Err(err)) => checks.push(Check::fail(
             "Zindeks",
             "health",
@@ -480,37 +477,49 @@ async fn collect_zindeks_checks(checks: &mut Vec<Check>, cwd: &Path, config: &Ko
 }
 
 async fn collect_ingat_checks(checks: &mut Vec<Check>, config: &KodeConfig) {
-    let adapter = IngatAdapter::new(&config.ingat);
-    const INGAT_FIX: &str = "run: kode setup (or start the Ingat app)";
+    let label = "store";
+    let fix = "run: kode setup";
 
-    let healthy = match tokio::time::timeout(TIMEOUT, adapter.health()).await {
+    let backend = match crate::memory_backend::connect(&config.ingat).await {
+        Ok(Some(backend)) => backend,
+        Ok(None) => {
+            checks.push(Check::warn("Ingat", "memory", "disabled", ""));
+            return;
+        }
+        Err(err) => {
+            checks.push(Check::fail("Ingat", label, err.to_string(), fix));
+            return;
+        }
+    };
+
+    let healthy = match tokio::time::timeout(TIMEOUT, backend.health()).await {
         Ok(Ok(())) => {
-            checks.push(Check::pass("Ingat", "service", "reachable"));
+            checks.push(Check::pass("Ingat", label, "reachable"));
             true
         }
         Ok(Err(err)) => {
-            checks.push(Check::fail("Ingat", "service", err.to_string(), INGAT_FIX));
+            checks.push(Check::fail("Ingat", label, err.to_string(), fix));
             false
         }
         Err(_) => {
-            checks.push(Check::fail("Ingat", "service", "timed out", INGAT_FIX));
+            checks.push(Check::fail("Ingat", label, "timed out", fix));
             false
         }
     };
 
     if !healthy {
-        checks.push(Check::warn("Ingat", "memory", "skipped (service down)", ""));
+        checks.push(Check::warn("Ingat", "memory", "skipped (backend down)", ""));
         return;
     }
 
-    match tokio::time::timeout(TIMEOUT, adapter.stats()).await {
+    match tokio::time::timeout(TIMEOUT, backend.stats()).await {
         Ok(Ok(stats)) => checks.push(Check::pass(
             "Ingat",
             "memory",
             format!("{} memories (v{})", stats.total, stats.version),
         )),
-        Ok(Err(err)) => checks.push(Check::fail("Ingat", "memory", err.to_string(), INGAT_FIX)),
-        Err(_) => checks.push(Check::fail("Ingat", "memory", "timed out", INGAT_FIX)),
+        Ok(Err(err)) => checks.push(Check::fail("Ingat", "memory", err.to_string(), fix)),
+        Err(_) => checks.push(Check::fail("Ingat", "memory", "timed out", fix)),
     }
 }
 

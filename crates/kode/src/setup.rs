@@ -10,18 +10,14 @@ use kode_local::models::{
     LocalPaths, download_verified, install_models, install_runtime, model_url, select_runtime,
 };
 use kode_local::pins::{MODEL_FILES, MODELS_REPO, MODELS_REVISION, ORT_VERSION, RUNTIMES};
-use kode_memory::{EngineeringMemory, IngatAdapter};
 
 const ZINDEKS_RELEASES_BASE: &str =
-    "https://github.com/sutantodadang/zindeks/releases/latest/download";
-const INGAT_RELEASES_URL: &str = "https://github.com/sutantodadang/Ingat/releases";
-#[cfg(windows)]
-const INGAT_LATEST_API: &str = "https://api.github.com/repos/sutantodadang/Ingat/releases/latest";
+    "https://github.com/sutantodadang/zindeks/releases/download/v0.10.2";
 
-/// Runs `kode setup`: a consent-gated installer/bootstrapper for the two
-/// engines Kode leans on (zindeks for code intelligence, Ingat for
-/// engineering memory). Never downloads or installs anything without an
-/// explicit `y` (or `--yes`).
+/// Runs `kode setup`: a consent-gated installer/bootstrapper for Kode's
+/// engines (zindeks for code intelligence, native Ingat for engineering
+/// memory). Never downloads or installs anything without an explicit `y`
+/// (or `--yes`).
 pub async fn run(yes: bool, cwd: &Path) -> anyhow::Result<()> {
     let config = KodeConfig::load(cwd)?;
 
@@ -208,44 +204,60 @@ async fn confirm(prompt: &str, yes: bool) -> bool {
 // --- zindeks -----------------------------------------------------------
 
 async fn setup_zindeks(cfg: &ZindeksConfig, yes: bool) -> anyhow::Result<()> {
-    if let Some(version) = probe_version(&cfg.command).await {
-        println!("zindeks: found ({version})");
-        return Ok(());
-    }
+    setup_zindeks_embedded(cfg, yes).await
+}
 
-    let managed_dir = kode_core::managed_bin_dir().ok_or_else(|| {
-        anyhow::anyhow!("cannot determine managed bin dir (no HOME/LOCALAPPDATA set)")
-    })?;
-    let managed_bin = managed_dir.join(if cfg!(windows) {
-        "zindeks.exe"
-    } else {
-        "zindeks"
-    });
-
-    if let Some(version) = probe_version(&managed_bin).await {
-        println!("zindeks: found ({version})");
-        return Ok(());
-    }
-
-    if !confirm(
-        &format!("install zindeks (latest) to {}?", managed_dir.display()),
-        yes,
-    )
-    .await
-    {
+/// Installs the pinned in-process zindeks shared library under
+/// `~/.kode/runtime/zindeks/<revision>/` (checksum-verified before install).
+async fn setup_zindeks_embedded(cfg: &ZindeksConfig, yes: bool) -> anyhow::Result<()> {
+    if let Some(path) = crate::engine_assets::override_path() {
         println!(
-            "zindeks: skipped — install manually or set [zindeks] command in .kode/config.toml"
+            "zindeks: using {} override ({})",
+            crate::engine_assets::DYLIB_ENV,
+            path.display()
         );
+        return Ok(());
+    }
+
+    if let Ok(path) = crate::engine_assets::zindeks_library(cfg) {
+        println!("zindeks: embedded library found ({})", path.display());
         return Ok(());
     }
 
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
-    let asset = zindeks_asset(os, arch)
-        .ok_or_else(|| anyhow::anyhow!("unsupported platform for zindeks: {os}/{arch}"))?;
+    let asset = zindeks_ffi_asset(os, arch)
+        .ok_or_else(|| anyhow::anyhow!("unsupported platform for embedded zindeks: {os}/{arch}"))?;
 
-    let tmp_dir = std::env::temp_dir().join(format!("kode-setup-{}", std::process::id()));
-    tokio::fs::create_dir_all(&tmp_dir).await?;
+    let runtime_root = kode_core::zindeks_runtime_dir().ok_or_else(|| {
+        anyhow::anyhow!("cannot determine Kode runtime dir (no HOME/LOCALAPPDATA set)")
+    })?;
+
+    if !confirm(
+        &format!(
+            "install embedded zindeks library ({asset}) to {}?",
+            runtime_root.display()
+        ),
+        yes,
+    )
+    .await
+    {
+        println!(
+            "zindeks: skipped — rerun `kode setup`, or set {} to a local library",
+            crate::engine_assets::DYLIB_ENV
+        );
+        return Ok(());
+    }
+
+    // Stage on the install volume: rename cannot cross Windows drive letters.
+    let tmp = runtime_root
+        .parent()
+        .expect("zindeks runtime directory has a parent")
+        .join(format!(
+            "kode-setup-zindeks-{}",
+            kode_local::dataset::new_id()
+        ));
+    tokio::fs::create_dir_all(&tmp).await?;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
@@ -254,14 +266,14 @@ async fn setup_zindeks(cfg: &ZindeksConfig, yes: bool) -> anyhow::Result<()> {
     let asset_url = format!("{ZINDEKS_RELEASES_BASE}/{asset}");
     let sums_url = format!("{ZINDEKS_RELEASES_BASE}/SHA256SUMS");
 
-    let archive_bytes = client
+    let bytes = client
         .get(&asset_url)
         .send()
         .await?
         .error_for_status()?
         .bytes()
         .await?;
-    let sums_text = client
+    let sums = client
         .get(&sums_url)
         .send()
         .await?
@@ -269,22 +281,22 @@ async fn setup_zindeks(cfg: &ZindeksConfig, yes: bool) -> anyhow::Result<()> {
         .text()
         .await?;
 
-    let expected_hex = find_sha256(&sums_text, asset)
+    let expected = find_sha256(&sums, asset)
         .ok_or_else(|| anyhow::anyhow!("SHA256SUMS has no entry for {asset}"))?;
-    let actual_hex = sha256_hex(&archive_bytes);
-    if !actual_hex.eq_ignore_ascii_case(&expected_hex) {
+    if !sha256_hex(&bytes).eq_ignore_ascii_case(&expected) {
         anyhow::bail!("checksum mismatch — aborting install");
     }
 
-    let archive_path = tmp_dir.join(asset);
-    tokio::fs::write(&archive_path, &archive_bytes).await?;
+    let archive = tmp.join(asset);
+    tokio::fs::write(&archive, &bytes).await?;
 
-    tokio::fs::create_dir_all(&managed_dir).await?;
+    let extract = tmp.join("extract");
+    tokio::fs::create_dir_all(&extract).await?;
     let output = tokio::process::Command::new("tar")
         .arg("-xf")
-        .arg(&archive_path)
+        .arg(&archive)
         .arg("-C")
-        .arg(&managed_dir)
+        .arg(&extract)
         .output()
         .await?;
     if !output.status.success() {
@@ -294,12 +306,50 @@ async fn setup_zindeks(cfg: &ZindeksConfig, yes: bool) -> anyhow::Result<()> {
         );
     }
 
-    match probe_version(&managed_bin).await {
-        Some(version) => {
-            println!("zindeks: installed ({version})");
-            Ok(())
+    // The archive wraps everything in one top-level directory; the inner
+    // `metadata.json` names the exact source revision to install under.
+    let mut top: Option<PathBuf> = None;
+    let mut entries = tokio::fs::read_dir(&extract).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.file_type().await?.is_dir() {
+            top = Some(entry.path());
         }
-        None => anyhow::bail!("zindeks installed but `--version` failed to run"),
+    }
+    let top = top.ok_or_else(|| anyhow::anyhow!("archive contained no directory"))?;
+
+    let meta_text = tokio::fs::read_to_string(top.join("metadata.json")).await?;
+    let meta: serde_json::Value = serde_json::from_str(&meta_text)?;
+    let revision = meta
+        .get("source_revision")
+        .and_then(|v| v.as_str())
+        .or_else(|| meta.get("zindeks_version").and_then(|v| v.as_str()))
+        .unwrap_or("latest")
+        .to_string();
+
+    let dest = runtime_root.join(&revision);
+    if dest.exists() {
+        tokio::fs::remove_dir_all(&dest).await?;
+    }
+    tokio::fs::create_dir_all(&runtime_root).await?;
+    tokio::fs::rename(&top, &dest).await?;
+    let _ = tokio::fs::remove_dir_all(&tmp).await;
+
+    println!(
+        "zindeks: embedded library installed ({})",
+        dest.join(crate::engine_assets::dylib_file_name()).display()
+    );
+    Ok(())
+}
+
+/// Maps (os, arch) to the embedded ABI asset name published with each zindeks
+/// release. Matches the four supported library targets; `None` otherwise.
+fn zindeks_ffi_asset(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
+        ("windows", "x86_64") => Some("zindeks-ffi-windows-x86_64.tar.gz"),
+        ("linux", "x86_64") => Some("zindeks-ffi-linux-x86_64.tar.gz"),
+        ("linux", "aarch64") => Some("zindeks-ffi-linux-aarch64.tar.gz"),
+        ("macos", "aarch64") => Some("zindeks-ffi-macos-aarch64.tar.gz"),
+        _ => None,
     }
 }
 
@@ -349,20 +399,6 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// Maps (os, arch) — as reported by `std::env::consts::{OS,ARCH}` — to the
-/// matching zindeks release asset name. `None` for unsupported platforms.
-fn zindeks_asset(os: &str, arch: &str) -> Option<&'static str> {
-    match (os, arch) {
-        ("windows", "x86_64") => Some("zindeks-windows-x86_64.zip"),
-        ("windows", "aarch64") => Some("zindeks-windows-aarch64.zip"),
-        ("macos", "x86_64") => Some("zindeks-macos-x86_64.tar.gz"),
-        ("macos", "aarch64") => Some("zindeks-macos-aarch64.tar.gz"),
-        ("linux", "x86_64") => Some("zindeks-linux-x86_64.tar.gz"),
-        ("linux", "aarch64") => Some("zindeks-linux-aarch64.tar.gz"),
-        _ => None,
-    }
-}
-
 /// Finds the hex digest for `asset_name` in a `SHA256SUMS` file (standard
 /// `<hex>  <filename>` format, optionally with a leading `*` on the
 /// filename for binary mode).
@@ -395,280 +431,22 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 // --- Ingat ---------------------------------------------------------------
 
-async fn setup_ingat(cfg: &IngatConfig, yes: bool) -> anyhow::Result<()> {
-    let adapter = IngatAdapter::new(cfg);
-    let healthy = matches!(
-        tokio::time::timeout(Duration::from_secs(3), adapter.health()).await,
-        Ok(Ok(()))
-    );
-    if healthy {
-        println!("ingat: service running");
-        return Ok(());
-    }
-
-    #[cfg(windows)]
-    {
-        windows_setup_ingat(cfg, yes).await
-    }
-
-    #[cfg(not(windows))]
-    {
-        let _ = yes;
-        println!("ingat: unavailable — install manually: {INGAT_RELEASES_URL}");
-        Ok(())
-    }
-}
-
-#[cfg(windows)]
-async fn windows_setup_ingat(cfg: &IngatConfig, yes: bool) -> anyhow::Result<()> {
-    if let Some(path) = find_mcp_service() {
-        try_start_ingat(cfg, &path, yes).await;
-        return Ok(());
-    }
-
-    if !confirm("download and run the Ingat installer (GUI, ~20MB)?", yes).await {
-        println!("ingat: skipped — install manually: {INGAT_RELEASES_URL}");
-        return Ok(());
-    }
-
-    install_ingat().await?;
-
-    match find_mcp_service() {
-        Some(path) => try_start_ingat(cfg, &path, yes).await,
-        None => println!(
-            "ingat: installer finished but mcp_service.exe was not found — start Ingat manually"
-        ),
+async fn setup_ingat(cfg: &IngatConfig, _yes: bool) -> anyhow::Result<()> {
+    let path = match &cfg.store_path {
+        Some(path) => path.clone(),
+        None => kode_core::default_ingat_store_path()
+            .ok_or_else(|| anyhow::anyhow!("cannot determine Kode home for the memory store"))?,
+    };
+    match kode_memory::EmbeddedIngat::open(&path) {
+        Ok(_) => println!("ingat: memory store ready ({})", path.display()),
+        Err(e) => println!("ingat: memory store unavailable — {e}"),
     }
     Ok(())
-}
-
-#[cfg(windows)]
-async fn try_start_ingat(cfg: &IngatConfig, path: &Path, yes: bool) {
-    if !confirm(&format!("start Ingat service ({})?", path.display()), yes).await {
-        println!("ingat: skipped — start it manually or set [ingat] url in .kode/config.toml");
-        return;
-    }
-
-    match spawn_detached(path) {
-        Ok(()) => {
-            if wait_for_health(cfg, Duration::from_secs(10)).await {
-                println!("ingat: service running");
-            } else {
-                println!("ingat: started but not healthy yet — check Ingat logs");
-            }
-        }
-        Err(e) => println!("ingat: failed to start service: {e}"),
-    }
-}
-
-#[cfg(windows)]
-async fn wait_for_health(cfg: &IngatConfig, budget: Duration) -> bool {
-    let adapter = IngatAdapter::new(cfg);
-    let deadline = std::time::Instant::now() + budget;
-    loop {
-        if let Ok(Ok(())) = tokio::time::timeout(Duration::from_secs(2), adapter.health()).await {
-            return true;
-        }
-        if std::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-}
-
-/// Searches `%LOCALAPPDATA%\ingat` and `%LOCALAPPDATA%\Programs\*ingat*`
-/// (case-insensitive) up to depth 3 for `mcp_service.exe`. The Ingat NSIS
-/// installer uses `%LOCALAPPDATA%\ingat` as its per-user install dir.
-#[cfg(windows)]
-pub(crate) fn find_mcp_service() -> Option<PathBuf> {
-    let local_app_data = PathBuf::from(std::env::var_os("LOCALAPPDATA")?);
-
-    let direct = local_app_data.join("ingat");
-    if direct.is_dir()
-        && let Some(found) = find_file_named(&direct, "mcp_service.exe", 3)
-    {
-        return Some(found);
-    }
-
-    let programs_dir = local_app_data.join("Programs");
-    let entries = std::fs::read_dir(&programs_dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let name = path.file_name()?.to_string_lossy().to_lowercase();
-        if !name.contains("ingat") {
-            continue;
-        }
-        if let Some(found) = find_file_named(&path, "mcp_service.exe", 3) {
-            return Some(found);
-        }
-    }
-    None
-}
-
-/// Non-Windows stub: Kode only knows how to locate the installed Ingat
-/// service on Windows (NSIS install layout). Always reports "not found" so
-/// autostart callers fall through to their "not installed" branch instead of
-/// needing per-platform `cfg` in the caller.
-#[cfg(not(windows))]
-pub(crate) fn find_mcp_service() -> Option<PathBuf> {
-    None
-}
-
-/// Downloads and launches the Ingat NSIS installer (interactive; waits for
-/// the user to click through it).
-#[cfg(windows)]
-async fn install_ingat() -> anyhow::Result<()> {
-    let api_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?;
-
-    let release: serde_json::Value = api_client
-        .get(INGAT_LATEST_API)
-        .header("User-Agent", "kode-setup")
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-
-    let (name, url) = release["assets"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find_map(|a| {
-            let name = a.get("name")?.as_str()?;
-            if name.ends_with("-setup.exe") {
-                let url = a.get("browser_download_url")?.as_str()?;
-                Some((name.to_string(), url.to_string()))
-            } else {
-                None
-            }
-        })
-        .ok_or_else(|| anyhow::anyhow!("no *-setup.exe asset found in latest Ingat release"))?;
-
-    let dl_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()?;
-    let bytes = dl_client
-        .get(&url)
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
-
-    let tmp_dir = std::env::temp_dir().join(format!("kode-setup-{}", std::process::id()));
-    tokio::fs::create_dir_all(&tmp_dir).await?;
-    let installer_path = tmp_dir.join(&name);
-    tokio::fs::write(&installer_path, &bytes).await?;
-
-    println!("ingat: launching installer — follow the on-screen steps");
-    let status = tokio::process::Command::new(&installer_path)
-        .status()
-        .await?;
-    if !status.success() {
-        anyhow::bail!("Ingat installer exited with {status}");
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-pub(crate) fn spawn_detached(path: &Path) -> std::io::Result<()> {
-    use std::os::windows::process::CommandExt;
-    // DETACHED_PROCESS | CREATE_NO_WINDOW
-    const CREATION_FLAGS: u32 = 0x0800_0008;
-    std::process::Command::new(path)
-        .creation_flags(CREATION_FLAGS)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-    Ok(())
-}
-
-/// Non-Windows stub: nothing to spawn since `find_mcp_service` never
-/// returns `Some` off Windows, but this keeps the signature callable from
-/// platform-agnostic autostart code without a `cfg` at the call site.
-#[cfg(not(windows))]
-pub(crate) fn spawn_detached(_path: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "starting the Ingat service is only supported on Windows",
-    ))
-}
-
-/// Depth-limited search for a file named `filename` (case-insensitive)
-/// under `root`. `max_depth` is measured in directories descended below
-/// `root` (0 = only `root` itself).
-#[cfg(windows)]
-fn find_file_named(root: &Path, filename: &str, max_depth: usize) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(root).ok()?;
-    let mut subdirs = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() {
-            if path
-                .file_name()
-                .map(|n| n.to_string_lossy().eq_ignore_ascii_case(filename))
-                .unwrap_or(false)
-            {
-                return Some(path);
-            }
-        } else if path.is_dir() {
-            subdirs.push(path);
-        }
-    }
-    if max_depth == 0 {
-        return None;
-    }
-    for subdir in subdirs {
-        if let Some(found) = find_file_named(&subdir, filename, max_depth - 1) {
-            return Some(found);
-        }
-    }
-    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn zindeks_asset_covers_all_supported_platforms() {
-        assert_eq!(
-            zindeks_asset("windows", "x86_64"),
-            Some("zindeks-windows-x86_64.zip")
-        );
-        assert_eq!(
-            zindeks_asset("windows", "aarch64"),
-            Some("zindeks-windows-aarch64.zip")
-        );
-        assert_eq!(
-            zindeks_asset("macos", "x86_64"),
-            Some("zindeks-macos-x86_64.tar.gz")
-        );
-        assert_eq!(
-            zindeks_asset("macos", "aarch64"),
-            Some("zindeks-macos-aarch64.tar.gz")
-        );
-        assert_eq!(
-            zindeks_asset("linux", "x86_64"),
-            Some("zindeks-linux-x86_64.tar.gz")
-        );
-        assert_eq!(
-            zindeks_asset("linux", "aarch64"),
-            Some("zindeks-linux-aarch64.tar.gz")
-        );
-    }
-
-    #[test]
-    fn zindeks_asset_rejects_unsupported_platform() {
-        assert_eq!(zindeks_asset("freebsd", "x86_64"), None);
-        assert_eq!(zindeks_asset("windows", "arm"), None);
-    }
 
     #[test]
     fn strip_ansi_removes_csi_sequences() {
@@ -707,57 +485,26 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
-    fn nanos() -> u128 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    }
-
-    #[cfg(windows)]
-    fn temp_test_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "kode-setup-test-{label}-{}-{}",
-            std::process::id(),
-            nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    #[cfg(windows)]
     #[test]
-    fn find_file_named_locates_nested_file_within_depth() {
-        let root = temp_test_dir("found");
-        let nested = root.join("a").join("b");
-        std::fs::create_dir_all(&nested).unwrap();
-        std::fs::write(nested.join("mcp_service.exe"), b"stub").unwrap();
-
-        let found = find_file_named(&root, "mcp_service.exe", 3);
-        assert_eq!(found, Some(nested.join("mcp_service.exe")));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn find_file_named_respects_max_depth() {
-        let root = temp_test_dir("toodeep");
-        let nested = root.join("a").join("b").join("c");
-        std::fs::create_dir_all(&nested).unwrap();
-        std::fs::write(nested.join("mcp_service.exe"), b"stub").unwrap();
-
-        // mcp_service.exe is 3 dirs below root; max_depth 1 can't reach it.
-        let found = find_file_named(&root, "mcp_service.exe", 1);
-        assert_eq!(found, None);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn find_file_named_not_found_returns_none() {
-        let root = temp_test_dir("missing");
-        std::fs::create_dir_all(root.join("a")).unwrap();
-
-        assert_eq!(find_file_named(&root, "mcp_service.exe", 3), None);
+    fn zindeks_ffi_asset_covers_all_library_targets() {
+        assert_eq!(
+            zindeks_ffi_asset("windows", "x86_64"),
+            Some("zindeks-ffi-windows-x86_64.tar.gz")
+        );
+        assert_eq!(
+            zindeks_ffi_asset("linux", "x86_64"),
+            Some("zindeks-ffi-linux-x86_64.tar.gz")
+        );
+        assert_eq!(
+            zindeks_ffi_asset("linux", "aarch64"),
+            Some("zindeks-ffi-linux-aarch64.tar.gz")
+        );
+        assert_eq!(
+            zindeks_ffi_asset("macos", "aarch64"),
+            Some("zindeks-ffi-macos-aarch64.tar.gz")
+        );
+        // Unsupported library targets stay unsupported (no asset pretended).
+        assert_eq!(zindeks_ffi_asset("macos", "x86_64"), None);
+        assert_eq!(zindeks_ffi_asset("windows", "aarch64"), None);
     }
 }

@@ -25,24 +25,8 @@ fn default_true() -> bool {
     true
 }
 
-fn default_zindeks_transport() -> String {
-    "stdio".to_string()
-}
-
-fn default_zindeks_command() -> String {
-    "zindeks".to_string()
-}
-
-fn default_zindeks_tcp_addr() -> String {
-    "127.0.0.1:7717".to_string()
-}
-
 fn default_zindeks_watch() -> bool {
     true
-}
-
-fn default_ingat_url() -> String {
-    "http://127.0.0.1:3200".to_string()
 }
 
 fn default_max_tool_calls() -> u32 {
@@ -266,32 +250,22 @@ impl Default for ModelConfig {
 pub struct ZindeksConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// "stdio" (default, spawns `command`) or "tcp" (connects to `tcp_addr`).
-    #[serde(default = "default_zindeks_transport")]
-    pub transport: String,
-    /// Binary spawned for stdio transport.
-    #[serde(default = "default_zindeks_command")]
-    pub command: String,
-    /// Address used for tcp transport.
-    #[serde(default = "default_zindeks_tcp_addr")]
-    pub tcp_addr: String,
-    /// Whether to enable zindeks's built-in poll-watcher (`ZINDEKS_WATCH=1`)
-    /// on the stdio child Kode spawns, so the index refreshes itself in the
-    /// background instead of via Kode's post-task `ensure_bound` call. Only
-    /// takes effect for `transport = "stdio"` — Kode doesn't control TCP
-    /// servers, so it can't enable their watcher.
+    /// Whether to run the in-process engine's background poll-watcher so the
+    /// index refreshes itself instead of via Kode's post-task `ensure_bound`.
     #[serde(default = "default_zindeks_watch")]
     pub watch: bool,
+    /// Where the in-process engine keeps its index. `None` defaults to
+    /// `~/.kode/zindeks/`, isolating it from any standalone zindeks index.
+    #[serde(default)]
+    pub store_root: Option<PathBuf>,
 }
 
 impl Default for ZindeksConfig {
     fn default() -> Self {
         Self {
             enabled: default_true(),
-            transport: default_zindeks_transport(),
-            command: default_zindeks_command(),
-            tcp_addr: default_zindeks_tcp_addr(),
             watch: default_zindeks_watch(),
+            store_root: None,
         }
     }
 }
@@ -301,22 +275,17 @@ impl Default for ZindeksConfig {
 pub struct IngatConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    #[serde(default = "default_ingat_url")]
-    pub url: String,
-    /// When the Ingat service is unreachable at task start, automatically
-    /// locate and start the installed `mcp_service.exe` and retry once
-    /// before falling back to memory-less operation. One attempt per `kode`
-    /// process, regardless of how many tasks it runs.
-    #[serde(default = "default_true")]
-    pub autostart: bool,
+    /// Embedded SQLite store path. `None` defaults to
+    /// `~/.kode/ingat/memory.sqlite3`.
+    #[serde(default)]
+    pub store_path: Option<PathBuf>,
 }
 
 impl Default for IngatConfig {
     fn default() -> Self {
         Self {
             enabled: default_true(),
-            url: default_ingat_url(),
-            autostart: default_true(),
+            store_path: None,
         }
     }
 }
@@ -628,13 +597,9 @@ mod tests {
         assert_eq!(cfg.model.model, "");
         assert_eq!(cfg.model.effort, "");
         assert!(cfg.zindeks.enabled);
-        assert_eq!(cfg.zindeks.transport, "stdio");
-        assert_eq!(cfg.zindeks.command, "zindeks");
-        assert_eq!(cfg.zindeks.tcp_addr, "127.0.0.1:7717");
         assert!(cfg.zindeks.watch);
         assert!(cfg.ingat.enabled);
-        assert_eq!(cfg.ingat.url, "http://127.0.0.1:3200");
-        assert!(cfg.ingat.autostart);
+        assert_eq!(cfg.ingat.store_path, None);
         assert_eq!(cfg.agent.max_tool_calls, 0);
         assert_eq!(cfg.agent.model_retries, 3);
         assert_eq!(cfg.agent.model_retry_base_ms, 500);
@@ -893,20 +858,43 @@ effort = "high"
     }
 
     #[test]
-    fn ingat_autostart_defaults_true_and_honors_explicit_false() {
+    fn ingat_store_path_defaults_none_and_parses_explicit() {
         let dir = temp_project_dir();
         let cfg = KodeConfig::load(&dir).unwrap();
-        assert!(cfg.ingat.autostart);
+        assert!(cfg.ingat.enabled);
+        assert_eq!(cfg.ingat.store_path, None);
 
         let kode_dir = dir.join(".kode");
         std::fs::create_dir_all(&kode_dir).unwrap();
-        std::fs::write(kode_dir.join("config.toml"), "[ingat]\nautostart = false\n").unwrap();
+        std::fs::write(
+            kode_dir.join("config.toml"),
+            "[ingat]\nstore_path = \"/tmp/kode-mem.sqlite3\"\n",
+        )
+        .unwrap();
 
         let cfg = KodeConfig::load(&dir).unwrap();
-        assert!(!cfg.ingat.autostart);
-        // Untouched keys in the same section keep their own defaults.
+        assert_eq!(
+            cfg.ingat.store_path,
+            Some(std::path::PathBuf::from("/tmp/kode-mem.sqlite3"))
+        );
+    }
+
+    #[test]
+    fn legacy_ingat_http_keys_are_ignored() {
+        // A config written for the removed HTTP backend still loads; its
+        // `url`/`autostart`/`backend` keys are ignored.
+        let dir = temp_project_dir();
+        let kode_dir = dir.join(".kode");
+        std::fs::create_dir_all(&kode_dir).unwrap();
+        std::fs::write(
+            kode_dir.join("config.toml"),
+            "[ingat]\nurl = \"http://x\"\nautostart = false\nbackend = \"http\"\n",
+        )
+        .unwrap();
+
+        let cfg = KodeConfig::load(&dir).unwrap();
         assert!(cfg.ingat.enabled);
-        assert_eq!(cfg.ingat.url, "http://127.0.0.1:3200");
+        assert_eq!(cfg.ingat.store_path, None);
     }
 
     #[test]

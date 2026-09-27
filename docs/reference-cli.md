@@ -142,7 +142,7 @@ In the TUI, `/router` shows the last record and `/router tier=heavy` corrects it
 
 ## `kode setup`
 
-Install or bootstrap the zindeks and Ingat engines. Consent-gated: prompts before downloading anything unless `--yes` is passed.
+Install the pinned zindeks shared library and initialize the native memory store. Consent-gated: prompts before downloading anything unless `--yes` is passed.
 
 | Flag | Description |
 |---|---|

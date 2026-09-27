@@ -2,8 +2,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use kode_core::KodeConfig;
-use kode_intel::{CodeIntelligence, ZindeksAdapter};
-use kode_memory::{EngineeringMemory, IngatAdapter};
 
 /// Prints Kode's current status to stdout. Always succeeds unless config I/O
 /// fails unexpectedly.
@@ -58,10 +56,7 @@ pub async fn run(cwd: &Path) -> anyhow::Result<()> {
     if config.ingat.enabled {
         let line = match tokio::time::timeout(Duration::from_secs(5), ingat_status(&config)).await {
             Ok(line) => line,
-            Err(_) => format!(
-                "ingat: unavailable — run: kode setup (or start the Ingat app) [{}]",
-                config.ingat.url
-            ),
+            Err(_) => "ingat: unavailable — timed out".to_string(),
         };
         println!("{line}");
     } else {
@@ -71,22 +66,21 @@ pub async fn run(cwd: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Connects to the Ingat REST service and reports health + memory count.
-/// Never touches Ingat's storage directly — REST only.
+/// Opens the native memory backend and reports health + count.
 async fn ingat_status(config: &KodeConfig) -> String {
-    let adapter = IngatAdapter::new(&config.ingat);
-    let unavailable = || {
-        format!(
-            "ingat: unavailable — run: kode setup (or start the Ingat app) [{}]",
-            config.ingat.url
-        )
+    let backend = match crate::memory_backend::connect(&config.ingat).await {
+        Ok(Some(backend)) => backend,
+        Ok(None) => return "ingat: disabled".to_string(),
+        Err(err) => return format!("ingat: unavailable — {err}"),
     };
 
-    if adapter.health().await.is_err() {
+    let unavailable = || "ingat: unavailable — memory store could not be read".to_string();
+
+    if backend.health().await.is_err() {
         return unavailable();
     }
 
-    match adapter.stats().await {
+    match backend.stats().await {
         Ok(stats) => format!(
             "ingat: healthy — {} memories (v{})",
             stats.total, stats.version
@@ -95,29 +89,37 @@ async fn ingat_status(config: &KodeConfig) -> String {
     }
 }
 
-/// Connects to zindeks, binds the project (only if already indexed), and
-/// reports health. Never auto-indexes an unindexed repository — that
-/// requires the user to explicitly run `zindeks index .`.
+/// Connects to the code-intelligence backend, binds the project (only if
+/// already indexed), and reports health. Never auto-indexes an unindexed
+/// repository — that requires `kode index`.
 async fn zindeks_status(cwd: &Path, config: &KodeConfig) -> String {
-    let adapter = match ZindeksAdapter::connect(&config.zindeks, cwd).await {
-        Ok(adapter) => adapter,
-        Err(err) => return format!("zindeks: unavailable — {err} — run: kode setup"),
+    let backend = match crate::intel_backend::connect(&config.zindeks, cwd).await {
+        Ok(Some(backend)) => backend,
+        Ok(None) => return "zindeks: disabled".to_string(),
+        Err(err) => return format!("zindeks: unavailable — {err}"),
     };
 
-    if let Err(err) = adapter.ensure_bound().await {
+    if let Err(err) = backend.ensure_bound().await {
         return match err {
             kode_intel::IntelError::NotIndexed(_) => {
-                "zindeks: not indexed — run: zindeks index .".to_string()
+                "zindeks: not indexed — run: kode index".to_string()
             }
-            other => format!("zindeks: unavailable — {other} — run: kode setup"),
+            other => format!("zindeks: unavailable — {other}"),
         };
     }
 
-    match adapter.health().await {
-        Ok(health) => format!(
-            "zindeks: healthy — {} files, {} symbols indexed",
-            health.documents, health.symbols
-        ),
-        Err(err) => format!("zindeks: unavailable — {err} — run: kode setup"),
+    match backend.health().await {
+        Ok(health) => {
+            let sqlite = health
+                .sqlite_version
+                .as_deref()
+                .map(|v| format!(", sqlite {v}"))
+                .unwrap_or_default();
+            format!(
+                "zindeks: healthy — {} files, {} symbols indexed{sqlite}",
+                health.documents, health.symbols
+            )
+        }
+        Err(err) => format!("zindeks: unavailable — {err}"),
     }
 }

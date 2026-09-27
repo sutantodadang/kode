@@ -23,6 +23,8 @@ impl Default for MockCodeIntelligence {
                 documents: 0,
                 symbols: 0,
                 edges: 0,
+                sqlite_version: None,
+                sqlite_version_number: None,
             },
             context: CodeContext {
                 text: String::new(),

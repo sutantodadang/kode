@@ -12,4 +12,7 @@ pub use config::KodeConfig;
 pub use error::{KodeError, Result};
 pub use event::{EventBus, KodeEvent};
 pub use input::{ImageAttachment, UserInput};
-pub use paths::{auth_dir, kode_home_dir, managed_bin_dir};
+pub use paths::{
+    auth_dir, default_ingat_store_path, default_zindeks_store_root, kode_home_dir,
+    kode_runtime_dir, zindeks_runtime_dir,
+};

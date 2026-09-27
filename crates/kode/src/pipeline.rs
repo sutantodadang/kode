@@ -5,11 +5,11 @@ use std::time::Duration;
 
 use kode_agent::{Agent, SubagentTool};
 use kode_context::{CompiledContext, ContextCompiler, ContextRequest, ContextSource};
-use kode_core::config::{AgentConfig, IngatConfig, KodeConfig, PermissionMode};
+use kode_core::config::{AgentConfig, KodeConfig, PermissionMode};
 use kode_core::event::{EventBus, KodeEvent, NoteSource, TaskStep};
 use kode_core::{CancellationToken, UserInput};
-use kode_intel::{CodeIntelligence, ZindeksAdapter};
-use kode_memory::{EngineeringMemory, IngatAdapter, MemorySearchTool, RememberTool};
+use kode_intel::CodeIntelligence;
+use kode_memory::{EngineeringMemory, MemorySearchTool, RememberTool};
 use kode_model::{OpenAiModel, OpenAiOptions, Usage};
 use kode_tools::ToolContext;
 use kode_tools::permission::PermissionHandler;
@@ -27,10 +27,6 @@ const PLAN_INSTRUCTION: &str = "Before making any changes, write a concise numbe
 accomplishing this task: the concrete steps you would take and which files you would touch. \
 Do not write code. You have no implementation tools available for this turn; `use_skill` may be available for reading relevant instructions. Describe the plan, then stop.";
 
-/// Set once this process has made its one autostart attempt for the Ingat
-/// service (successful or not). Guards against re-attempting on every task
-/// within a long-lived `kode` process (e.g. the TUI running many turns).
-static INGAT_AUTOSTART_ATTEMPTED: OnceLock<()> = OnceLock::new();
 static REPORTED_CONTEXT_BUDGETS: OnceLock<Mutex<HashSet<(String, String, u32)>>> = OnceLock::new();
 
 fn format_token_count(tokens: u32) -> String {
@@ -409,27 +405,26 @@ async fn execute_task(
         cancel,
     };
 
-    // Keep a concrete handle alongside the `dyn CodeIntelligence` one so we
-    // can call `ensure_bound` again (as an incremental refresh) after edits.
-    let mut zindeks_adapter: Option<Arc<ZindeksAdapter>> = None;
+    // Keep a handle on the bound backend so we can call `ensure_bound` again
+    // (as an incremental refresh) after edits. The trait exposes lifecycle
+    // parity, so no concrete adapter type is retained here.
+    let mut bound_backend: Option<Arc<dyn CodeIntelligence>> = None;
     let intel: Option<Arc<dyn CodeIntelligence>> = if config.zindeks.enabled {
-        match ZindeksAdapter::connect(&config.zindeks, cwd).await {
-            Ok(adapter) => {
-                let adapter = Arc::new(adapter);
-                match adapter.ensure_bound().await {
-                    Ok(()) => {
-                        zindeks_adapter = Some(adapter.clone());
-                        Some(adapter as Arc<dyn CodeIntelligence>)
-                    }
-                    Err(e) => {
-                        events.emit(KodeEvent::SourcedNote {
-                            text: format!("code intelligence unavailable: {e}"),
-                            source: NoteSource::Zindeks,
-                        });
-                        None
-                    }
+        match crate::intel_backend::connect(&config.zindeks, cwd).await {
+            Ok(Some(backend)) => match backend.ensure_bound().await {
+                Ok(()) => {
+                    bound_backend = Some(backend.clone());
+                    Some(backend)
                 }
-            }
+                Err(e) => {
+                    events.emit(KodeEvent::SourcedNote {
+                        text: format!("code intelligence unavailable: {e}"),
+                        source: NoteSource::Zindeks,
+                    });
+                    None
+                }
+            },
+            Ok(None) => None,
             Err(e) => {
                 events.emit(KodeEvent::SourcedNote {
                     text: format!("code intelligence unavailable: {e}"),
@@ -442,28 +437,36 @@ async fn execute_task(
         None
     };
 
-    let memory: Option<Arc<dyn EngineeringMemory>> = if config.ingat.enabled {
-        let adapter = IngatAdapter::new(&config.ingat);
-        match tokio::time::timeout(Duration::from_secs(3), adapter.health()).await {
-            Ok(Ok(())) => Some(Arc::new(adapter) as Arc<dyn EngineeringMemory>),
-            Ok(Err(e)) => {
+    let memory: Option<Arc<dyn EngineeringMemory>> =
+        match crate::memory_backend::connect(&config.ingat).await {
+            Ok(Some(backend)) => {
+                match tokio::time::timeout(Duration::from_secs(3), backend.health()).await {
+                    Ok(Ok(())) => Some(backend),
+                    Ok(Err(e)) => {
+                        events.emit(KodeEvent::SourcedNote {
+                            text: format!("engineering memory unavailable: {e}"),
+                            source: NoteSource::Ingat,
+                        });
+                        None
+                    }
+                    Err(_) => {
+                        events.emit(KodeEvent::SourcedNote {
+                            text: "engineering memory unavailable: request timed out".to_string(),
+                            source: NoteSource::Ingat,
+                        });
+                        None
+                    }
+                }
+            }
+            Ok(None) => None,
+            Err(e) => {
                 events.emit(KodeEvent::SourcedNote {
                     text: format!("engineering memory unavailable: {e}"),
                     source: NoteSource::Ingat,
                 });
-                maybe_autostart_ingat(&config.ingat, &events).await
+                None
             }
-            Err(_) => {
-                events.emit(KodeEvent::SourcedNote {
-                    text: "engineering memory unavailable: request timed out".to_string(),
-                    source: NoteSource::Ingat,
-                });
-                maybe_autostart_ingat(&config.ingat, &events).await
-            }
-        }
-    } else {
-        None
-    };
+        };
 
     let skills = Arc::new(SkillCatalog::discover(cwd));
     if !skills.is_empty() {
@@ -715,7 +718,7 @@ async fn execute_task(
             // the pre-edit snapshot. Refresh code intelligence first (even
             // when a watcher exists, since it may not have observed the edit
             // yet), then compile a new git/intel/memory context.
-            if let Some(adapter) = zindeks_adapter.as_ref() {
+            if let Some(adapter) = bound_backend.as_ref() {
                 match adapter.ensure_bound().await {
                     Ok(()) => events.emit(KodeEvent::SourcedNote {
                         text: "zindeks index refreshed before repair".to_string(),
@@ -784,13 +787,12 @@ async fn execute_task(
         ),
     };
 
-    if let Some(adapter) = zindeks_adapter.as_ref()
+    if let Some(adapter) = bound_backend.as_ref()
         && mutated_any
     {
         if adapter.watching() {
-            // The spawned zindeks server has its own poll-watcher running
-            // (ZINDEKS_WATCH=1) and will pick up the mutation on its own —
-            // no need for Kode to trigger an explicit refresh.
+            // The engine's own watcher is running and will pick up the
+            // mutation on its own — no need for Kode to trigger a refresh.
             events.emit(KodeEvent::SourcedNote {
                 text: "zindeks watcher active — index updates automatically".to_string(),
                 source: NoteSource::Zindeks,
@@ -935,83 +937,6 @@ async fn run_plan_phase(
         Ok(PlanOutcome::Approved { effective_task })
     } else {
         Ok(PlanOutcome::Rejected { outcome })
-    }
-}
-
-/// Whether the Ingat autostart flow should run: only when the config opts
-/// in and this process hasn't already made its one attempt. Pure — kept
-/// separate from the I/O so the decision is unit-testable on its own.
-fn should_attempt_autostart(autostart: bool, already_attempted: bool) -> bool {
-    autostart && !already_attempted
-}
-
-/// Polls `adapter.health()` up to `attempts` times (2s timeout per call),
-/// sleeping `interval` between attempts, returning `true` on the first
-/// success and `false` if every attempt fails. With the defaults used below
-/// (10 attempts, 500ms interval) this budgets roughly 5s total.
-async fn poll_ingat_health(adapter: &IngatAdapter, attempts: u32, interval: Duration) -> bool {
-    for attempt in 0..attempts {
-        if let Ok(Ok(())) = tokio::time::timeout(Duration::from_secs(2), adapter.health()).await {
-            return true;
-        }
-        if attempt + 1 < attempts {
-            tokio::time::sleep(interval).await;
-        }
-    }
-    false
-}
-
-/// Called only after the initial Ingat health check has already failed.
-/// When autostart is enabled and this process hasn't tried yet, locates the
-/// installed service, starts it detached, and re-polls health — reporting
-/// each step via `KodeEvent::SourcedNote`. Returns `Some` when the retry
-/// succeeds, `None` otherwise (task proceeds without engineering memory).
-async fn maybe_autostart_ingat(
-    cfg: &IngatConfig,
-    events: &EventBus,
-) -> Option<Arc<dyn EngineeringMemory>> {
-    let already_attempted = INGAT_AUTOSTART_ATTEMPTED.get().is_some();
-    if !should_attempt_autostart(cfg.autostart, already_attempted) {
-        return None;
-    }
-    // Mark the attempt immediately (not just on success) — this is a
-    // one-shot-per-process flag regardless of outcome.
-    let _ = INGAT_AUTOSTART_ATTEMPTED.set(());
-
-    events.emit(KodeEvent::SourcedNote {
-        text: "ingat: service not running — starting it".to_string(),
-        source: NoteSource::Ingat,
-    });
-
-    let Some(path) = crate::setup::find_mcp_service() else {
-        events.emit(KodeEvent::SourcedNote {
-            text: "ingat: service not installed — run kode setup".to_string(),
-            source: NoteSource::Ingat,
-        });
-        return None;
-    };
-
-    if let Err(e) = crate::setup::spawn_detached(&path) {
-        events.emit(KodeEvent::SourcedNote {
-            text: format!("ingat: failed to start service: {e}"),
-            source: NoteSource::Ingat,
-        });
-        return None;
-    }
-
-    let adapter = IngatAdapter::new(cfg);
-    if poll_ingat_health(&adapter, 10, Duration::from_millis(500)).await {
-        events.emit(KodeEvent::SourcedNote {
-            text: "ingat: service started".to_string(),
-            source: NoteSource::Ingat,
-        });
-        Some(Arc::new(adapter) as Arc<dyn EngineeringMemory>)
-    } else {
-        events.emit(KodeEvent::SourcedNote {
-            text: "ingat: service did not become healthy — continuing without memory".to_string(),
-            source: NoteSource::Ingat,
-        });
-        None
     }
 }
 
@@ -1396,31 +1321,6 @@ mod plan_phase_tests {
         // mirrors `run_task`'s real control flow: the exec-turn
         // `agent.run_with_context` call only runs in the `Approved` arm.
         assert_eq!(mock.requests().len(), 1);
-    }
-}
-
-#[cfg(test)]
-mod ingat_autostart_tests {
-    use super::should_attempt_autostart;
-
-    #[test]
-    fn attempts_when_enabled_and_not_yet_attempted() {
-        assert!(should_attempt_autostart(true, false));
-    }
-
-    #[test]
-    fn skips_when_disabled() {
-        assert!(!should_attempt_autostart(false, false));
-    }
-
-    #[test]
-    fn skips_when_already_attempted() {
-        assert!(!should_attempt_autostart(true, true));
-    }
-
-    #[test]
-    fn skips_when_disabled_and_already_attempted() {
-        assert!(!should_attempt_autostart(false, true));
     }
 }
 

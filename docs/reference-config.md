@@ -37,20 +37,16 @@ effort = "high"
 | Key | Type | Default | Effect |
 |---|---|---|---|
 | `enabled` | bool | `true` | Whether Kode uses zindeks for code-graph context at all. |
-| `transport` | string | `"stdio"` | `"stdio"` spawns the binary named by `command` as a child process; `"tcp"` connects to `tcp_addr` instead. |
-| `command` | string | `"zindeks"` | Binary spawned for stdio transport. |
-| `tcp_addr` | string | `"127.0.0.1:7717"` | Address used when `transport = "tcp"`. |
-| `watch` | bool | `true` | Enables zindeks's built-in poll-based file watcher (`ZINDEKS_WATCH=1`) on the spawned stdio child, so the index refreshes itself in the background. Only takes effect for `transport = "stdio"`: Kode doesn't control a TCP server's process, so it can't set its environment. |
+| `watch` | bool | `true` | Runs the in-process engine's background poll watcher, so the index refreshes itself instead of via Kode's explicit post-task refresh. |
+| `store_root` | path | `~/.kode/zindeks/` | Where the in-process engine keeps its index (isolated from any standalone zindeks index). |
 
-**Watch semantics:** with `watch = true` (the default) and `transport = "stdio"`, the index polls for filesystem changes on its own every 2 seconds, so Kode's pipeline skips its own post-task refresh call: the watcher already has it covered. If `watch = false`, or the transport is `"tcp"` (Kode never controls a TCP server's watcher), Kode falls back to an explicit refresh after each task instead.
+**Watch semantics:** with `watch = true` (the default), the engine polls for filesystem changes on its own every 2 seconds, so Kode's pipeline skips its own post-task refresh call: the watcher already has it covered. With `watch = false`, Kode falls back to an explicit refresh after each task instead.
 
 ```toml
 [zindeks]
 enabled = true
-transport = "stdio"
-command = "zindeks"
-tcp_addr = "127.0.0.1:7717"
 watch = true
+# store_root = "/custom/zindeks"
 ```
 
 ## `[ingat]`
@@ -58,14 +54,12 @@ watch = true
 | Key | Type | Default | Effect |
 |---|---|---|---|
 | `enabled` | bool | `true` | Whether Kode uses Ingat for engineering-memory context. |
-| `url` | string | `"http://127.0.0.1:3200"` | Base URL of the Ingat REST API. |
-| `autostart` | bool | `true` | When the Ingat service is unreachable at task start, automatically locate and start the installed service, then retry once before falling back to memory-less operation. At most one attempt per `kode` process. |
+| `store_path` | path | `~/.kode/ingat/memory.sqlite3` | SQLite store for Kode's native, in-process memory. |
 
 ```toml
 [ingat]
 enabled = true
-url = "http://127.0.0.1:3200"
-autostart = true
+# store_path = "/custom/memory.sqlite3"
 ```
 
 ## `[agent]`
@@ -275,15 +269,12 @@ effort = "high"
 
 [zindeks]
 enabled = true
-transport = "stdio"
-command = "zindeks"
-tcp_addr = "127.0.0.1:7717"
 watch = true
+# store_root = "/custom/zindeks"
 
 [ingat]
 enabled = true
-url = "http://127.0.0.1:3200"
-autostart = true
+# store_path = "/custom/memory.sqlite3"
 
 [agent]
 max_tool_calls = 0

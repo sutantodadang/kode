@@ -51,13 +51,13 @@ If you use an opencode-family provider instead (paste an API key), see [howto-au
 
 ## Step 3: Install the engines and confirm health
 
-Kode's intelligence comes from two engines: zindeks (code graph) and Ingat (engineering memory). Install them with consent:
+Kode's intelligence runs in-process: a pinned zindeks shared library (code graph) and Ingat's headless core (engineering memory). `kode setup` downloads the pinned zindeks library (checksum-verified) and initializes the native memory store:
 
 ```
 kode setup
 ```
 
-Kode prompts before downloading anything. Confirm, and it installs both engines to Kode's managed bin directory. Skip the prompts with `kode setup --yes` if you already trust the source.
+Kode prompts before downloading anything. Skip the prompt with `kode setup --yes` if you already trust the source.
 
 Confirm everything is wired up:
 
@@ -65,7 +65,7 @@ Confirm everything is wired up:
 kode doctor
 ```
 
-`doctor` checks config, LLM auth, zindeks, Ingat, git, and environment, and reports each check as pass, fail, or skipped. A skipped check is never reported as passed: if zindeks isn't installed yet, you will see it called out honestly, not silently green.
+`doctor` checks config, LLM auth, zindeks, Ingat, git, and environment, and reports each check as pass, fail, or skipped. A skipped check is never reported as passed: if the zindeks library isn't installed yet, you will see it called out honestly, not silently green.
 
 ## Step 4: Run the TUI on a real task
 

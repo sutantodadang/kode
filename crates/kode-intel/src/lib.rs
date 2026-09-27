@@ -1,14 +1,16 @@
+pub mod embedded;
 pub mod error;
+pub mod ffi;
+pub mod mapping;
 pub mod mock;
 pub mod types;
-pub mod zindeks;
 
+pub use embedded::EmbeddedZindeks;
 pub use error::{IntelError, Result};
 pub use mock::MockCodeIntelligence;
 pub use types::{
     CodeContext, CodeContextRequest, CodeSearchResult, FileOutline, IntelHealth, OutlineSymbol,
 };
-pub use zindeks::ZindeksAdapter;
 
 /// Domain-level access to a local code intelligence backend (zindeks).
 ///
@@ -27,4 +29,24 @@ pub trait CodeIntelligence: Send + Sync {
 
     /// Symbol outline for a single file.
     async fn file_outline(&self, path: &str) -> Result<FileOutline>;
+
+    /// Bind the selected repository for this session without performing a
+    /// first-time index. Backends with nothing to bind may leave this default.
+    async fn ensure_bound(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Perform an explicit, user-requested index of the selected repository.
+    /// Only `kode index` calls this; the default backend does not support it.
+    async fn index_repository(&self) -> Result<()> {
+        Err(IntelError::Tool(
+            "index_repository is not supported by this backend".to_string(),
+        ))
+    }
+
+    /// Whether the backend applies index updates in the background (watcher
+    /// on) so callers can skip their post-task refresh.
+    fn watching(&self) -> bool {
+        false
+    }
 }
