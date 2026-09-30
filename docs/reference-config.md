@@ -236,10 +236,12 @@ required = true
 | Key | Type | Default | Effect |
 |---|---|---|---|
 | `reduced_motion` | bool | `false` | When `true`, freezes the TUI's low-frequency spinner, evidence-row fade, and Run Map active-marker pulse. Streaming coalescing (buffering model output before it hits the transcript) stays active regardless — it is buffering, not motion. |
+| `theme` | string | `"dark"` | `"dark"` keeps the default palette; `"light"` swaps to darker, higher-contrast colors for light terminal backgrounds. Kode falls back to a 256-color palette automatically unless `COLORTERM` contains `truecolor`/`24bit` or `WT_SESSION` is set. Kode never sets the background; the terminal's own is used. |
 
 ```toml
 [ui]
 reduced_motion = false
+theme = "dark"
 ```
 
 ## `[mcp.servers.<name>]`
@@ -310,6 +312,7 @@ enabled = true
 
 [ui]
 reduced_motion = false
+theme = "dark"
 ```
 
 Every section is optional. Any key you omit falls back to the default listed above; `kode` writes back only the keys it changes (for example `/model` or `/effort` in the TUI), preserving everything else already in the file, including unknown keys from a future version.

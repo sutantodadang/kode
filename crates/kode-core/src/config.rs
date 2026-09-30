@@ -469,6 +469,16 @@ pub enum PermissionMode {
     Deny,
 }
 
+/// TUI color theme. `Light` swaps the palette for light terminal backgrounds;
+/// the background itself is never set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UiTheme {
+    #[default]
+    Dark,
+    Light,
+}
+
 /// TUI motion preferences. Per `DESIGN.md`'s Motion section: `[ui]
 /// reduced_motion = true` kills spinner glyph animation, the knowledge-band
 /// evidence-row dim→normal fade, and the Ledger active-marker pulse.
@@ -479,12 +489,15 @@ pub enum PermissionMode {
 pub struct UiConfig {
     #[serde(default = "default_reduced_motion")]
     pub reduced_motion: bool,
+    #[serde(default)]
+    pub theme: UiTheme,
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
             reduced_motion: default_reduced_motion(),
+            theme: UiTheme::default(),
         }
     }
 }
@@ -646,6 +659,27 @@ timeout_seconds = 120
 
         let cfg = KodeConfig::load(&dir).unwrap();
         assert!(cfg.ui.reduced_motion);
+    }
+
+    #[test]
+    fn ui_theme_light_parses_and_defaults_dark() {
+        let dir = temp_project_dir();
+        let kode_dir = dir.join(".kode");
+        std::fs::create_dir_all(&kode_dir).unwrap();
+        std::fs::write(kode_dir.join("config.toml"), "[ui]\ntheme = \"light\"\n").unwrap();
+        let cfg = KodeConfig::load(&dir).unwrap();
+        assert_eq!(cfg.ui.theme, UiTheme::Light);
+
+        let dir = temp_project_dir();
+        let kode_dir = dir.join(".kode");
+        std::fs::create_dir_all(&kode_dir).unwrap();
+        std::fs::write(
+            kode_dir.join("config.toml"),
+            "[ui]\nreduced_motion = true\n",
+        )
+        .unwrap();
+        let cfg = KodeConfig::load(&dir).unwrap();
+        assert_eq!(cfg.ui.theme, UiTheme::Dark);
     }
 
     #[test]
