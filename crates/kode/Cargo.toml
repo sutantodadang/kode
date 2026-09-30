@@ -30,3 +30,5 @@ ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 crossterm = { workspace = true }
 futures = { workspace = true }
 getrandom = { workspace = true }
+unicode-segmentation = "1.13"
+unicode-width = "0.2"

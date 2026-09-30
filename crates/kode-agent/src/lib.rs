@@ -107,15 +107,10 @@ Delegation: when `delegate_task` is offered, use it only for an independent, bou
     )
 }
 
-/// A repeated identical tool call is blocked after this many occurrences in a
-/// row, to stop the model from looping on the same no-op action.
-const MAX_REPEAT_CALLS: u32 = 2;
-
 pub struct Agent {
     model: Arc<dyn Model>,
     tools: ToolRuntime,
     events: EventBus,
-    max_tool_calls: u32,
     model_retries: u32,
     model_retry_base_ms: u64,
     prompt_budget: PromptBudget,
@@ -178,7 +173,6 @@ impl Agent {
             model,
             tools,
             events,
-            max_tool_calls: agent_cfg.max_tool_calls,
             model_retries: agent_cfg.model_retries.min(10),
             model_retry_base_ms: agent_cfg.model_retry_base_ms,
             prompt_budget: PromptBudget::new(agent_cfg.max_context_tokens),
@@ -363,8 +357,6 @@ impl Agent {
 
         let mut usage = Usage::default();
         let mut total_tool_calls: u32 = 0;
-        let mut last_call: Option<(String, String)> = None;
-        let mut repeat_count: u32 = 0;
         let mut mutated = false;
         let mut steering_open = steering.is_some();
         let mut compaction_available = self.auto_compact;
@@ -572,28 +564,6 @@ impl Agent {
             });
 
             for call in &response.tool_calls {
-                if self.max_tool_calls > 0 && total_tool_calls >= self.max_tool_calls {
-                    return Err(AgentError::ToolCallLimit(self.max_tool_calls));
-                }
-
-                let canonical_args = serde_json::to_string(&call.arguments).unwrap_or_default();
-                let is_repeat = last_call
-                    .as_ref()
-                    .is_some_and(|(name, args)| *name == call.name && *args == canonical_args);
-                repeat_count = if is_repeat { repeat_count + 1 } else { 1 };
-                last_call = Some((call.name.clone(), canonical_args));
-
-                if repeat_count > MAX_REPEAT_CALLS {
-                    total_tool_calls += 1;
-                    messages.push(Message::Tool {
-                        tool_call_id: call.id.clone(),
-                        content:
-                            "error: identical tool call repeated too many times; change approach"
-                                .to_string(),
-                    });
-                    continue;
-                }
-
                 self.events.emit(KodeEvent::ToolRequested {
                     name: call.name.clone(),
                 });
@@ -1479,7 +1449,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_call_limit_returns_err() {
+    async fn agent_completes_after_multiple_tool_calls() {
         let dir = temp_dir();
         let mock = MockModel::new();
         for i in 0..3 {
@@ -1490,20 +1460,25 @@ mod tests {
             });
             mock.push_script(script);
         }
+        mock.push_script(vec![
+            StreamEvent::TextDelta("done".into()),
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: None,
+            },
+        ]);
 
         let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
-        let agent_cfg = AgentConfig {
-            max_tool_calls: 2,
-            ..Default::default()
-        };
+        let agent_cfg = AgentConfig::default();
         let agent = Agent::new(Arc::new(mock), tools, EventBus::new(64), &agent_cfg);
 
-        let err = agent.run("call tools", &ctx(dir)).await.unwrap_err();
-        assert!(matches!(err, AgentError::ToolCallLimit(2)));
+        let outcome = agent.run("call tools", &ctx(dir)).await.unwrap();
+        assert_eq!(outcome.tool_calls, 3);
+        assert_eq!(outcome.final_text, "done");
     }
 
     #[tokio::test]
-    async fn repeated_identical_call_is_blocked_then_agent_finishes() {
+    async fn repeated_identical_calls_are_not_silently_skipped() {
         let dir = temp_dir();
         let mock = MockModel::new();
         for _ in 0..4 {
@@ -1533,6 +1508,7 @@ mod tests {
 
         let outcome = agent.run("repeat", &ctx(dir)).await.unwrap();
         assert_eq!(outcome.final_text, "done");
+        assert_eq!(outcome.tool_calls, 4);
 
         let requests = mock.requests();
         let has_repeat_message = requests.iter().any(|r| {
@@ -1540,7 +1516,7 @@ mod tests {
                 .iter()
                 .any(|m| matches!(m, Message::Tool { content, .. } if content.contains("repeated")))
         });
-        assert!(has_repeat_message);
+        assert!(!has_repeat_message);
     }
 
     #[tokio::test]

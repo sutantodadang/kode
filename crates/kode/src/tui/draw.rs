@@ -1,5 +1,6 @@
+use std::collections::VecDeque;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -7,6 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
+use unicode_width::UnicodeWidthStr;
 
 use kode_core::event::TaskStep;
 
@@ -16,10 +18,10 @@ use super::state::*;
 use super::theme;
 use crate::custom_commands;
 
-/// Renders an 8-cell (by default) meter string: `▓` for filled cells,
-/// `░` for empty ones. `budget == 0` yields an all-empty meter (no
-/// division by zero). Pure — the caller applies Z/DIM coloring per cell.
-#[cfg(test)]
+/// Renders an 8-cell (by default) meter string: `■` for filled cells,
+/// `□` for empty ones. `budget == 0` yields an all-empty meter (no
+/// division by zero). Pure — the caller applies default/DIM coloring per
+/// cell.
 pub fn meter(used: usize, budget: usize, cells: usize) -> String {
     let filled = if budget == 0 {
         0
@@ -27,9 +29,9 @@ pub fn meter(used: usize, budget: usize, cells: usize) -> String {
         let ratio = used as f64 / budget as f64;
         ((ratio * cells as f64).round() as usize).min(cells)
     };
-    let mut s = String::with_capacity(cells);
+    let mut s = String::with_capacity(cells * 3);
     for i in 0..cells {
-        s.push(if i < filled { '▓' } else { '░' });
+        s.push(if i < filled { '■' } else { '□' });
     }
     s
 }
@@ -119,32 +121,43 @@ pub fn input_suffix(knowledge: Option<&KnowledgeState>) -> InputSuffix {
     }
 }
 
-/// One idle empty-state engine-status line: ` {label}: {status word}`.
-pub(crate) fn engine_status_line(
+/// Display width of a span list, in terminal cells.
+fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum()
+}
+
+/// One idle empty-state engine-status body: `{label}: {status word}`.
+/// `disabled` is a caution (`WARN`); `available after first task` stays dim.
+pub(crate) fn engine_status_spans(
     label: &str,
     enabled: bool,
     source_seen: bool,
     ready_color: Color,
-) -> Line<'static> {
+) -> Vec<Span<'static>> {
     let (text, style) = match engine_status(enabled, source_seen) {
-        EngineStatus::Disabled => ("disabled".to_string(), Style::default().fg(theme::DIM)),
+        EngineStatus::Disabled => ("disabled".to_string(), Style::default().fg(theme::WARN)),
         EngineStatus::Ready => ("ready".to_string(), Style::default().fg(ready_color)),
         EngineStatus::AvailableAfterFirstTask => (
             "available after first task".to_string(),
             Style::default().fg(theme::DIM),
         ),
     };
-    Line::from(vec![
-        Span::styled(format!(" {label}: "), Style::default().fg(theme::MUTED)),
+    vec![
+        Span::styled(format!("{label}: "), Style::default().fg(theme::MUTED)),
         Span::styled(text, style),
-    ])
+    ]
 }
 
-/// Builds the idle empty-state block: version/tagline, per-engine status
-/// (zindeks/ingat), then the input nudge and command list. Top-left
-/// anchored, one blank row down — never vertically centered, per
-/// `DESIGN.md`'s calm-instrument direction.
-pub(crate) fn empty_state_lines(state: &AppState) -> Vec<Line<'static>> {
+/// Builds the idle empty-state block on the thread gutter: column heads,
+/// one knot row per engine (graph, memory, git), then the input nudge.
+/// Top-left anchored, one blank row down — never vertically centered, per
+/// `DESIGN.md`'s calm-instrument direction. `width` picks the wide (7-cell)
+/// or narrow (3-cell) gutter.
+pub(crate) fn empty_state_lines(state: &AppState, width: u16) -> Vec<Line<'static>> {
+    let wide = is_wide(width);
     let zindeks_seen = state
         .knowledge
         .as_ref()
@@ -153,44 +166,49 @@ pub(crate) fn empty_state_lines(state: &AppState) -> Vec<Line<'static>> {
         .knowledge
         .as_ref()
         .is_some_and(|k| !k.ingat.is_empty());
-    let repo = if state.repo_dir.is_empty() {
-        "this repository"
-    } else {
-        state.repo_dir.as_str()
-    };
-    let dirty = if state.dirty {
-        "worktree has changes"
-    } else {
-        "worktree clean"
-    };
-    let mut lines = vec![
-        Line::default(),
-        Line::from(Span::styled(
-            format!(" Ready in {repo}"),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        engine_status_line("code graph", state.zindeks_enabled, zindeks_seen, theme::Z),
-        engine_status_line("memory", state.ingat_enabled, ingat_seen, theme::I),
-        Line::from(vec![
-            Span::styled(" git: ", Style::default().fg(theme::MUTED)),
-            Span::styled(dirty, Style::default().fg(theme::G)),
-        ]),
-        Line::default(),
-        Line::from(Span::styled(
-            " Start from here",
-            Style::default()
-                .fg(theme::MUTED)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(" › Review the current diff"),
-        Line::from(" › Explain this repository"),
-        Line::from(" › Attach a screenshot and describe the problem"),
-        Line::default(),
-        Line::from(Span::styled(
-            " Type a task, paste an image path, or press / for actions.",
-            Style::default().fg(theme::DIM),
-        )),
+    let git_body = vec![
+        Span::styled("git: ", Style::default().fg(theme::MUTED)),
+        if state.dirty {
+            Span::styled("worktree has changes", Style::default().fg(theme::WARN))
+        } else {
+            Span::raw("worktree clean")
+        },
     ];
+    let row = |gutter: Gutter, body: Vec<Span<'static>>, name: &str, color: Color| {
+        let mut spans = gutter_spans(gutter, false, wide);
+        spans.extend(body);
+        if wide {
+            let used = spans_width(&spans);
+            let name_w = name.chars().count();
+            if used + name_w + 2 <= width as usize {
+                spans.push(Span::raw(" ".repeat(width as usize - used - name_w - 1)));
+                spans.push(Span::styled(name.to_string(), Style::default().fg(color)));
+            }
+        }
+        Line::from(spans)
+    };
+    let mut lines = vec![Line::default(), thread_head_line(wide)];
+    lines.push(row(
+        Gutter::Zindeks,
+        engine_status_spans("code graph", state.zindeks_enabled, zindeks_seen, theme::Z),
+        "graph",
+        theme::Z,
+    ));
+    lines.push(row(
+        Gutter::Ingat,
+        engine_status_spans("memory", state.ingat_enabled, ingat_seen, theme::I),
+        "memory",
+        theme::I,
+    ));
+    lines.push(row(Gutter::Git, git_body, "git", theme::G));
+    lines.push(Line::from(gutter_spans(Gutter::Prose, false, wide)));
+    lines.push(Line::from(vec![
+        Span::raw(if wide { "        " } else { "   " }),
+        Span::styled(
+            "Type a task, or press / for commands and ? for help.",
+            Style::default().fg(theme::MUTED),
+        ),
+    ]));
     if !state.status.model.is_empty() {
         return lines;
     }
@@ -201,7 +219,7 @@ pub(crate) fn empty_state_lines(state: &AppState) -> Vec<Line<'static>> {
     lines
 }
 
-pub(crate) const SPINNER_FRAMES: [char; 4] = ['·', '•', '●', '•'];
+pub(crate) const SPINNER_FRAMES: [char; 4] = ['◐', '◓', '◑', '◒'];
 
 fn compact_tokens(tokens: usize) -> String {
     if tokens < 1000 {
@@ -211,22 +229,22 @@ fn compact_tokens(tokens: usize) -> String {
     }
 }
 
-/// The single heartbeat advances at 1 Hz. Faster pulses read as anxiety in
-/// a long-running engineering task and compete with streamed prose.
+/// The single heartbeat advances every 250 ms (4 frames per second-long
+/// turn of the glyph); it is the only animated cell on screen.
 pub(crate) fn spinner_frame(elapsed_ms: u128) -> char {
-    let idx = ((elapsed_ms / 1000) % 4) as usize;
+    let idx = ((elapsed_ms / 250) % 4) as usize;
     SPINNER_FRAMES[idx]
 }
 
 /// The spinner glyph to actually render: cycles through `SPINNER_FRAMES` at
-/// 4 Hz normally, but holds a single static frame when `reduced_motion` is
+/// 250 ms per frame normally, but holds a single static frame when `reduced_motion` is
 /// on (`[ui] reduced_motion`, item 1) or a token stream is actively
 /// producing (`streaming`, item 2 — the transcript is the one moving
 /// region while tokens flow; the spinner resumes once no tokens are in
 /// flight).
 pub(crate) fn spinner_glyph(elapsed_ms: u128, reduced_motion: bool, streaming: bool) -> char {
     if reduced_motion || streaming {
-        SPINNER_FRAMES[2]
+        SPINNER_FRAMES[0]
     } else {
         spinner_frame(elapsed_ms)
     }
@@ -275,28 +293,93 @@ pub(crate) fn ledger_pulse_glyph(elapsed_ms: u128, running: bool, reduced_motion
     }
 }
 
-/// Maps a `Gutter` to its fixed 2-col glyph prefix and color, per
-/// `DESIGN.md`'s glyph vocabulary. Every color pairs with a fixed glyph —
-/// shape carries meaning without color.
-pub(crate) fn gutter_prefix(gutter: &Gutter) -> (&'static str, Color) {
-    match gutter {
-        Gutter::None => ("  ", Color::Reset),
-        Gutter::Prose => ("│ ", theme::DIM),
-        Gutter::Tool => ("T▸", theme::T),
-        Gutter::ToolFail => ("T▸", theme::ERR),
-        Gutter::Verify => ("V ", theme::OK),
-        Gutter::VerifyFail => ("V ", theme::ERR),
-        Gutter::VerifySkip => ("V ", theme::DIM),
-        Gutter::Note => ("· ", theme::DIM),
-        // Per DESIGN.md's decision log: the transcript gutter's Z/I glyphs
-        // stay their source colors (cyan/amber), but G renders dim — same
-        // literal spec as the item that introduced this gutter, distinct
-        // from the Knowledge Band's git-green `theme::G`.
-        Gutter::Zindeks => ("Z ", theme::Z),
-        Gutter::Ingat => ("I ", theme::I),
-        Gutter::Git => ("G ", theme::DIM),
-        Gutter::Error => ("× ", theme::ERR),
-        Gutter::User => ("U ", Color::Reset),
+/// Wide layout (7-cell thread gutter, step-rail names, ctx meter) applies
+/// from 80 columns up; below that the gutter collapses to 3 cells.
+pub(crate) fn is_wide(width: u16) -> bool {
+    width >= 80
+}
+
+/// True when a tool line names an edit-class tool (`edit`, `write`,
+/// `patch`), which draws as a knot on the thread rather than a plain run.
+fn is_edit_tool(line: &TranscriptLine) -> bool {
+    const EDIT_WORDS: [&str; 3] = ["edit", "write", "patch"];
+    std::iter::once(&line.text)
+        .chain(line.tool_children.iter())
+        .any(|name| {
+            let name = name.to_ascii_lowercase();
+            EDIT_WORDS.iter().any(|word| name.contains(word))
+        })
+}
+
+/// The gutter cells for one transcript line, per `DESIGN.md`'s thread
+/// vocabulary. `wide` selects the 7-cell three-thread gutter (graph, memory,
+/// git) over the 3-cell one. `edit` marks an edit-class tool. Prose, notes
+/// and errors carry idle DIM threads; `None`/`User` carry no gutter.
+pub(crate) fn gutter_spans(gutter: Gutter, edit: bool, wide: bool) -> Vec<Span<'static>> {
+    let dim = Style::default().fg(theme::DIM);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let run = |c: Color| Style::default().fg(c);
+    let knot = |c: Color| Style::default().fg(c).add_modifier(Modifier::BOLD);
+    let span = |text: &'static str, style: Style| Span::styled(text, style);
+    let edit_style = if gutter == Gutter::ToolFail {
+        knot(theme::ERR)
+    } else {
+        bold
+    };
+    match (gutter, wide) {
+        (Gutter::None | Gutter::User | Gutter::ThreadHead, _) => Vec::new(),
+        (Gutter::Zindeks, true) => vec![span("●", knot(theme::Z)), span("─┼─┼─ ", run(theme::Z))],
+        (Gutter::Ingat, true) => vec![
+            span("│ ", dim),
+            span("●", knot(theme::I)),
+            span("─┼─ ", run(theme::I)),
+        ],
+        (Gutter::Git, true) => vec![
+            span("│ │ ", dim),
+            span("●", knot(theme::G)),
+            span("─ ", run(theme::G)),
+        ],
+        (Gutter::Zindeks, false) => vec![span("g●", knot(theme::Z)), span(" ", dim)],
+        (Gutter::Ingat, false) => vec![span("m●", knot(theme::I)), span(" ", dim)],
+        (Gutter::Git, false) => vec![span("t●", knot(theme::G)), span(" ", dim)],
+        (Gutter::Route, true) => vec![span("╰─┴─┴▶ ", bold)],
+        (Gutter::Route, false) => vec![span("▶  ", bold)],
+        (Gutter::Tool | Gutter::ToolFail, true) if edit => vec![span("●═╪═╪═ ", edit_style)],
+        (Gutter::Tool | Gutter::ToolFail, false) if edit => vec![span("●═ ", edit_style)],
+        (Gutter::Verify | Gutter::VerifyFail | Gutter::VerifySkip, true) => {
+            vec![span("┆ ┆ ┆  ", dim)]
+        }
+        (_, true) => vec![span("│ │ │  ", dim)],
+        (_, false) => vec![span("   ", dim)],
+    }
+}
+
+/// The `g m t` column-head row (each letter bold in its source color) drawn
+/// once before a run's first graph/memory/git line. Empty at narrow width,
+/// where each source line carries its own letter instead.
+fn thread_head_line(wide: bool) -> Line<'static> {
+    if !wide {
+        return Line::default();
+    }
+    let head = |letter: &'static str, c: Color| {
+        Span::styled(letter, Style::default().fg(c).add_modifier(Modifier::BOLD))
+    };
+    Line::from(vec![
+        head("g", theme::Z),
+        Span::raw(" "),
+        head("m", theme::I),
+        Span::raw(" "),
+        head("t", theme::G),
+    ])
+}
+
+/// Result glyph (and word, for skips) plus color for one check status:
+/// passed `✓`, failed `✗`, skipped `⊘ skipped`.
+fn check_mark(status: StepStatusLite) -> (&'static str, Color) {
+    match status {
+        StepStatusLite::Passed => ("✓", theme::OK),
+        StepStatusLite::Failed => ("✗", theme::ERR),
+        StepStatusLite::Skipped => ("⊘ skipped", theme::WARN),
     }
 }
 
@@ -313,38 +396,235 @@ pub(crate) fn md_span_style(style: &markdown::MdStyle) -> Style {
     }
 }
 
-/// Renders one transcript line as a gutter span + text span(s). Long lines
-/// wrap via `Paragraph`'s own word-wrap without gutter-aligned
-/// continuation (acceptable ceiling for this phase). Markdown-rendered
-/// Prose lines (`md_kind`/`spans` both `Some`) render their styled spans;
-/// everything else falls back to the legacy plain-text span.
-pub(crate) fn transcript_line_to_ratatui(line: &TranscriptLine) -> Line<'static> {
-    let (prefix, color) = gutter_prefix(&line.gutter);
-    let mut prefix_style = Style::default().fg(color);
-    // Source/user letters are bold per DESIGN.md's glyph vocabulary. Agent
-    // prose keeps a quiet bar so a multi-line response reads as one block.
-    if matches!(
-        line.gutter,
-        Gutter::Tool
-            | Gutter::ToolFail
-            | Gutter::Verify
-            | Gutter::VerifyFail
-            | Gutter::VerifySkip
-            | Gutter::Zindeks
-            | Gutter::Ingat
-            | Gutter::Git
-            | Gutter::User
-    ) {
-        prefix_style = prefix_style.add_modifier(Modifier::BOLD);
+/// Cells of the thread run revealed after the knot: 0..=3 over 3 frames of
+/// 40 ms. Reduced motion shows the final state.
+pub(crate) fn thread_pull_frame(elapsed_ms: u128, reduced_motion: bool) -> u8 {
+    if reduced_motion {
+        return 3;
     }
-    let mut spans = vec![Span::styled(prefix, prefix_style)];
+    (elapsed_ms / 40).min(3) as u8
+}
+
+/// Route gutter cells revealed (0..=6) over 4 frames of 50 ms.
+pub(crate) fn converge_cells(elapsed_ms: u128, reduced_motion: bool) -> usize {
+    if reduced_motion {
+        return 6;
+    }
+    let frame = (elapsed_ms / 50).min(4) as usize;
+    frame * 6 / 4
+}
+
+/// Filled bar cells shown: 0 until 200 ms, then one more every 30 ms, capped
+/// at `filled`.
+pub(crate) fn bar_fill_cells(elapsed_ms: u128, filled: usize, reduced_motion: bool) -> usize {
+    if reduced_motion {
+        return filled;
+    }
+    if elapsed_ms < 200 {
+        return 0;
+    }
+    let steps = (elapsed_ms - 200) / 30 + 1;
+    steps.min(filled as u128) as usize
+}
+
+/// Connector after a finished step: 1 heavy cell before 90 ms, 2 after.
+pub(crate) fn rail_fill_cells(elapsed_ms: u128, reduced_motion: bool) -> usize {
+    if reduced_motion || elapsed_ms >= 90 {
+        2
+    } else {
+        1
+    }
+}
+
+/// Sparkline level 0..=6 for `tokens` against the run's `peak` (0 tokens or
+/// peak 0 => 0; any tokens show at least level 1).
+pub(crate) fn pulse_level(tokens: u32, peak: u32) -> usize {
+    if tokens == 0 || peak == 0 {
+        return 0;
+    }
+    ((u64::from(tokens) * 6 / u64::from(peak)) as usize).clamp(1, 6)
+}
+
+/// Motion window: a line born less than this ago still needs per-frame
+/// re-rendering (longest animation is the bar fill, ~500 ms).
+const LINE_ANIMATION_MS: u128 = 600;
+
+/// True while a line born at `born` still needs per-frame re-rendering.
+/// Lines without a birth time (and reduced motion) are always final.
+pub(crate) fn line_animating(born: Option<Instant>, now: Instant, reduced_motion: bool) -> bool {
+    if reduced_motion {
+        return false;
+    }
+    born.is_some_and(|b| now.saturating_duration_since(b).as_millis() < LINE_ANIMATION_MS)
+}
+
+/// The token-pulse sparkline: the last `max_cells` cells. `Tokens` scale
+/// against the peak of the whole deque; `Tool` is `─`, `Wait` is `·`.
+pub(crate) fn pulse_spans(cells: &VecDeque<PulseCell>, max_cells: usize) -> Vec<Span<'static>> {
+    const LEVELS: [char; 7] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇'];
+    let peak = cells
+        .iter()
+        .filter_map(|c| match c {
+            PulseCell::Tokens(n) => Some(*n),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let skip = cells.len().saturating_sub(max_cells);
+    cells
+        .iter()
+        .skip(skip)
+        .map(|cell| match cell {
+            PulseCell::Tokens(n) => Span::raw(LEVELS[pulse_level(*n, peak)].to_string()),
+            PulseCell::Tool => Span::styled("─", Style::default().fg(theme::T)),
+            PulseCell::Wait => Span::styled("·", Style::default().fg(theme::WARN)),
+        })
+        .collect()
+}
+
+/// Idle thread pattern per gutter cell, shown where motion has not yet
+/// revealed the final cell.
+const IDLE_CELLS: [char; 7] = ['│', ' ', '│', ' ', '│', ' ', ' '];
+
+/// Replaces the gutter cells at positions where `hide` is true with the idle
+/// thread pattern in `theme::DIM`.
+fn mask_gutter(spans: Vec<Span<'static>>, hide: impl Fn(usize) -> bool) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    for span in spans {
+        for c in span.content.chars() {
+            if hide(pos) {
+                let idle = IDLE_CELLS.get(pos).copied().unwrap_or(' ');
+                out.push(Span::styled(
+                    idle.to_string(),
+                    Style::default().fg(theme::DIM),
+                ));
+            } else {
+                out.push(Span::styled(c.to_string(), span.style));
+            }
+            pos += 1;
+        }
+    }
+    out
+}
+
+/// Spans for a route line's text: a `■□` bar fills over time and the score
+/// stays hidden until the bar is full; `□` cells are DIM and a trailing
+/// ` low` is WARN. A route without a bar is one bold span.
+fn route_text_spans(text: &str, elapsed_ms: u128, reduced_motion: bool) -> Vec<Span<'static>> {
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let chars: Vec<char> = text.chars().collect();
+    let is_bar = |c: &char| matches!(c, '■' | '□');
+    let Some(start) = chars.iter().position(is_bar) else {
+        return vec![Span::styled(text.to_string(), bold)];
+    };
+    let len = chars[start..].iter().take_while(|c| is_bar(c)).count();
+    let filled = chars[start..start + len]
+        .iter()
+        .filter(|c| **c == '■')
+        .count();
+    let shown = bar_fill_cells(elapsed_ms, filled, reduced_motion);
+    let mut out = vec![
+        Span::styled(chars[..start].iter().collect::<String>(), bold),
+        Span::styled("■".repeat(shown), bold),
+        Span::styled("□".repeat(len - shown), Style::default().fg(theme::DIM)),
+    ];
+    if shown >= filled && (reduced_motion || elapsed_ms >= 200) {
+        let rest: String = chars[start + len..].iter().collect();
+        match rest.strip_suffix(" low") {
+            Some(head) => {
+                out.push(Span::styled(head.to_string(), bold));
+                out.push(Span::styled(" low", Style::default().fg(theme::WARN)));
+            }
+            None => out.push(Span::styled(rest, bold)),
+        }
+    }
+    out
+}
+
+/// Renders one transcript line as thread-gutter cells + text span(s) at the
+/// given transcript `width` (which picks the wide or narrow gutter).
+/// Markdown-rendered Prose lines (`md_kind`/`spans` both `Some`) render their
+/// styled spans; everything else falls back to the legacy plain-text span.
+///
+/// ponytail: wrapped continuation rows keep ratatui's plain wrap and carry no
+/// gutter; gutter-aligned continuation needs a custom wrapper.
+pub(crate) fn transcript_line_to_ratatui(line: &TranscriptLine, width: u16) -> Line<'static> {
+    transcript_line_at(line, width, Instant::now(), false, false)
+}
+
+/// [`transcript_line_to_ratatui`] with the Kode Benang motion inputs: `now`
+/// and `reduced_motion` drive the thread pull / route converge (pure
+/// functions of time since `line.born`), `trace_bold` bolds a fact line's
+/// text for the trace-back.
+pub(crate) fn transcript_line_at(
+    line: &TranscriptLine,
+    width: u16,
+    now: Instant,
+    reduced_motion: bool,
+    trace_bold: bool,
+) -> Line<'static> {
+    let wide = is_wide(width);
+    let elapsed = match line.born {
+        Some(born) if !reduced_motion => now.saturating_duration_since(born).as_millis(),
+        _ => u128::MAX,
+    };
+    match line.gutter {
+        Gutter::ThreadHead => return thread_head_line(wide),
+        Gutter::None if line.text.is_empty() => return Line::default(),
+        Gutter::User => {
+            let bold = Style::default().add_modifier(Modifier::BOLD);
+            return Line::from(vec![
+                Span::styled("YOU", bold),
+                Span::raw("  "),
+                Span::styled(line.text.clone(), bold),
+            ]);
+        }
+        _ => {}
+    }
+    let edit = matches!(line.gutter, Gutter::Tool | Gutter::ToolFail) && is_edit_tool(line);
+    let mut spans = gutter_spans(line.gutter, edit, wide);
+    if wide {
+        // (knot cell, run length) of each source thread.
+        let fact = match line.gutter {
+            Gutter::Zindeks => Some((0usize, 5usize)),
+            Gutter::Ingat => Some((2, 3)),
+            Gutter::Git => Some((4, 1)),
+            _ => None,
+        };
+        if let Some((knot, run)) = fact {
+            let frame = thread_pull_frame(elapsed, reduced_motion);
+            if frame < 3 {
+                let revealed = run * usize::from(frame) / 3;
+                let spans = mask_gutter(spans, |pos| pos > knot + revealed && pos <= knot + run);
+                return Line::from(spans);
+            }
+        } else if line.gutter == Gutter::Route {
+            let cells = converge_cells(elapsed, reduced_motion);
+            if cells < 6 {
+                spans = mask_gutter(spans, |pos| pos >= cells);
+            }
+        }
+    }
+    if line.gutter == Gutter::Error {
+        spans.push(Span::styled(
+            "FAILED ",
+            Style::default().fg(theme::ERR).add_modifier(Modifier::BOLD),
+        ));
+    }
     // A collapsible tool-group header (`tool_children` non-empty) gets a
     // collapse-state glyph ahead of its summary text — `▸` collapsed, `▾`
-    // expanded, both already in DESIGN.md's approved vocabulary (the `T▸`
-    // gutter, the `▸ {tool}` running label).
+    // expanded. Other non-edit tool lines get the plain `▸` tool marker.
     if !line.tool_children.is_empty() {
         let glyph = if line.expanded { "▾ " } else { "▸ " };
         spans.push(Span::styled(glyph, Style::default().fg(theme::DIM)));
+    } else if matches!(line.gutter, Gutter::Tool | Gutter::ToolFail) && !edit {
+        let color = if line.gutter == Gutter::ToolFail {
+            theme::ERR
+        } else {
+            theme::T
+        };
+        spans.push(Span::styled("▸ ", Style::default().fg(color)));
     }
 
     match (&line.md_kind, &line.spans) {
@@ -373,8 +653,12 @@ pub(crate) fn transcript_line_to_ratatui(line: &TranscriptLine) -> Line<'static>
                 spans.push(Span::styled(text.clone(), md_span_style(style)));
             }
         }
+        _ if line.gutter == Gutter::Route => {
+            spans.extend(route_text_spans(&line.text, elapsed, reduced_motion));
+        }
         _ => {
-            let style = if line.gutter == Gutter::User {
+            let fact = matches!(line.gutter, Gutter::Zindeks | Gutter::Ingat | Gutter::Git);
+            let style = if trace_bold && fact {
                 Style::default().add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
@@ -389,71 +673,140 @@ pub(crate) fn transcript_line_to_ratatui(line: &TranscriptLine) -> Line<'static>
         let (mark, color) = if ok {
             ("✓", theme::OK)
         } else {
-            ("×", theme::ERR)
+            ("✗", theme::ERR)
         };
         spans.push(Span::styled(
             format!(" · {duration:.1}s {mark}"),
             Style::default().fg(color),
         ));
     }
+    let verify_status = match line.gutter {
+        Gutter::Verify => Some(StepStatusLite::Passed),
+        Gutter::VerifyFail => Some(StepStatusLite::Failed),
+        Gutter::VerifySkip => Some(StepStatusLite::Skipped),
+        _ => None,
+    };
+    if let Some(status) = verify_status {
+        let (mark, color) = check_mark(status);
+        spans.push(Span::styled(format!(" {mark}"), Style::default().fg(color)));
+    }
+    // Right-align the source name on graph/memory/git lines when the text
+    // fits on one row; a wrapped line omits it.
+    let source = match line.gutter {
+        Gutter::Zindeks => Some(("graph", theme::Z)),
+        Gutter::Ingat => Some(("memory", theme::I)),
+        Gutter::Git => Some(("git", theme::G)),
+        _ => None,
+    };
+    if wide
+        && line.md_kind.is_none()
+        && let Some((name, color)) = source
+    {
+        let used = spans_width(&spans);
+        let name_w = name.len();
+        if used + name_w + 2 <= width as usize {
+            spans.push(Span::raw(" ".repeat(width as usize - used - name_w - 1)));
+            spans.push(Span::styled(name, Style::default().fg(color)));
+        }
+    }
     Line::from(spans)
 }
 
-/// Builds the stable scope rail. It answers where the user is and what
-/// authority the next submission has; configuration detail belongs in
-/// `/status`, not permanent chrome.
+/// `m:ss` for an elapsed millisecond count.
+fn fmt_mss(ms: u128) -> String {
+    let secs = ms / 1000;
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+/// Live counter text: `{:.1}s`, or whole seconds under `reduced_motion` so
+/// the row doesn't repaint every tick.
+fn fmt_counter(ms: u128, reduced_motion: bool) -> String {
+    if reduced_motion {
+        format!("{}s", ms / 1000)
+    } else {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    }
+}
+
+/// Builds the stable scope row: repo, branch, run authority (`PLAN`/`AUTO`),
+/// model, and a right-aligned context meter. When space is short the model
+/// drops first; authority labels never drop.
 pub(crate) fn scope_line(state: &AppState, width: u16) -> Line<'static> {
+    let w = width as usize;
     let branch = state.branch.clone().unwrap_or_else(|| "no git".to_string());
-    let mode = if state.plan_mode {
-        "PLAN"
-    } else if state.auto_mode {
-        "AUTO"
-    } else {
-        "BUILD"
-    };
-    let model_set = !state.status.model.is_empty();
-    let model = if model_set {
-        state.status.model.clone()
-    } else {
-        "pick model".to_string()
-    };
     let repo = if state.repo_dir.is_empty() {
         "."
     } else {
         state.repo_dir.as_str()
     };
-    let left_plain = format!(
-        " KODE / {repo}  {branch}{}",
-        if state.dirty { "*" } else { "" }
-    );
-    let right_plain = if width >= 72 {
-        format!("{mode} · {model}")
-    } else {
-        mode.to_string()
-    };
-    let pad = (width as usize)
-        .saturating_sub(left_plain.chars().count() + right_plain.chars().count() + 1);
-    let mut spans = vec![
-        Span::styled(" KODE / ", Style::default().fg(theme::DIM)),
+    let mut left = vec![
+        Span::raw(" "),
         Span::styled(
             repo.to_string(),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  "),
-        Span::raw(branch),
+        Span::raw(format!(" ⎇ {branch}")),
     ];
     if state.dirty {
-        spans.push(Span::styled("*", Style::default().fg(theme::G)));
+        left.push(Span::styled("*", Style::default().fg(theme::WARN)));
     }
-    spans.push(Span::raw(" ".repeat(pad)));
-    spans.push(Span::styled(
-        right_plain,
-        Style::default().fg(if state.auto_mode {
-            theme::WARN
+    for (on, label) in [(state.plan_mode, "PLAN"), (state.auto_mode, "AUTO")] {
+        if on {
+            left.push(Span::raw("  "));
+            left.push(Span::styled(
+                label,
+                Style::default()
+                    .fg(theme::WARN)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+    let model = vec![
+        Span::raw("  "),
+        if state.status.model.is_empty() {
+            Span::styled("pick model", Style::default().fg(theme::WARN))
         } else {
-            theme::MUTED
-        }),
-    ));
+            Span::styled(
+                state.status.model.clone(),
+                Style::default().fg(theme::MUTED),
+            )
+        },
+    ];
+
+    let muted = Style::default().fg(theme::MUTED);
+    let right: Vec<Span<'static>> = match &state.knowledge {
+        None => vec![Span::styled("ctx —", muted)],
+        Some(ks) => {
+            let numbers = format!(
+                "{}/{}",
+                compact_tokens(ks.context_tokens),
+                compact_tokens(ks.budget_tokens)
+            );
+            if is_wide(width) {
+                let bar = meter(ks.context_tokens, ks.budget_tokens, 8);
+                let filled: String = bar.chars().filter(|c| *c == '■').collect();
+                let empty: String = bar.chars().filter(|c| *c == '□').collect();
+                vec![
+                    Span::styled("ctx ", muted),
+                    Span::raw(filled),
+                    Span::styled(empty, Style::default().fg(theme::DIM)),
+                    Span::styled(format!(" {numbers}"), muted),
+                ]
+            } else {
+                vec![Span::styled(format!("ctx {numbers}"), muted)]
+            }
+        }
+    };
+
+    let mut used = spans_width(&left) + spans_width(&right);
+    let model_w = spans_width(&model);
+    let mut spans = left;
+    if used + model_w < w {
+        spans.extend(model);
+        used += model_w;
+    }
+    spans.push(Span::raw(" ".repeat(w.saturating_sub(used))));
+    spans.extend(right);
     Line::from(spans)
 }
 
@@ -643,46 +996,77 @@ pub(crate) fn line_rows(line: &Line<'static>, width: u16) -> u16 {
 #[derive(Default)]
 pub(crate) struct TranscriptCache {
     width: u16,
+    epoch: u64,
     lines: Vec<CachedTranscriptLine>,
+}
+
+/// Motion inputs for one transcript render pass (see `TranscriptCache::update`).
+#[derive(Clone, Copy)]
+pub(crate) struct MotionCtx {
+    pub now: Instant,
+    pub reduced_motion: bool,
+    /// `AppState::style_epoch`; a change invalidates every cached line.
+    pub epoch: u64,
+    /// Transcript index from which fact lines render bold (trace-back), or
+    /// `None` when the trace-back is off.
+    pub trace_from: Option<usize>,
 }
 
 struct CachedTranscriptLine {
     source: TranscriptLine,
+    /// False while the line was rendered inside its animation window; such an
+    /// entry is re-rendered once more after the window closes.
+    settled: bool,
     entries: Vec<(Line<'static>, Option<usize>, [u16; 2])>,
 }
 
 impl TranscriptCache {
-    fn update(&mut self, transcript: &[TranscriptLine], width: u16) {
+    /// First rendered row and settled flag of the cached line at `index`.
+    #[cfg(test)]
+    pub(crate) fn probe(&self, index: usize) -> Option<(&Line<'static>, bool)> {
+        let cached = self.lines.get(index)?;
+        Some((&cached.entries.first()?.0, cached.settled))
+    }
+
+    pub(crate) fn update(&mut self, transcript: &[TranscriptLine], width: u16, ctx: MotionCtx) {
         // ponytail: linear equality scan; revision counters if very long
         // histories make this scan dominate rendering.
-        if self.width != width {
+        if self.width != width || self.epoch != ctx.epoch {
             self.lines.clear();
             self.width = width;
+            self.epoch = ctx.epoch;
         }
         self.lines.truncate(transcript.len());
         for (index, source) in transcript.iter().enumerate() {
-            if self
-                .lines
-                .get(index)
-                .is_some_and(|cached| cached.source == *source)
+            let animating = line_animating(source.born, ctx.now, ctx.reduced_motion);
+            if !animating
+                && self
+                    .lines
+                    .get(index)
+                    .is_some_and(|cached| cached.settled && cached.source == *source)
             {
                 continue;
             }
             let header = !source.tool_children.is_empty();
-            let mut entries = vec![(transcript_line_to_ratatui(source), header.then_some(index))];
+            let trace_bold = ctx.trace_from.is_some_and(|start| index >= start);
+            let mut entries = vec![(
+                transcript_line_at(source, width, ctx.now, ctx.reduced_motion, trace_bold),
+                header.then_some(index),
+            )];
             if header && source.expanded {
                 entries.extend(source.tool_children.iter().map(|child| {
                     (
-                        transcript_line_to_ratatui(&TranscriptLine::new(
-                            Gutter::Tool,
-                            format!("  {child}"),
-                        )),
+                        transcript_line_to_ratatui(
+                            &TranscriptLine::new(Gutter::Tool, format!("  {child}")),
+                            width,
+                        ),
                         None,
                     )
                 }));
             }
             let cached = CachedTranscriptLine {
                 source: source.clone(),
+                settled: !animating,
                 entries: entries
                     .into_iter()
                     .map(|(line, index)| {
@@ -734,65 +1118,117 @@ pub(crate) fn visible_transcript_lines(
 pub(crate) const MAX_INPUT_LINES: usize = 6;
 pub(crate) const MAX_VISIBLE_PASTE_ATTACHMENTS: usize = 2;
 
-pub(crate) fn input_height(input: &str) -> u16 {
-    let lines = input.split('\n').count().clamp(1, MAX_INPUT_LINES);
-    (lines + 3) as u16
-}
-
 pub(crate) fn composer_height(state: &AppState) -> u16 {
     let total = state.pasted_attachments.len() + state.image_attachments.len();
     let attachment_rows = total.min(MAX_VISIBLE_PASTE_ATTACHMENTS) + usize::from(total > 2);
-    input_height(&state.input).saturating_add(attachment_rows as u16)
+    let rows = input_visual_rows(&state.input, state.input_columns).len();
+    (rows.clamp(1, MAX_INPUT_LINES) as u16 + 2).saturating_add(attachment_rows as u16)
 }
 
-fn compact_run_map_line(state: &AppState) -> Line<'static> {
-    let mut spans = Vec::new();
-    for (index, (step, done)) in state.ledger.steps.iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::styled("  ", Style::default().fg(theme::DIM)));
-        }
-        let active = !*done
-            && state
-                .ledger
-                .steps
-                .iter()
-                .take(index)
-                .all(|(_, prior_done)| *prior_done);
-        let (mark, color) = if *done {
-            ("✓", theme::OK)
-        } else if active {
-            ("●", theme::MUTED)
-        } else {
-            ("○", theme::DIM)
-        };
-        spans.push(Span::styled(
-            format!(
-                "{:02} {} {mark}",
-                index + 1,
-                task_step_label(*step).to_ascii_titlecase()
-            ),
-            Style::default().fg(color).add_modifier(if active {
-                Modifier::BOLD
+/// Builds the step rail (header row 2): the run's steps with a done `✓`, the
+/// active spinner, or a dim future `·`, plus right-aligned elapsed `m:ss`
+/// (live while running, the receipt's total once finished). With no run and
+/// no receipt every step reads as future. Narrow widths collapse to
+/// ` 3/4 CHANGE ◐`.
+pub(crate) fn step_rail_line(state: &AppState, width: u16) -> Line<'static> {
+    let w = width as usize;
+    let steps = &state.ledger.steps;
+    let has_progress = state.running || state.completion.is_some();
+    let done_at = |i: usize| has_progress && steps.get(i).is_some_and(|(_, done)| *done);
+    let active = if state.running {
+        steps.iter().position(|(_, done)| !*done)
+    } else {
+        None
+    };
+    let elapsed_ms = if state.running {
+        state.run_started.map(|t| t.elapsed().as_millis())
+    } else {
+        state.completion.as_ref().map(|c| c.elapsed_ms)
+    };
+    let streaming = !state.current_stream.is_empty() || !state.stream_pending.is_empty();
+    let spin = spinner_glyph(
+        state.run_started.map_or(0, |t| t.elapsed().as_millis()),
+        state.reduced_motion,
+        streaming,
+    );
+    let name_style = Style::default();
+    let mut spans = vec![Span::raw(" ")];
+    if is_wide(width) {
+        for (i, (step, _)) in steps.iter().enumerate() {
+            let label = task_step_label(*step);
+            if done_at(i) {
+                spans.push(Span::styled(label, name_style));
+                spans.push(Span::styled(
+                    " ✓",
+                    Style::default().fg(theme::OK).add_modifier(Modifier::BOLD),
+                ));
+            } else if active == Some(i) {
+                spans.push(Span::styled(
+                    label,
+                    Style::default().add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(
+                    format!(" {spin}"),
+                    Style::default().fg(theme::T),
+                ));
             } else {
-                Modifier::empty()
-            }),
-        ));
+                spans.push(Span::styled(label, Style::default().fg(theme::MUTED)));
+                spans.push(Span::styled(" ·", Style::default().fg(theme::DIM)));
+            }
+            if i + 1 < steps.len() {
+                if done_at(i) {
+                    let since = state
+                        .ledger
+                        .done_at
+                        .iter()
+                        .find(|(s, _)| s == step)
+                        .map_or(u128::MAX, |(_, t)| t.elapsed().as_millis());
+                    if rail_fill_cells(since, state.reduced_motion) == 1 {
+                        spans.push(Span::raw(" ━"));
+                        spans.push(Span::styled("─", Style::default().fg(theme::DIM)));
+                        spans.push(Span::raw(" "));
+                    } else {
+                        spans.push(Span::raw(" ━━ "));
+                    }
+                } else {
+                    spans.push(Span::styled(" ── ", Style::default().fg(theme::DIM)));
+                }
+            }
+        }
+    } else {
+        let current = active.or_else(|| (0..steps.len()).rev().find(|i| done_at(*i)));
+        let (index, label, glyph) = match current {
+            Some(i) if active == Some(i) => (i + 1, task_step_label(steps[i].0), spin.to_string()),
+            Some(i) => (i + 1, task_step_label(steps[i].0), "✓".to_string()),
+            None => (
+                0,
+                steps.first().map_or("", |(s, _)| task_step_label(*s)),
+                "·".to_string(),
+            ),
+        };
+        spans.push(Span::raw(format!(
+            "{index}/{} {label} {glyph}",
+            steps.len()
+        )));
+    }
+    if let Some(ms) = elapsed_ms {
+        let text = fmt_mss(ms);
+        let used = spans_width(&spans);
+        let text_w = text.chars().count();
+        if used + text_w + 2 <= w {
+            let pad = w - used - text_w - 1;
+            let cells = state.pulse.len().min(pad.saturating_sub(4));
+            if cells >= 4 {
+                spans.push(Span::raw(" ".repeat(pad - cells - 2)));
+                spans.extend(pulse_spans(&state.pulse, cells));
+                spans.push(Span::raw("  "));
+            } else {
+                spans.push(Span::raw(" ".repeat(pad)));
+            }
+            spans.push(Span::styled(text, Style::default().fg(theme::MUTED)));
+        }
     }
     Line::from(spans)
-}
-
-trait AsciiTitleCase {
-    fn to_ascii_titlecase(&self) -> String;
-}
-
-impl AsciiTitleCase for str {
-    fn to_ascii_titlecase(&self) -> String {
-        let mut chars = self.to_ascii_lowercase().chars().collect::<Vec<_>>();
-        if let Some(first) = chars.first_mut() {
-            first.make_ascii_uppercase();
-        }
-        chars.into_iter().collect()
-    }
 }
 
 fn context_receipt_line(state: &AppState) -> Option<Line<'static>> {
@@ -839,138 +1275,41 @@ fn context_receipt_line(state: &AppState) -> Option<Line<'static>> {
 }
 
 pub(crate) fn focus_surface_lines(state: &AppState) -> Vec<Line<'static>> {
+    let bold = Style::default().add_modifier(Modifier::BOLD);
     if let Some(permission) = state.pending.front() {
         return vec![
             Line::from(Span::styled(
-                " PERMISSION REQUIRED",
+                " PERMISSION",
                 Style::default()
                     .fg(theme::WARN)
                     .add_modifier(Modifier::BOLD),
             )),
-            Line::from(Span::styled(
-                format!(" {}", permission.summary),
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
+            Line::from(Span::styled(format!(" {}", permission.summary), bold)),
             Line::from(vec![
                 Span::styled(" Scope  ", Style::default().fg(theme::MUTED)),
                 Span::raw("this invocation only"),
             ]),
             Line::from(vec![
-                Span::styled(" [A]", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(" [A]", bold),
                 Span::raw(" Allow once   "),
-                Span::styled("[D]", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled("[D]", bold),
                 Span::raw(" Deny"),
             ]),
         ];
     }
 
     if state.running {
-        let elapsed = state
-            .run_started
-            .map(|started| started.elapsed().as_secs_f64())
-            .unwrap_or(0.0);
-        let mut lines = match state.status.state {
-            RunState::Tool => {
-                let tool = state.current_tool.as_deref().unwrap_or("tool");
-                let tool_elapsed = state
-                    .tool_started
-                    .map(|started| started.elapsed().as_secs_f64())
-                    .unwrap_or(elapsed);
-                let frame = spinner_glyph((elapsed * 1000.0) as u128, state.reduced_motion, false);
-                vec![
-                    Line::from(Span::styled(
-                        format!(" {frame} RUNNING"),
-                        Style::default()
-                            .fg(theme::MUTED)
-                            .add_modifier(Modifier::BOLD),
-                    )),
-                    Line::from(vec![
-                        Span::styled(" TOOL  ", Style::default().fg(theme::T)),
-                        Span::styled(
-                            truncate_chars(tool, 160),
-                            Style::default().add_modifier(Modifier::BOLD),
-                        ),
-                    ]),
-                    Line::from(Span::styled(
-                        format!("       elapsed {tool_elapsed:05.1}s · Esc twice to interrupt"),
-                        Style::default().fg(theme::MUTED),
-                    )),
-                    compact_run_map_line(state),
-                ]
-            }
-            RunState::Verify => {
-                let mut lines = vec![
-                    Line::from(Span::styled(
-                        " VERIFYING",
-                        Style::default()
-                            .fg(theme::MUTED)
-                            .add_modifier(Modifier::BOLD),
-                    )),
-                    compact_run_map_line(state),
-                ];
-                for (name, status) in state.ledger.verify_steps.iter().rev().take(2).rev() {
-                    let (mark, color) = match status {
-                        StepStatusLite::Passed => ("✓", theme::OK),
-                        StepStatusLite::Failed => ("×", theme::ERR),
-                        StepStatusLite::Skipped => ("–", theme::WARN),
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(" VERIFY  ", Style::default().fg(color)),
-                        Span::raw(name.clone()),
-                        Span::styled(format!(" {mark}"), Style::default().fg(color)),
-                    ]));
-                }
-                lines.push(Line::from(Span::styled(
-                    " Type now to queue the next task.",
-                    Style::default().fg(theme::DIM),
-                )));
-                lines
-            }
-            RunState::Thinking | RunState::Idle => vec![
-                Line::from(vec![
-                    Span::styled(
-                        " UNDERSTANDING  ",
-                        Style::default()
-                            .fg(theme::MUTED)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!(
-                            "{} {elapsed:05.1}s",
-                            spinner_glyph(
-                                (elapsed * 1000.0) as u128,
-                                state.reduced_motion,
-                                !state.current_stream.is_empty()
-                                    || !state.stream_pending.is_empty(),
-                            )
-                        ),
-                        Style::default().fg(theme::T),
-                    ),
-                ]),
-                compact_run_map_line(state),
-            ],
-        };
-        if state.interrupt_confirmation_active() {
-            lines = vec![
-                Line::from(Span::styled(
-                    " × INTERRUPT ARMED",
-                    Style::default().fg(theme::ERR).add_modifier(Modifier::BOLD),
-                )),
-                Line::from(Span::styled(
-                    " Esc again within 2s to interrupt · any other key keeps running",
-                    Style::default().fg(theme::ERR),
-                )),
-                compact_run_map_line(state),
-            ];
-        }
-        if let Some(context) = context_receipt_line(state) {
-            lines.push(context);
-        }
-        if state.knowledge_band_open
-            && let Some(knowledge) = &state.knowledge
-        {
-            for line in knowledge_band_lines(knowledge, state.render_tick, state.reduced_motion) {
-                lines.push(line);
+        // The step rail and now-line already cover a running task; only the
+        // opt-in evidence band (Ctrl+K) adds rows here.
+        let mut lines = Vec::new();
+        if state.knowledge_band_open {
+            lines.extend(context_receipt_line(state));
+            if let Some(knowledge) = &state.knowledge {
+                lines.extend(knowledge_band_lines(
+                    knowledge,
+                    state.render_tick,
+                    state.reduced_motion,
+                ));
             }
         }
         return lines;
@@ -979,13 +1318,10 @@ pub(crate) fn focus_surface_lines(state: &AppState) -> Vec<Line<'static>> {
     if let Some(error) = &state.last_error {
         let mut lines = vec![
             Line::from(Span::styled(
-                " STOPPED",
+                " FAILED",
                 Style::default().fg(theme::ERR).add_modifier(Modifier::BOLD),
             )),
-            Line::from(vec![
-                Span::styled(" ERROR  ", Style::default().fg(theme::ERR)),
-                Span::raw(truncate_chars(error, 180)),
-            ]),
+            Line::from(Span::raw(format!(" {}", truncate_chars(error, 180)))),
         ];
         for row in state.ledger.numstat.iter().take(2) {
             lines.push(Line::from(vec![
@@ -997,6 +1333,12 @@ pub(crate) fn focus_surface_lines(state: &AppState) -> Vec<Line<'static>> {
                 ),
             ]));
         }
+        if !state.ledger.numstat.is_empty() {
+            lines.push(Line::from(Span::styled(
+                " still in the working tree, unverified",
+                Style::default().fg(theme::WARN),
+            )));
+        }
         lines.push(Line::from(Span::styled(
             " Edit the task and press Enter to try again.",
             Style::default().fg(theme::DIM),
@@ -1005,68 +1347,53 @@ pub(crate) fn focus_surface_lines(state: &AppState) -> Vec<Line<'static>> {
     }
 
     if let Some(receipt) = &state.completion {
-        let failed = receipt
-            .verify_steps
-            .iter()
-            .any(|(_, status)| *status == StepStatusLite::Failed);
-        let unverified = receipt.verify_steps.is_empty()
-            || receipt
-                .verify_steps
-                .iter()
-                .all(|(_, status)| *status == StepStatusLite::Skipped);
-        let heading_color = if failed {
-            theme::ERR
-        } else if unverified {
-            theme::WARN
-        } else {
-            theme::OK
-        };
-        let additions = receipt.numstat.iter().map(|row| row.added).sum::<u32>();
-        let deletions = receipt.numstat.iter().map(|row| row.deleted).sum::<u32>();
-        let mut lines = vec![
-            Line::from(vec![
-                Span::styled(
-                    format!(" {}", receipt.verification_label()),
-                    Style::default()
-                        .fg(heading_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("   {:.1}s", receipt.elapsed_ms as f64 / 1000.0),
-                    Style::default().fg(theme::MUTED),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(" GIT     ", Style::default().fg(theme::G)),
-                Span::raw(format!(
-                    "{} files changed · +{additions} -{deletions}",
-                    receipt.numstat.len()
-                )),
-            ]),
-        ];
-        for (name, status) in receipt.verify_steps.iter().take(2) {
-            let (mark, color) = match status {
-                StepStatusLite::Passed => ("✓", theme::OK),
-                StepStatusLite::Failed => ("×", theme::ERR),
-                StepStatusLite::Skipped => ("–", theme::WARN),
-            };
+        const MAX_FILES: usize = 3;
+        let mut lines = vec![Line::from(Span::styled(" RECEIPT", bold))];
+        for row in receipt.numstat.iter().take(MAX_FILES) {
             lines.push(Line::from(vec![
-                Span::styled(" VERIFY  ", Style::default().fg(color)),
-                Span::raw(name.clone()),
-                Span::styled(format!(" {mark}"), Style::default().fg(color)),
+                Span::raw(format!(" {} ", row.path)),
+                Span::styled(format!("+{}", row.added), Style::default().fg(theme::OK)),
+                Span::raw(" "),
+                Span::styled(format!("−{}", row.deleted), Style::default().fg(theme::ERR)),
             ]));
         }
-        lines.push(Line::from(Span::styled(
-            format!(
-                " {} iterations · {} tools · {}→{} tokens",
-                receipt.iterations, receipt.tool_calls, receipt.input_tokens, receipt.output_tokens
-            ),
-            Style::default().fg(theme::MUTED),
-        )));
-        lines.push(Line::from(Span::styled(
-            " Ctrl+L Run Map · Ctrl+Y copy · type a follow-up",
-            Style::default().fg(theme::DIM),
-        )));
+        if receipt.numstat.len() > MAX_FILES {
+            lines.push(Line::from(Span::styled(
+                format!(" +{} more", receipt.numstat.len() - MAX_FILES),
+                Style::default().fg(theme::MUTED),
+            )));
+        }
+        let mut checks = vec![Span::raw(" ")];
+        if receipt.verify_steps.is_empty() {
+            checks.push(Span::styled(
+                "no checks ran",
+                Style::default().fg(theme::WARN),
+            ));
+        }
+        for (i, (name, status)) in receipt.verify_steps.iter().enumerate() {
+            let (mark, color) = check_mark(*status);
+            if i > 0 {
+                checks.push(Span::raw("  "));
+            }
+            checks.push(Span::raw(format!("{name} ")));
+            checks.push(Span::styled(mark, Style::default().fg(color)));
+        }
+        lines.push(Line::from(checks));
+        lines.push(if receipt.input_tokens == 0 && receipt.output_tokens == 0 {
+            Line::from(Span::styled(
+                " tokens ? not reported",
+                Style::default().fg(theme::WARN),
+            ))
+        } else {
+            Line::from(Span::styled(
+                format!(
+                    " {} in · {} out",
+                    compact_tokens(receipt.input_tokens as usize),
+                    compact_tokens(receipt.output_tokens as usize)
+                ),
+                Style::default().fg(theme::MUTED),
+            ))
+        });
         return lines;
     }
 
@@ -1083,8 +1410,136 @@ pub(crate) fn focus_surface_lines(state: &AppState) -> Vec<Line<'static>> {
     lines
 }
 
-pub(crate) fn focus_surface_height(state: &AppState) -> u16 {
-    focus_surface_lines(state).len().min(8) as u16
+/// Builds the now-line: exactly one row above the composer input that says
+/// what is happening, for how long, and what the next key does. Left side is
+/// the first matching state; the right-aligned key hints drop when they do
+/// not fit.
+pub(crate) fn now_line(state: &AppState, width: u16) -> Line<'static> {
+    let w = width as usize;
+    let narrow = !is_wide(width);
+    let reduced = state.reduced_motion;
+    let run_ms = state.run_started.map_or(0, |t| t.elapsed().as_millis());
+    let streaming = !state.current_stream.is_empty() || !state.stream_pending.is_empty();
+    let spin = spinner_glyph(run_ms, reduced, false);
+    let counter = fmt_counter(run_ms, reduced);
+    let glyph_bold = |glyph: String, color: Color| {
+        Span::styled(
+            glyph,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )
+    };
+    let mut left = vec![Span::raw(" ")];
+    let mut right: Option<String> = None;
+    if state.exit_confirmation_active() {
+        left.push(Span::styled(
+            "Ctrl+C or Ctrl+D again to exit · draft stays until then",
+            Style::default().fg(theme::MUTED),
+        ));
+    } else if state.select_mode {
+        left.push(Span::styled(
+            "Ctrl+T exit select mode",
+            Style::default().fg(theme::MUTED),
+        ));
+    } else if !state.pending.is_empty() {
+        left.push(glyph_bold("⏸".to_string(), theme::WARN));
+        left.push(Span::styled(
+            " waiting for you",
+            Style::default().fg(theme::WARN),
+        ));
+        right = Some("A allow once · D deny · Esc deny".to_string());
+    } else if state.running {
+        match state.status.state {
+            RunState::Tool => {
+                let name = state.current_tool.as_deref().unwrap_or("tool");
+                let tool_ms = state
+                    .tool_started
+                    .map_or(run_ms, |t| t.elapsed().as_millis());
+                left.push(Span::styled(
+                    format!("{spin} "),
+                    Style::default().fg(theme::T),
+                ));
+                left.push(Span::raw("tool: "));
+                left.push(Span::styled(
+                    truncate_chars(name, 36),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ));
+                left.push(Span::raw(format!(" · {}", fmt_counter(tool_ms, reduced))));
+            }
+            RunState::Verify => {
+                left.push(Span::styled(
+                    format!("{spin} "),
+                    Style::default().fg(theme::T),
+                ));
+                left.push(Span::raw(format!("verifying · {counter}")));
+            }
+            _ if streaming => {
+                left.push(Span::styled("▸ ", Style::default().fg(theme::T)));
+                left.push(Span::raw(format!("model writing · {counter}")));
+            }
+            _ => {
+                left.push(Span::styled(
+                    format!("{spin} "),
+                    Style::default().fg(theme::T),
+                ));
+                left.push(Span::raw(format!("model thinking · {counter}")));
+            }
+        }
+        right = Some(
+            if state.steering_active && narrow {
+                "Enter steer · Esc cancel"
+            } else if state.steering_active {
+                "Enter steer · Alt+Enter queue · Esc cancel"
+            } else {
+                "Enter queue · Esc cancel"
+            }
+            .to_string(),
+        );
+    } else if let Some(error) = &state.last_error {
+        let prefix = "✗ stopped · ";
+        let room = w.saturating_sub(1 + prefix.chars().count());
+        let first = error.lines().next().unwrap_or("");
+        left.push(glyph_bold("✗".to_string(), theme::ERR));
+        left.push(Span::styled(" stopped", Style::default().fg(theme::ERR)));
+        left.push(Span::raw(format!(" · {}", truncate_chars(first, room))));
+        right = Some("Enter follow-up".to_string());
+    } else if let Some(receipt) = &state.completion {
+        let (text, color, glyph) = match receipt.verification_label() {
+            "DONE · VERIFIED" => ("done · verified", theme::OK, true),
+            "DONE · FAILED VERIFICATION" => ("done · failed verification", theme::ERR, false),
+            _ => ("done · unverified", theme::WARN, false),
+        };
+        if glyph {
+            left.push(glyph_bold("✓ ".to_string(), color));
+        }
+        left.push(Span::styled(text, Style::default().fg(color)));
+        left.push(Span::styled(
+            format!(" · {}", fmt_mss(receipt.elapsed_ms)),
+            Style::default().fg(theme::MUTED),
+        ));
+        right = Some("Enter follow-up".to_string());
+    } else {
+        left.push(glyph_bold("●".to_string(), theme::OK));
+        left.push(Span::raw(" ready"));
+        right = Some(
+            if !state.pasted_attachments.is_empty() || !state.image_attachments.is_empty() {
+                "Enter send · Backspace remove last · Ctrl+A inspect"
+            } else if narrow {
+                "Enter send · / commands"
+            } else {
+                "Enter send · / commands · ? help"
+            }
+            .to_string(),
+        );
+    }
+    if let Some(hint) = right {
+        let used = spans_width(&left);
+        let hint_w = hint.chars().count();
+        if used + hint_w + 2 <= w {
+            left.push(Span::raw(" ".repeat(w - used - hint_w - 1)));
+            left.push(Span::styled(hint, Style::default().fg(theme::MUTED)));
+        }
+    }
+    Line::from(left)
 }
 
 fn draw_focus_surface(
@@ -1136,15 +1591,19 @@ pub(crate) fn shortcut_sheet_lines(state: &AppState) -> Vec<Line<'static>> {
         )),
         Line::default(),
         Line::from(format!(" Enter        {enter}")),
+        Line::from(" Alt+Enter    queue during an active run"),
         Line::from(" Shift+Enter  newline"),
+        Line::from(" Arrows       edit prompt; Up/Down recall history"),
         Line::from(" /            actions and commands"),
+        Line::from(" Ctrl+P       command palette (keeps draft)"),
+        Line::from(" Ctrl+C/D     repeat within 2s to exit when idle"),
         Line::from(" Ctrl+K       expand evidence"),
         Line::from(" Ctrl+L       open Run Map"),
         Line::from(" Ctrl+A       inspect attachments"),
         Line::from(" Ctrl+Y       copy last response"),
         Line::from(" Ctrl+T       terminal select mode"),
         Line::from(" Shift+Tab    toggle auto mode"),
-        Line::from(" Esc Esc      interrupt active run"),
+        Line::from(" Esc          cancel active run"),
         Line::default(),
         Line::from(Span::styled(
             " ? or Esc closes this sheet",
@@ -1196,17 +1655,23 @@ fn draw_sheet(f: &mut ratatui::Frame, lines: Vec<Line<'static>>) {
 }
 
 pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
-    let focus_lines = if state.ledger_open {
+    state.input_columns = f.area().width.saturating_sub(4).max(1) as usize;
+    let mut focus_lines = if state.ledger_open {
         Vec::new()
     } else {
         focus_surface_lines(state)
     };
-    let focus_height = focus_surface_height(state).saturating_add(1);
-
-    let mut constraints = vec![Constraint::Length(2)]; // scope rail + rule
-    constraints.push(Constraint::Min(1)); // transcript
-    if !focus_lines.is_empty() {
-        constraints.push(Constraint::Length(focus_height));
+    if !state.pending.is_empty() {
+        focus_lines.insert(
+            2,
+            Line::from(vec![
+                Span::styled(" cwd    ", Style::default().fg(theme::MUTED)),
+                Span::raw(truncate_chars(
+                    &cwd.display().to_string(),
+                    f.area().width.saturating_sub(8) as usize,
+                )),
+            ]),
+        );
     }
     let hint_items = if !state.picker.open
         && state.pending.is_empty()
@@ -1220,10 +1685,35 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
     } else {
         Vec::new()
     };
-    if !hint_items.is_empty() {
-        constraints.push(Constraint::Length(hint_items.len() as u16));
+    // Reserve the transcript and composer before assigning optional rows.
+    // At 60×20 this prevents slash hints or a long receipt from hiding input.
+    let optional = f.area().height.saturating_sub(6);
+    let composer_rows = if state.pending.is_empty() {
+        composer_height(state)
+    } else {
+        3
     }
-    constraints.push(Constraint::Length(composer_height(state)));
+    .min(optional);
+    let remaining = optional.saturating_sub(composer_rows);
+    let focus_height = if !state.pending.is_empty() {
+        // ponytail: nine rows fit normal command summaries at 60×20; add scrolling if longer approvals appear.
+        9
+    } else if focus_lines.is_empty() {
+        0
+    } else {
+        (focus_lines.len() as u16 + 1).min(if f.area().height <= 20 { 6 } else { 9 })
+    }
+    .min(remaining);
+    let hint_height = (hint_items.len() as u16).min(remaining.saturating_sub(focus_height));
+
+    let mut constraints = vec![Constraint::Length(3), Constraint::Min(3)];
+    if !focus_lines.is_empty() {
+        constraints.push(Constraint::Length(focus_height));
+    }
+    if !hint_items.is_empty() {
+        constraints.push(Constraint::Length(hint_height));
+    }
+    constraints.push(Constraint::Length(composer_rows));
 
     let areas = Layout::vertical(constraints).split(f.area());
     let mut idx = 0;
@@ -1231,6 +1721,7 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
     f.render_widget(
         Paragraph::new(vec![
             scope_line(state, areas[idx].width),
+            step_rail_line(state, areas[idx].width),
             Line::from(Span::styled(
                 "─".repeat(areas[idx].width as usize),
                 Style::default().fg(theme::DIM),
@@ -1265,19 +1756,26 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
         // (prose, plain tool lines, expanded children, the stream line,
         // the spinner label) is `None`.
         let transcript_area = areas[idx];
-        state
-            .transcript_cache
-            .update(&state.transcript, transcript_area.width);
+        state.transcript_cache.update(
+            &state.transcript,
+            transcript_area.width,
+            MotionCtx {
+                now: Instant::now(),
+                reduced_motion: state.reduced_motion,
+                epoch: state.style_epoch,
+                trace_from: state.trace_back.map(|_| state.run_transcript_start),
+            },
+        );
         let mut extra = Vec::new();
         if show_empty_state(&state.transcript, state.running) {
-            extra.extend(empty_state_lines(state));
+            extra.extend(empty_state_lines(state, transcript_area.width));
         }
         let empty_len = extra.len();
         if !state.current_stream.is_empty() {
-            extra.push(transcript_line_to_ratatui(&TranscriptLine::new(
-                Gutter::Prose,
-                state.current_stream.clone(),
-            )));
+            extra.push(transcript_line_to_ratatui(
+                &TranscriptLine::new(Gutter::Prose, state.current_stream.clone()),
+                transcript_area.width,
+            ));
         }
         let mut text_lines = Vec::new();
         let mut indices = Vec::new();
@@ -1398,7 +1896,14 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
         areas[idx]
     } else {
         f.render_widget(
-            Paragraph::new(slash_hint_lines(&hint_items, state.slash_selected)),
+            Paragraph::new({
+                let count = areas[idx].height as usize;
+                let start = state.slash_selected.saturating_add(1).saturating_sub(count);
+                slash_hint_lines(
+                    &hint_items[start..(start + count).min(hint_items.len())],
+                    state.slash_selected.saturating_sub(start),
+                )
+            }),
             areas[idx],
         );
         idx += 1;
@@ -1470,12 +1975,7 @@ pub(crate) fn draw_input(f: &mut ratatui::Frame, area: ratatui::layout::Rect, st
         ..area
     };
 
-    let mut rendered = vec![Line::from(Span::styled(
-        format!(" {}", state.composer_mode().label()),
-        Style::default()
-            .fg(theme::MUTED)
-            .add_modifier(Modifier::BOLD),
-    ))];
+    let mut rendered = vec![now_line(state, area.width)];
     let attachment_summaries: Vec<(&str, String)> = state
         .attachment_rows()
         .into_iter()
@@ -1513,10 +2013,7 @@ pub(crate) fn draw_input(f: &mut ratatui::Frame, area: ratatui::layout::Rect, st
 
     let input_area = ratatui::layout::Rect {
         y: composer_area.y + rendered.len() as u16,
-        height: composer_area
-            .height
-            .saturating_sub(rendered.len() as u16)
-            .saturating_sub(1),
+        height: composer_area.height.saturating_sub(rendered.len() as u16),
         ..composer_area
     };
     if input_area.height == 0 {
@@ -1524,51 +2021,27 @@ pub(crate) fn draw_input(f: &mut ratatui::Frame, area: ratatui::layout::Rect, st
         return;
     }
 
-    let all_lines: Vec<&str> = state.input.split('\n').collect();
-    let visible_count = all_lines.len().min(input_area.height as usize);
-    let visible_start = all_lines.len().saturating_sub(visible_count);
-    let visible = &all_lines[visible_start..];
-    for (visible_index, text) in visible.iter().enumerate() {
+    let rows = input_visual_rows(&state.input, input_area.width.saturating_sub(4) as usize);
+    let cursor_byte = state.cursor_byte();
+    let cursor_row = rows
+        .iter()
+        .rposition(|row| row.start <= cursor_byte)
+        .unwrap_or(0);
+    let visible_count = rows.len().min(input_area.height as usize);
+    let visible_start = (cursor_row + 1).saturating_sub(visible_count);
+    for (visible_index, row) in rows[visible_start..visible_start + visible_count]
+        .iter()
+        .enumerate()
+    {
         let actual_index = visible_start + visible_index;
         let prefix = if actual_index == 0 { " › " } else { " │ " };
         let spans = vec![
             Span::styled(prefix, Style::default().fg(theme::MUTED)),
-            Span::raw((*text).to_string()),
+            Span::raw(state.input[row.start..row.end].to_string()),
         ];
         rendered.push(Line::from(spans));
     }
 
-    let hints = if state.interrupt_confirmation_active() {
-        "Esc again interrupt · any other key keeps running".to_string()
-    } else if state.select_mode {
-        "Ctrl+T exit select mode".to_string()
-    } else if !state.pending.is_empty() {
-        "A allow once · D deny".to_string()
-    } else if !attachment_summaries.is_empty() {
-        match state.composer_mode() {
-            ComposerMode::Steer => {
-                "Enter steer · Backspace remove last · Ctrl+A inspect".to_string()
-            }
-            ComposerMode::Queue => {
-                "Enter queue · Backspace remove last · Ctrl+A inspect".to_string()
-            }
-            _ => "Enter send · Backspace remove last · Ctrl+A inspect".to_string(),
-        }
-    } else {
-        match state.composer_mode() {
-            ComposerMode::Ask => "Enter send · / actions · ? shortcuts",
-            ComposerMode::Steer => "Enter steer · Esc twice interrupt · ? shortcuts",
-            ComposerMode::Queue => "Enter queue · Ctrl+L Run Map · ? shortcuts",
-            ComposerMode::Decision => "A allow once · D deny",
-            ComposerMode::Recover => "Enter retry · Ctrl+L Run Map · ? shortcuts",
-            ComposerMode::FollowUp => "Ctrl+L Run Map · Ctrl+Y copy · ? shortcuts",
-        }
-        .to_string()
-    };
-    rendered.push(Line::from(Span::styled(
-        format!(" {hints}"),
-        Style::default().fg(theme::DIM),
-    )));
     f.render_widget(Paragraph::new(rendered), composer_area);
 
     if !state.picker.open
@@ -1576,11 +2049,12 @@ pub(crate) fn draw_input(f: &mut ratatui::Frame, area: ratatui::layout::Rect, st
         && !state.attachments_open
         && state.pending.is_empty()
     {
-        let last_len = all_lines.last().map_or(0, |line| line.chars().count());
-        let cursor_x = (input_area.x as usize + 3 + last_len)
+        let row = rows[cursor_row];
+        let column = UnicodeWidthStr::width(&state.input[row.start..cursor_byte.min(row.end)]);
+        let cursor_x = (input_area.x as usize + 3 + column)
             .min((input_area.x + input_area.width).saturating_sub(1) as usize)
             as u16;
-        let cursor_y = input_area.y + visible_count.saturating_sub(1) as u16;
+        let cursor_y = input_area.y + (cursor_row - visible_start) as u16;
         f.set_cursor_position((cursor_x, cursor_y));
     }
 }
@@ -1660,14 +2134,7 @@ pub(crate) fn draw_ledger(
                 ledger
                     .verify_steps
                     .iter()
-                    .map(|(name, status)| {
-                        let mark = match status {
-                            StepStatusLite::Passed => "✓",
-                            StepStatusLite::Failed => "×",
-                            StepStatusLite::Skipped => "–",
-                        };
-                        format!("{name} {mark}")
-                    })
+                    .map(|(name, status)| format!("{name} {}", check_mark(*status).0))
                     .collect::<Vec<_>>()
                     .join(" · "),
             ),
@@ -1752,8 +2219,8 @@ pub(crate) fn draw_ledger(
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
-/// Centered overlay listing (filtered) catalog entries, max ~12 rows
-/// visible. `>` marks the currently-selected row.
+/// Centered overlay listing catalog entries. The visible window follows the
+/// highlighted row so keyboard selection never disappears below the viewport.
 pub(crate) fn draw_picker(f: &mut ratatui::Frame, picker: &PickerState) {
     let area = f.area();
     let width = area.width.saturating_mul(3) / 4;
@@ -1776,6 +2243,7 @@ pub(crate) fn draw_picker(f: &mut ratatui::Frame, picker: &PickerState) {
         PickerKind::Model => "select model",
         PickerKind::Provider => "select provider",
         PickerKind::Session => "resume session",
+        PickerKind::Command => "commands",
     };
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
@@ -1796,7 +2264,7 @@ pub(crate) fn draw_picker(f: &mut ratatui::Frame, picker: &PickerState) {
         Style::default().fg(theme::MUTED),
     )));
     lines.push(Line::from(Span::styled(
-        "(type to filter; Enter on empty filter row = use typed text verbatim)",
+        "type to filter · Enter select · Esc cancel",
         Style::default().fg(theme::MUTED),
     )));
     if let Some(note) = &picker.note {
@@ -1812,11 +2280,17 @@ pub(crate) fn draw_picker(f: &mut ratatui::Frame, picker: &PickerState) {
         )));
     } else if filtered.is_empty() && !picker.items.is_empty() {
         lines.push(Line::from(Span::styled(
-            "(no matches)",
+            if picker.kind == PickerKind::Model {
+                "(no matches · Esc, then /model <name> for custom)"
+            } else {
+                "(no matches)"
+            },
             Style::default().fg(theme::DIM),
         )));
     }
-    for (i, item) in filtered.iter().take(12).enumerate() {
+    let capacity = (popup.height as usize).saturating_sub(lines.len());
+    let start = picker.selected.saturating_add(1).saturating_sub(capacity);
+    for (i, item) in filtered.iter().enumerate().skip(start).take(capacity) {
         let (marker, item_span) = if i == picker.selected {
             (
                 Span::styled(" › ", Style::default().fg(theme::MUTED)),

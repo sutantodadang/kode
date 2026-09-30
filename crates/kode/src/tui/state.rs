@@ -8,12 +8,47 @@ use kode_context::git::{NumstatRow, RepoState};
 use kode_core::event::TaskStep;
 use kode_core::{ImageAttachment, UserInput};
 use tokio::sync::oneshot;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use super::markdown;
 
-pub(crate) const INTERRUPT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
+pub(crate) const EXIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 pub(crate) const PASTE_ATTACHMENT_MIN_LINES: usize = 8;
 pub(crate) const PASTE_ATTACHMENT_MIN_CHARS: usize = 1000;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InputRow {
+    pub start: usize,
+    pub end: usize,
+}
+
+pub(crate) fn input_visual_rows(input: &str, width: usize) -> Vec<InputRow> {
+    let mut rows = Vec::new();
+    let mut start = 0;
+    let mut cells = 0;
+    let width = width.max(1);
+    for (offset, grapheme) in input.grapheme_indices(true) {
+        if grapheme == "\n" {
+            rows.push(InputRow { start, end: offset });
+            start = offset + 1;
+            cells = 0;
+            continue;
+        }
+        let next = UnicodeWidthStr::width(grapheme);
+        if cells > 0 && cells + next > width {
+            rows.push(InputRow { start, end: offset });
+            start = offset;
+            cells = 0;
+        }
+        cells += next;
+    }
+    rows.push(InputRow {
+        start,
+        end: input.len(),
+    });
+    rows
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PastedAttachment {
@@ -104,6 +139,10 @@ pub enum Gutter {
     Error,
     /// Echoed user input.
     User,
+    /// The router's decision line (`route tier=… · effort=…`).
+    Route,
+    /// Column heads (`g m t`) drawn once before a run's first source line.
+    ThreadHead,
 }
 
 /// One line of transcript: its provenance gutter plus the rendered text.
@@ -130,6 +169,10 @@ pub struct TranscriptLine {
     /// `None` while the represented tool group is active, otherwise the
     /// aggregate outcome used by the transcript receipt suffix.
     pub tool_ok: Option<bool>,
+    /// When the event that produced this line was applied. Only sourced
+    /// notes and route lines set it; drives the Kode Benang motion layer.
+    /// `None` (restored sessions, everything else) always renders final.
+    pub born: Option<Instant>,
 }
 
 impl TranscriptLine {
@@ -143,6 +186,7 @@ impl TranscriptLine {
             expanded: false,
             tool_duration_ms: None,
             tool_ok: None,
+            born: None,
         }
     }
 
@@ -163,6 +207,7 @@ impl TranscriptLine {
             expanded: false,
             tool_duration_ms: None,
             tool_ok: None,
+            born: None,
         }
     }
 }
@@ -207,19 +252,6 @@ pub enum ComposerMode {
     Decision,
     Recover,
     FollowUp,
-}
-
-impl ComposerMode {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Ask => "ASK KODE",
-            Self::Steer => "STEER ACTIVE RUN",
-            Self::Queue => "QUEUE NEXT TASK",
-            Self::Decision => "DECISION REQUIRED",
-            Self::Recover => "RECOVER OR ASK AGAIN",
-            Self::FollowUp => "ASK A FOLLOW-UP",
-        }
-    }
 }
 
 /// The Knowledge Band's data — the last `KodeEvent::Knowledge` digest
@@ -272,6 +304,8 @@ pub struct LedgerState {
     /// not by counting tool calls.
     pub numstat: Vec<NumstatRow>,
     pub why: Vec<(WhySource, String)>,
+    /// When each step was marked done (real event time) — drives the rail fill.
+    pub done_at: Vec<(TaskStep, Instant)>,
 }
 
 impl Default for LedgerState {
@@ -287,6 +321,7 @@ impl Default for LedgerState {
             verify_steps: Vec::new(),
             numstat: Vec::new(),
             why: Vec::new(),
+            done_at: Vec::new(),
         }
     }
 }
@@ -323,6 +358,7 @@ pub enum PickerKind {
     Model,
     Provider,
     Session,
+    Command,
 }
 
 /// State of the `/model`/`/provider` picker overlay. `items` holds the
@@ -333,6 +369,8 @@ pub struct PickerState {
     pub request_id: u64,
     pub open: bool,
     pub kind: PickerKind,
+    /// Provider being browsed. Active configuration is unchanged until a model is chosen.
+    pub provider: String,
     pub filter: String,
     pub items: Vec<String>,
     pub selected: usize,
@@ -360,10 +398,18 @@ pub struct AppState {
     /// steering. False during verification/finalization; input submitted in
     /// that window is queued as the next turn by the TUI loop.
     pub steering_active: bool,
+    /// Whether this run already emitted its `ThreadHead` transcript line.
+    pub thread_head_shown: bool,
     pub pending: VecDeque<PermReq>,
     pub scroll: u16,
     pub follow: bool,
     pub input: String,
+    /// UTF-8 byte boundary; `None` tracks the end after programmatic edits.
+    pub input_cursor: Option<usize>,
+    pub input_columns: usize,
+    pub prompt_history: Vec<String>,
+    pub history_index: Option<usize>,
+    pub history_draft: String,
     /// Large/multiline bracketed pastes kept outside the visible text input.
     /// They are materialized into the submitted task only when Enter is
     /// pressed, so the composer stays compact.
@@ -399,10 +445,9 @@ pub struct AppState {
     /// When the currently running tool started — drives the tool elapsed
     /// label.
     pub tool_started: Option<Instant>,
-    /// First Esc press during a run. A second Esc inside
-    /// `INTERRUPT_CONFIRM_WINDOW` performs the cancellation; any other key
-    /// disarms it.
-    pub interrupt_armed_at: Option<Instant>,
+    /// First idle Ctrl+C/Ctrl+D press; a repeat confirms exit without
+    /// discarding an unsent draft on the first press.
+    pub exit_armed_at: Option<Instant>,
     /// Whether the Ledger view (Ctrl+L) is showing instead of the
     /// transcript.
     pub ledger_open: bool,
@@ -484,7 +529,30 @@ pub struct AppState {
     /// transcript to click). Drives left-click-to-expand on tool-group
     /// headers.
     pub transcript_hit: Option<TranscriptHit>,
+    /// Transcript length when the current task started; fact lines at or
+    /// after this index belong to the current run (trace-back highlight).
+    pub(crate) run_transcript_start: usize,
+    /// Trace-back highlight: `None` = off, `Some(Some(t))` = bold until `t`,
+    /// `Some(None)` = bold until the next task.
+    pub(crate) trace_back: Option<Option<Instant>>,
+    /// Bumped whenever `trace_back` changes so the transcript cache re-renders.
+    pub(crate) style_epoch: u64,
+    /// Token-pulse sparkline cells, one per second of a run.
+    pub(crate) pulse: VecDeque<PulseCell>,
+    pub(crate) pulse_tokens: u32,
+    pub(crate) pulse_last: Option<Instant>,
 }
+
+/// One second of run activity in the rail's token pulse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PulseCell {
+    Tokens(u32),
+    Tool,
+    Wait,
+}
+
+/// Max pulse cells retained.
+const PULSE_CAP: usize = 240;
 
 /// Per-frame click hit-test geometry for the transcript area, rebuilt by
 /// `draw()` every render. `rows` walks the expanded (post-collapse) line
@@ -509,10 +577,16 @@ impl AppState {
             status: StatusInfo::new(provider, model, effort),
             running: false,
             steering_active: false,
+            thread_head_shown: false,
             pending: VecDeque::new(),
             scroll: 0,
             follow: true,
             input: String::new(),
+            input_cursor: None,
+            input_columns: 76,
+            prompt_history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
             pasted_attachments: Vec::new(),
             image_attachments: Vec::new(),
             attachment_order: Vec::new(),
@@ -526,7 +600,7 @@ impl AppState {
             run_started: None,
             current_tool: None,
             tool_started: None,
-            interrupt_armed_at: None,
+            exit_armed_at: None,
             ledger_open: false,
             ledger: LedgerState::default(),
             decide_marked_this_run: false,
@@ -552,10 +626,45 @@ impl AppState {
             stream_last_flush: None,
             select_mode: false,
             transcript_hit: None,
+            run_transcript_start: 0,
+            trace_back: None,
+            style_epoch: 0,
+            pulse: VecDeque::new(),
+            pulse_tokens: 0,
+            pulse_last: None,
         }
     }
 
+    /// Samples one pulse cell per second while a run is active. Inputs are
+    /// real state (pending permission, run phase, streamed token count).
+    pub(crate) fn sample_pulse(&mut self, now: Instant) {
+        if !self.running {
+            return;
+        }
+        if let Some(last) = self.pulse_last
+            && now.duration_since(last) < Duration::from_secs(1)
+        {
+            return;
+        }
+        let cell = if !self.pending.is_empty() {
+            PulseCell::Wait
+        } else if matches!(self.status.state, RunState::Tool | RunState::Verify) {
+            PulseCell::Tool
+        } else {
+            PulseCell::Tokens(self.pulse_tokens)
+        };
+        self.pulse.push_back(cell);
+        while self.pulse.len() > PULSE_CAP {
+            self.pulse.pop_front();
+        }
+        self.pulse_tokens = 0;
+        self.pulse_last = Some(now);
+    }
+
     pub fn push_permission(&mut self, req: PermReq) {
+        self.picker.open = false;
+        self.shortcuts_open = false;
+        self.attachments_open = false;
         self.pending.push_back(req);
     }
 
@@ -572,9 +681,16 @@ impl AppState {
         let task = task.into();
         self.ledger = LedgerState::new(ledger_objective(&task.text), plan_mode);
         self.steering_active = true;
+        self.thread_head_shown = false;
+        self.run_transcript_start = self.transcript.len();
+        if self.trace_back.take().is_some() {
+            self.style_epoch += 1;
+        }
+        self.pulse.clear();
+        self.pulse_tokens = 0;
+        self.pulse_last = None;
         self.decide_marked_this_run = false;
         self.tool_started = None;
-        self.interrupt_armed_at = None;
         self.response_buf.clear();
         self.md_in_code_block = false;
         self.stream_pending.clear();
@@ -603,8 +719,137 @@ impl AppState {
     }
 
     pub(crate) fn begin_composing(&mut self) {
-        self.completion = None;
-        self.last_error = None;
+        self.history_index = None;
+        self.history_draft.clear();
+    }
+
+    pub(crate) fn cursor_byte(&self) -> usize {
+        self.input_cursor
+            .filter(|&at| at <= self.input.len() && self.input.is_char_boundary(at))
+            .unwrap_or(self.input.len())
+    }
+
+    pub(crate) fn insert_input(&mut self, text: &str) {
+        self.begin_composing();
+        let at = self.cursor_byte();
+        self.input.insert_str(at, text);
+        self.input_cursor = Some(at + text.len());
+    }
+
+    pub(crate) fn backspace_input(&mut self) -> bool {
+        let at = self.cursor_byte();
+        let Some((start, _)) = self.input[..at].grapheme_indices(true).next_back() else {
+            return false;
+        };
+        self.begin_composing();
+        self.input.drain(start..at);
+        self.input_cursor = Some(start);
+        true
+    }
+
+    pub(crate) fn delete_input(&mut self) -> bool {
+        let at = self.cursor_byte();
+        let Some(grapheme) = self.input[at..].graphemes(true).next() else {
+            return false;
+        };
+        let end = at + grapheme.len();
+        self.begin_composing();
+        self.input.drain(at..end);
+        self.input_cursor = Some(at);
+        true
+    }
+
+    pub(crate) fn move_input_left(&mut self) {
+        let at = self.cursor_byte();
+        self.input_cursor = Some(
+            self.input[..at]
+                .grapheme_indices(true)
+                .next_back()
+                .map_or(0, |(start, _)| start),
+        );
+    }
+
+    pub(crate) fn move_input_right(&mut self) {
+        let at = self.cursor_byte();
+        self.input_cursor = Some(
+            self.input[at..]
+                .graphemes(true)
+                .next()
+                .map_or(at, |g| at + g.len()),
+        );
+    }
+
+    pub(crate) fn move_input_home(&mut self) {
+        let at = self.cursor_byte();
+        self.input_cursor = Some(self.input[..at].rfind('\n').map_or(0, |i| i + 1));
+    }
+
+    pub(crate) fn move_input_end(&mut self) {
+        let at = self.cursor_byte();
+        self.input_cursor = Some(
+            self.input[at..]
+                .find('\n')
+                .map_or(self.input.len(), |i| at + i),
+        );
+    }
+
+    pub(crate) fn move_input_vertical(&mut self, direction: i8) -> bool {
+        let rows = input_visual_rows(&self.input, self.input_columns);
+        let at = self.cursor_byte();
+        let current = rows.iter().rposition(|row| row.start <= at).unwrap_or(0);
+        let target = match direction {
+            -1 if current > 0 => current - 1,
+            1 if current + 1 < rows.len() => current + 1,
+            _ => return false,
+        };
+        let column =
+            UnicodeWidthStr::width(&self.input[rows[current].start..at.min(rows[current].end)]);
+        let row = rows[target];
+        let mut cursor = row.start;
+        let mut cells = 0;
+        for (offset, grapheme) in self.input[row.start..row.end].grapheme_indices(true) {
+            let width = UnicodeWidthStr::width(grapheme);
+            if cells + width > column {
+                break;
+            }
+            cells += width;
+            cursor = row.start + offset + grapheme.len();
+        }
+        self.input_cursor = Some(cursor);
+        true
+    }
+
+    pub(crate) fn history_previous(&mut self) -> bool {
+        if self.prompt_history.is_empty() {
+            return false;
+        }
+        let next = match self.history_index {
+            Some(0) => return true,
+            Some(i) => i - 1,
+            None => {
+                self.history_draft = self.input.clone();
+                self.prompt_history.len() - 1
+            }
+        };
+        self.history_index = Some(next);
+        self.input = self.prompt_history[next].clone();
+        self.input_cursor = None;
+        true
+    }
+
+    pub(crate) fn history_next(&mut self) -> bool {
+        let Some(index) = self.history_index else {
+            return false;
+        };
+        if index + 1 < self.prompt_history.len() {
+            self.history_index = Some(index + 1);
+            self.input = self.prompt_history[index + 1].clone();
+        } else {
+            self.history_index = None;
+            self.input = std::mem::take(&mut self.history_draft);
+        }
+        self.input_cursor = None;
+        true
     }
 
     pub(crate) fn append_pending_steering(&mut self, message: &UserInput) {
@@ -615,15 +860,16 @@ impl AppState {
         }
     }
 
-    pub(crate) fn interrupt_confirmation_active(&self) -> bool {
-        self.interrupt_armed_at
-            .is_some_and(|armed| armed.elapsed() <= INTERRUPT_CONFIRM_WINDOW)
+    pub(crate) fn exit_confirmation_active(&self) -> bool {
+        self.exit_armed_at
+            .is_some_and(|armed| armed.elapsed() <= EXIT_CONFIRM_WINDOW)
     }
 
     pub(crate) fn composer_has_content(&self) -> bool {
-        !self.input.trim().is_empty()
-            || !self.pasted_attachments.is_empty()
-            || !self.image_attachments.is_empty()
+        self.pending.is_empty()
+            && (!self.input.trim().is_empty()
+                || !self.pasted_attachments.is_empty()
+                || !self.image_attachments.is_empty())
     }
 
     pub(crate) fn add_paste(&mut self, pasted: &str) {
@@ -636,7 +882,7 @@ impl AppState {
         let line_count = normalized.split('\n').count();
         let char_count = normalized.chars().count();
         if line_count < PASTE_ATTACHMENT_MIN_LINES && char_count < PASTE_ATTACHMENT_MIN_CHARS {
-            self.input.push_str(&normalized);
+            self.insert_input(&normalized);
             return;
         }
 
@@ -732,6 +978,11 @@ impl AppState {
 
     pub(crate) fn take_composer_submission(&mut self) -> UserInput {
         let mut task = std::mem::take(&mut self.input);
+        self.input_cursor = None;
+        self.begin_composing();
+        if !task.trim().is_empty() && self.prompt_history.last() != Some(&task) {
+            self.prompt_history.push(task.clone());
+        }
         for attachment in std::mem::take(&mut self.pasted_attachments) {
             if !task.is_empty() {
                 task.push_str("\n\n");
@@ -893,11 +1144,43 @@ pub(crate) fn restore_session(state: &mut AppState, cwd: &Path, id: &str) -> boo
                 return false;
             }
             state.transcript.clear();
+            state.transcript_cache = Default::default();
             state.history.clear();
+            state.current_stream.clear();
+            state.stream_pending.clear();
+            state.stream_last_flush = None;
+            state.completion = None;
+            state.last_error = None;
+            state.pending_task = None;
+            state.ledger = LedgerState::default();
+            state.run_started = None;
+            state.tool_started = None;
+            state.current_tool = None;
+            state.status.state = RunState::Idle;
+            state.steering_active = false;
+            state.scroll = 0;
+            state.follow = true;
+            state.history_index = None;
+            state.history_draft.clear();
+            state.prompt_history = turns.iter().map(|turn| turn.task.clone()).collect();
+            if let Some((provider, model)) = crate::session::model_for(cwd, id) {
+                state.status.provider = provider;
+                state.status.model = model;
+            }
             state.transcript.push(TranscriptLine::new(
                 Gutter::Note,
-                format!("— resumed {id} · {} turns —", turns.len()),
+                format!(
+                    "— resumed {} · {} turns · {id} —",
+                    truncate_chars(&turns[0].task, 36),
+                    turns.len()
+                ),
             ));
+            if state.composer_has_content() {
+                state.transcript.push(TranscriptLine::new(
+                    Gutter::Note,
+                    "unsent draft and attachments kept in the composer",
+                ));
+            }
             if corrupt > 0 {
                 state.transcript.push(TranscriptLine::new(
                     Gutter::Note,

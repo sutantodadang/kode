@@ -79,6 +79,7 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             if state.stream_pending.is_empty() {
                 state.stream_last_flush = Some(Instant::now());
             }
+            state.pulse_tokens = state.pulse_tokens.saturating_add(1);
             state.stream_pending.push_str(&text);
             let elapsed = state
                 .stream_last_flush
@@ -127,6 +128,10 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
                     .find(|(step, _)| *step == TaskStep::Decide)
                 {
                     entry.1 = true;
+                    state
+                        .ledger
+                        .done_at
+                        .push((TaskStep::Decide, Instant::now()));
                 }
             }
         }
@@ -218,14 +223,22 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             state.steering_active = false;
             state.current_tool = None;
         }
-        KodeEvent::VerificationFinished { .. } => {}
+        KodeEvent::VerificationFinished { ok } => {
+            if !ok {
+                // Failure is state, not motion: applies under reduced motion too.
+                state.trace_back = Some(None);
+                state.style_epoch += 1;
+            } else if !state.reduced_motion {
+                state.trace_back = Some(Some(Instant::now() + Duration::from_millis(300)));
+                state.style_epoch += 1;
+            }
+        }
         KodeEvent::AgentFinished => {
             // The pipeline may still be verifying or preparing a repair
             // agent. `TaskFinished` owns the transition to idle.
             state.status.state = RunState::Thinking;
             state.steering_active = false;
             state.current_tool = None;
-            state.interrupt_armed_at = None;
         }
         KodeEvent::AgentError { message } => {
             state.last_error = Some(message.clone());
@@ -238,7 +251,6 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             state.status.state = RunState::Idle;
             state.run_started = None;
             state.current_tool = None;
-            state.interrupt_armed_at = None;
             if !state.response_buf.is_empty() {
                 state.last_response = std::mem::take(&mut state.response_buf);
             }
@@ -259,10 +271,9 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             if router_plans && state.ledger.steps.iter().all(|(s, _)| *s != TaskStep::Plan) {
                 state.ledger.steps.insert(0, (TaskStep::Plan, false));
             }
-            state.transcript.push(TranscriptLine::new(
-                Gutter::Note,
-                kode_core::event::router_summary(&answers),
-            ));
+            let mut line = TranscriptLine::new(Gutter::Route, route_line_text(&answers));
+            line.born = Some(Instant::now());
+            state.transcript.push(line);
         }
         KodeEvent::SourcedNote { text, source } => {
             let gutter = match source {
@@ -270,7 +281,15 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
                 NoteSource::Ingat => Gutter::Ingat,
                 NoteSource::Git => Gutter::Git,
             };
-            state.transcript.push(TranscriptLine::new(gutter, text));
+            if !state.thread_head_shown {
+                state.thread_head_shown = true;
+                state
+                    .transcript
+                    .push(TranscriptLine::new(Gutter::ThreadHead, ""));
+            }
+            let mut line = TranscriptLine::new(gutter, text);
+            line.born = Some(Instant::now());
+            state.transcript.push(line);
         }
         KodeEvent::TaskFinished {
             iterations,
@@ -297,7 +316,6 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             state.status.state = RunState::Idle;
             state.run_started = None;
             state.current_tool = None;
-            state.interrupt_armed_at = None;
             if !state.response_buf.is_empty() {
                 state.last_response = std::mem::take(&mut state.response_buf);
             }
@@ -352,19 +370,19 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             let (gutter, text, status) = if skipped {
                 (
                     Gutter::VerifySkip,
-                    format!("{name} · {dur:.1}s – (skipped)"),
+                    format!("{name} · {dur:.1}s"),
                     StepStatusLite::Skipped,
                 )
             } else if passed {
                 (
                     Gutter::Verify,
-                    format!("{name} · {dur:.1}s ✓"),
+                    format!("{name} · {dur:.1}s"),
                     StepStatusLite::Passed,
                 )
             } else {
                 (
                     Gutter::VerifyFail,
-                    format!("{name} · {dur:.1}s ×"),
+                    format!("{name} · {dur:.1}s"),
                     StepStatusLite::Failed,
                 )
             };
@@ -374,9 +392,41 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
         KodeEvent::TaskProgress { step, done } => {
             if let Some(entry) = state.ledger.steps.iter_mut().find(|(s, _)| *s == step) {
                 entry.1 = done;
+                if done {
+                    state.ledger.done_at.push((step, Instant::now()));
+                }
             }
         }
     }
+}
+
+/// Text of the transcript's `Route` line: `route k=v · k=v` plus, for the
+/// first Laya answer that reports confidence, a 10-cell `■□` bar and the
+/// score. Static answers carry their reason inline and get no bar. Pure so
+/// it is unit-testable without driving `apply_event`.
+pub(crate) fn route_line_text(answers: &[kode_core::event::RouteAnswer]) -> String {
+    use kode_core::event::RouteSource;
+    let parts: Vec<String> = answers
+        .iter()
+        .map(|a| match &a.source {
+            RouteSource::Laya => format!("{}={}", a.key, a.value),
+            RouteSource::Static(reason) => format!("{}={} (static: {reason})", a.key, a.value),
+        })
+        .collect();
+    let mut text = format!("route {}", parts.join(" · "));
+    let laya = answers
+        .iter()
+        .find(|a| a.source == RouteSource::Laya && a.confidence.is_some());
+    if let Some(confidence) = laya.and_then(|a| a.confidence) {
+        let filled = ((confidence * 10.0).round().max(0.0) as usize).min(10);
+        text.push_str("  ");
+        text.extend((0..10).map(|i| if i < filled { '■' } else { '□' }));
+        text.push_str(&format!(" {confidence:.2}"));
+        if confidence < 0.5 {
+            text.push_str(" low");
+        }
+    }
+    text
 }
 
 /// Summarizes a tool-group header's stacked child names: `"{name} ×{n}"`

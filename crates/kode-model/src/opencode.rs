@@ -23,7 +23,7 @@ pub fn default_config_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".config").join("opencode"))
 }
 
-fn builtin_base_url(provider_id: &str) -> Option<&'static str> {
+pub(crate) fn builtin_base_url(provider_id: &str) -> Option<&'static str> {
     match provider_id {
         "opencode-go" => Some("https://opencode.ai/zen/go/v1"),
         "opencode" => Some("https://opencode.ai/zen/v1"),
@@ -51,6 +51,14 @@ pub fn resolve(
         base_url,
         api_key: key,
         model,
+        opencode_session: Some(format!(
+            "kode-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        )),
     }))
 }
 

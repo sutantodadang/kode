@@ -12,6 +12,8 @@ pub struct OpenAiOptions {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    /// Stable for all requests made by one OpenCode agent run.
+    pub opencode_session: Option<String>,
 }
 
 impl Default for OpenAiOptions {
@@ -20,6 +22,7 @@ impl Default for OpenAiOptions {
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: String::new(),
             model: String::new(),
+            opencode_session: None,
         }
     }
 }
@@ -58,13 +61,18 @@ impl Model for OpenAiModel {
             "{}/chat/completions",
             self.opts.base_url.trim_end_matches('/')
         );
-        let resp = self
+        let mut request = self
             .client
             .post(url)
             .bearer_auth(&self.opts.api_key)
-            .json(&body)
-            .send()
-            .await?;
+            .json(&body);
+        if let Some(session) = &self.opts.opencode_session {
+            request = request.header("x-opencode-session", session).header(
+                reqwest::header::USER_AGENT,
+                concat!("kode/", env!("CARGO_PKG_VERSION")),
+            );
+        }
+        let resp = request.send().await?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
@@ -365,6 +373,43 @@ fn message_to_wire(message: &Message) -> serde_json::Value {
 mod tests {
     use super::*;
     use crate::types::{ToolCall, ToolSpec};
+
+    #[tokio::test]
+    async fn opencode_request_sends_stable_session_header() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = vec![0; 4096];
+            let count = socket.read(&mut bytes).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&bytes[..count]).to_ascii_lowercase()
+        });
+        let model = OpenAiModel::new(OpenAiOptions {
+            base_url: format!("http://{address}"),
+            api_key: "test".into(),
+            model: "deepseek-v4-flash".into(),
+            opencode_session: Some("kode-session-test".into()),
+        });
+        let request = ModelRequest {
+            messages: vec![Message::System("Reply OK".into())],
+            tools: vec![],
+            max_tokens: Some(16),
+            temperature: None,
+            effort: None,
+        };
+        let _stream = model.stream(request).await.unwrap();
+        let wire = server.await.unwrap();
+        assert!(
+            wire.contains("x-opencode-session: kode-session-test"),
+            "{wire}"
+        );
+    }
 
     #[test]
     fn build_body_maps_image_attachment() {

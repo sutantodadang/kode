@@ -4,8 +4,6 @@ use thiserror::Error;
 pub enum AgentError {
     #[error(transparent)]
     Model(#[from] kode_model::ModelError),
-    #[error("tool call limit reached ({0})")]
-    ToolCallLimit(u32),
     #[error("cancelled")]
     Cancelled,
     #[error(

@@ -46,7 +46,7 @@ kode auth login kilo
 kode auth login lmstudio
 ```
 
-Kode prompts you to paste the key, then writes it to `~/.kode/auth/<provider>.json`.
+Kode prompts you to paste the key, then writes it under that provider ID in `~/.kode/auth/opencode.json`. `opencode-go` and `opencode` (Zen) are separate login entries; choosing one does not use the other's key. Kode sends a stable `x-opencode-session` header for each agent run, as required by [OpenCode Go](https://opencode.ai/docs/go/#where-can-i-use-it), and lists models from the selected gateway's live `/models` endpoint.
 
 ## Check what's logged in
 

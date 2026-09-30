@@ -125,7 +125,8 @@ pub async fn list_catalog(
         )),
         other => {
             let models = match other {
-                "opencode-go" | "opencode" | "kilo" => fetch_models_dev(other).await,
+                "opencode-go" | "opencode" => fetch_opencode_models(other).await,
+                "kilo" => fetch_models_dev(other).await,
                 "lmstudio" => fetch_lmstudio().await,
                 "openai" => fetch_openai(api_key_env).await,
                 _ => Err(format!("no model catalog for provider '{other}'")),
@@ -450,20 +451,40 @@ fn parse_models_dev(json: &str, provider: &str) -> Result<Vec<String>, String> {
 }
 
 async fn fetch_lmstudio() -> Result<Vec<String>, String> {
+    fetch_openai_style_models(LMSTUDIO_URL, "lmstudio").await
+}
+
+fn opencode_models_url(provider: &str) -> Option<String> {
+    match provider {
+        "opencode-go" | "opencode" => Some(format!(
+            "{}/models",
+            crate::opencode::builtin_base_url(provider)?
+        )),
+        _ => None,
+    }
+}
+
+async fn fetch_opencode_models(provider: &str) -> Result<Vec<String>, String> {
+    let url = opencode_models_url(provider)
+        .ok_or_else(|| format!("no OpenCode catalog for provider '{provider}'"))?;
+    fetch_openai_style_models(&url, provider).await
+}
+
+async fn fetch_openai_style_models(url: &str, label: &str) -> Result<Vec<String>, String> {
     let client = reqwest::Client::new();
     let resp = client
-        .get(LMSTUDIO_URL)
+        .get(url)
         .timeout(FETCH_TIMEOUT)
         .send()
         .await
-        .map_err(|e| format!("lmstudio fetch failed: {e}"))?;
+        .map_err(|e| format!("{label} fetch failed: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("lmstudio returned {}", resp.status()));
+        return Err(format!("{label} returned {}", resp.status()));
     }
     let text = resp
         .text()
         .await
-        .map_err(|e| format!("lmstudio read failed: {e}"))?;
+        .map_err(|e| format!("{label} read failed: {e}"))?;
     parse_openai_models(&text)
 }
 
@@ -688,6 +709,18 @@ mod tests {
         let json = r#"{"other": {"models": {}}}"#;
         let err = parse_models_dev(json, "opencode-go").unwrap_err();
         assert!(err.contains("opencode-go"));
+    }
+
+    #[test]
+    fn opencode_uses_its_live_gateway_catalogs() {
+        assert_eq!(
+            opencode_models_url("opencode-go").as_deref(),
+            Some("https://opencode.ai/zen/go/v1/models")
+        );
+        assert_eq!(
+            opencode_models_url("opencode").as_deref(),
+            Some("https://opencode.ai/zen/v1/models")
+        );
     }
 
     #[test]
