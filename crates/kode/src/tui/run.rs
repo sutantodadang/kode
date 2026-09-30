@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
+use std::fs::{File, OpenOptions};
 use std::future::Future;
-use std::io::Stdout;
+use std::io::{self, Stdout, Write};
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Arc;
@@ -28,7 +29,7 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::{mpsc, oneshot};
 
 use super::commands::*;
-use super::draw::draw;
+use super::draw::{draw, line_animating};
 use super::events::{apply_event, flush_model_stream};
 use super::state::*;
 use crate::custom_commands;
@@ -83,7 +84,105 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Native engines write diagnostics to the process stderr. Keep those bytes
+/// in a file while the alternate screen is active so they cannot overwrite
+/// the composer or be mistaken for user input.
+struct TuiStderrGuard {
+    #[cfg(windows)]
+    original: *mut std::ffi::c_void,
+    #[cfg(unix)]
+    original: i32,
+    _file: File,
+}
+
+impl TuiStderrGuard {
+    fn redirect() -> io::Result<Self> {
+        let root = kode_core::kode_home_dir().unwrap_or_else(std::env::temp_dir);
+        let dir = root.join("logs");
+        std::fs::create_dir_all(&dir)?;
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(dir.join("tui-stderr.log"))?;
+        io::stderr().flush()?;
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            unsafe extern "system" {
+                fn GetStdHandle(kind: u32) -> *mut std::ffi::c_void;
+                fn SetStdHandle(kind: u32, handle: *mut std::ffi::c_void) -> i32;
+            }
+            const STDERR_HANDLE: u32 = -12_i32 as u32;
+            let original = unsafe { GetStdHandle(STDERR_HANDLE) };
+            if original.is_null() || original as isize == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if unsafe { SetStdHandle(STDERR_HANDLE, file.as_raw_handle()) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self {
+                original,
+                _file: file,
+            })
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            unsafe extern "C" {
+                fn dup(fd: i32) -> i32;
+                fn dup2(from: i32, to: i32) -> i32;
+                fn close(fd: i32) -> i32;
+            }
+            let original = unsafe { dup(2) };
+            if original < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if unsafe { dup2(file.as_raw_fd(), 2) } < 0 {
+                let error = io::Error::last_os_error();
+                unsafe { close(original) };
+                return Err(error);
+            }
+            Ok(Self {
+                original,
+                _file: file,
+            })
+        }
+    }
+}
+
+impl Drop for TuiStderrGuard {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        {
+            unsafe extern "system" {
+                fn SetStdHandle(kind: u32, handle: *mut std::ffi::c_void) -> i32;
+            }
+            unsafe { SetStdHandle(-12_i32 as u32, self.original) };
+        }
+        #[cfg(unix)]
+        {
+            unsafe extern "C" {
+                fn dup2(from: i32, to: i32) -> i32;
+                fn close(fd: i32) -> i32;
+            }
+            unsafe {
+                dup2(self.original, 2);
+                close(self.original);
+            }
+        }
+    }
+}
+
 pub(crate) fn append_paste_at(state: &mut AppState, cwd: &Path, pasted: &str) {
+    if !state.pending.is_empty() {
+        return;
+    }
     state.begin_composing();
     if !pasted.contains(['\r', '\n']) && crate::attachments::looks_like_image_path(pasted) {
         if let Err(err) = state.add_image_path(cwd, pasted) {
@@ -430,11 +529,13 @@ fn record_failed_turn(
     record_completed_turn(state, cwd, provider, model, 0);
 }
 
-/// Launches the interactive TUI. Runs until the user quits (Ctrl-C/'q' while
+/// Launches the interactive TUI. Runs until the user quits (Ctrl-C while
 /// idle) or the process is otherwise terminated. `continue_` resumes the
 /// latest session: transcript replayed, history armed for the model.
 pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyhow::Result<()> {
     let mut config = KodeConfig::load(cwd).unwrap_or_default();
+
+    let _stderr_guard = TuiStderrGuard::redirect()?;
 
     enable_raw_mode()?;
     execute!(
@@ -490,7 +591,10 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
     if continue_ {
         match crate::session::latest(cwd) {
             Some(id) => {
-                restore_session(&mut state, cwd, &id);
+                if restore_session(&mut state, cwd, &id) {
+                    config.model.provider = state.status.provider.clone();
+                    config.model.model = state.status.model.clone();
+                }
             }
             None => state.transcript.push(TranscriptLine::new(
                 Gutter::Note,
@@ -517,6 +621,10 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
     let mut current_steering: Option<mpsc::UnboundedSender<UserInput>> = None;
     let mut queued_followup: Option<UserInput> = None;
     let mut ui_tick = tokio::time::interval(Duration::from_millis(100));
+    // Kode Benang motion cadence: only polled while something can animate
+    // (see `motion_active`); the idle path keeps the 100 ms tick above.
+    let mut motion_tick = tokio::time::interval(Duration::from_millis(50));
+    motion_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Tracks whether the terminal currently has mouse capture enabled, so
     // Ctrl+T (`state.select_mode`) is synced to the real terminal mode at
     // most once per toggle rather than issuing the escape sequence every
@@ -538,26 +646,36 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
     }
 
     'outer: loop {
+        let animating = motion_active(&state, Instant::now());
         tokio::select! {
             biased;
 
             maybe_key = next_terminal_event(&mut key_events, &mut pending_terminal_events) => {
                 match maybe_key {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                        if state.picker.open {
-                            match handle_picker_key(&mut state, key.code) {
+                        if state.running
+                            && state.pending.is_empty()
+                            && key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            if let Some(cancel) = &current_cancel {
+                                cancel.cancel();
+                            }
+                        } else if state.picker.open {
+                            let picker_outcome = if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                                if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                                    PickerOutcome::Cancel
+                                } else {
+                                    PickerOutcome::Continue
+                                }
+                            } else {
+                                handle_picker_key(&mut state, key.code)
+                            };
+                            match picker_outcome {
                                 PickerOutcome::Select(selected) => {
-                                    state.picker.open = false;
                                     match state.picker.kind {
                                         PickerKind::Model => {
-                                            let model = selected;
-                                            state.status.model = model.clone();
-                                            config.model.model = model.clone();
-                                            let _ = KodeConfig::update_model_selection(cwd, Some(&model), None);
-                                            state.transcript.push(TranscriptLine::new(
-                                                Gutter::Note,
-                                                format!("model set: {model}"),
-                                            ));
+                                            commit_model_selection(&mut state, cwd, &mut config, &selected);
                                         }
                                         PickerKind::Provider => {
                                             let name = selected
@@ -566,20 +684,42 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                                 .unwrap_or("")
                                                 .to_string();
                                             if VALID_PROVIDERS.contains(&name.as_str()) {
-                                                apply_provider_selection(&mut state, cwd, &mut config, &picker_tx, &name);
+                                                state.picker.open = false;
+                                                apply_provider_selection(&mut state, &picker_tx, &name);
                                             } else {
-                                                state.transcript.push(TranscriptLine::new(
-                                                    Gutter::Note,
-                                                    format!(
-                                                        "invalid provider '{name}' (valid: {})",
-                                                        VALID_PROVIDERS.join(", ")
-                                                    ),
-                                                ));
+                                                state.picker.note = Some(format!("invalid provider: {name}"));
                                             }
                                         }
                                         PickerKind::Session => {
+                                            state.picker.open = false;
                                             let id = session_id_from_row(&selected);
-                                            restore_session(&mut state, cwd, &id);
+                                            if restore_session(&mut state, cwd, &id) {
+                                                config.model.provider = state.status.provider.clone();
+                                                config.model.model = state.status.model.clone();
+                                            }
+                                        }
+                                        PickerKind::Command => {
+                                            state.picker.open = false;
+                                            if let Some(name) = selected.split_whitespace().next() {
+                                                if name == "/exit" {
+                                                    break 'outer;
+                                                }
+                                                let needs_argument = matches!(name, "/effort" | "/image")
+                                                    || !BUILTIN_COMMAND_NAMES.contains(&name.trim_start_matches('/'));
+                                                if needs_argument {
+                                                    if state.input.is_empty() {
+                                                        state.input = format!("{name} ");
+                                                        state.input_cursor = None;
+                                                    } else {
+                                                        state.transcript.push(TranscriptLine::new(
+                                                            Gutter::Note,
+                                                            format!("draft kept; type {name} after sending or clearing it"),
+                                                        ));
+                                                    }
+                                                } else if let Some(command) = parse_slash_command(name) {
+                                                    handle_slash_command(&mut state, cwd, &mut config, &picker_tx, command);
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -598,13 +738,25 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                             {
                                 if state.running {
                                     let steering = state.take_composer_submission();
+                                    if steering.text.trim() == "/exit" {
+                                        break 'outer;
+                                    }
                                     route_running_input(
                                         &mut state,
-                                        current_steering.as_ref(),
+                                        if key.modifiers.contains(KeyModifiers::ALT) {
+                                            None
+                                        } else {
+                                            current_steering.as_ref()
+                                        },
                                         &mut queued_followup,
                                         steering,
                                     );
                                 } else {
+                                    if requires_model_before_send(&state, cwd) {
+                                        state.transcript.push(TranscriptLine::new(Gutter::Note, "pick a model first"));
+                                        open_picker(&mut state, config.model.provider.clone(), &picker_tx);
+                                        continue 'outer;
+                                    }
                                     let had_attachments = !state.pasted_attachments.is_empty()
                                         || !state.image_attachments.is_empty();
                                     let mut input = state.take_composer_submission();
@@ -624,6 +776,9 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                     } else {
                                         parse_slash_command(&input.text)
                                     };
+                                    if matches!(command.as_ref(), Some(SlashCommand::Exit)) {
+                                        break 'outer;
+                                    }
                                     if let Some(cmd) = command {
                                         if let Some(expanded) =
                                             handle_slash_command(&mut state, cwd, &mut config, &picker_tx, cmd)
@@ -658,7 +813,9 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                         }
                     }
                     Some(Ok(Event::Paste(pasted))) => {
-                        if !state.picker.open {
+                        if state.picker.open {
+                            append_picker_filter(&mut state, &pasted);
+                        } else {
                             append_paste_at(&mut state, cwd, &pasted);
                         }
                     }
@@ -794,6 +951,11 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                 // dim→normal fade (item 3) — a new evidence row is dim for
                 // its first 2 of these ~100ms ticks.
                 state.render_tick = state.render_tick.wrapping_add(1);
+                motion_tick_update(&mut state, Instant::now());
+            }
+
+            _ = motion_tick.tick(), if animating => {
+                motion_tick_update(&mut state, Instant::now());
             }
         }
 
@@ -820,6 +982,54 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
     Ok(())
 }
 
+/// True while any Kode Benang animation can be in flight: a run is active, a
+/// timed trace-back is pending, or one of the last 8 transcript lines is
+/// inside its animation window. Never true under reduced motion.
+fn motion_active(state: &AppState, now: Instant) -> bool {
+    !state.reduced_motion
+        && (state.running
+            || matches!(state.trace_back, Some(Some(_)))
+            || state
+                .transcript
+                .iter()
+                .rev()
+                .take(8)
+                .any(|l| line_animating(l.born, now, false)))
+}
+
+/// Per-tick motion bookkeeping: expire a timed trace-back and sample the
+/// token pulse.
+fn motion_tick_update(state: &mut AppState, now: Instant) {
+    if let Some(Some(until)) = state.trace_back
+        && now >= until
+    {
+        state.trace_back = None;
+        state.style_epoch += 1;
+    }
+    state.sample_pulse(now);
+}
+
+pub(crate) fn requires_model_before_send(state: &AppState, cwd: &Path) -> bool {
+    if !state.status.model.is_empty() {
+        return false;
+    }
+    let hint = if state.input.starts_with('/') {
+        let custom = custom_commands::discover(cwd, BUILTIN_COMMAND_NAMES);
+        let hints = slash_hint_items(&state.input, &custom);
+        hints
+            .get(state.slash_selected.min(hints.len().saturating_sub(1)))
+            .map(|item| item.0.clone())
+    } else {
+        None
+    };
+    !state.pasted_attachments.is_empty()
+        || !state.image_attachments.is_empty()
+        || matches!(
+            parse_slash_command(hint.as_deref().unwrap_or(&state.input)),
+            None | Some(SlashCommand::Unknown(_) | SlashCommand::Custom { .. })
+        )
+}
+
 /// Handles one key press. Returns `true` if the app should quit.
 pub(crate) fn handle_key(
     state: &mut AppState,
@@ -843,11 +1053,25 @@ pub(crate) fn handle_key(
         return false;
     }
 
-    if code != KeyCode::Esc {
-        state.interrupt_armed_at = None;
+    if !(modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c' | 'd'))) {
+        state.exit_armed_at = None;
     }
 
-    if code == KeyCode::Char('?') && state.input.is_empty() && state.pending.is_empty() {
+    if !state.pending.is_empty() {
+        let decision = match (code, modifiers) {
+            (KeyCode::Char('a' | 'y'), KeyModifiers::NONE) => Some(true),
+            (KeyCode::Char('d' | 'n') | KeyCode::Esc, KeyModifiers::NONE) => Some(false),
+            _ => None,
+        };
+        if let Some(allow) = decision
+            && let Some(req) = state.pop_permission()
+        {
+            let _ = req.responder.send(allow);
+        }
+        return false;
+    }
+
+    if code == KeyCode::Char('?') && state.input.is_empty() {
         state.shortcuts_open = true;
         return false;
     }
@@ -864,11 +1088,35 @@ pub(crate) fn handle_key(
 
     if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
         if !state.running {
-            return true;
+            if !state.pending.is_empty() {
+                return false;
+            }
+            if state.exit_confirmation_active() {
+                return true;
+            }
+            state.exit_armed_at = Some(Instant::now());
+            return false;
         }
         if let Some(c) = current_cancel {
             c.cancel();
         }
+        return false;
+    }
+
+    if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('d') {
+        if !state.input.is_empty() {
+            state.delete_input();
+        } else if !state.running {
+            if state.exit_confirmation_active() {
+                return true;
+            }
+            state.exit_armed_at = Some(Instant::now());
+        }
+        return false;
+    }
+
+    if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('p') {
+        open_command_picker(state, cwd);
         return false;
     }
 
@@ -916,51 +1164,19 @@ pub(crate) fn handle_key(
 
     match code {
         KeyCode::Enter if modifiers.contains(KeyModifiers::SHIFT) => {
-            state.input.push('\n');
+            state.insert_input("\n");
         }
         KeyCode::Esc => {
-            if hint_count > 0 {
-                state.input.clear();
-                state.slash_selected = 0;
-            } else if state.ledger_open {
+            if state.ledger_open {
                 state.ledger_open = false;
             } else if state.running
                 && let Some(c) = current_cancel
             {
-                if state.interrupt_confirmation_active() {
-                    state.interrupt_armed_at = None;
-                    c.cancel();
-                } else {
-                    state.interrupt_armed_at = Some(Instant::now());
-                }
-            }
-        }
-        KeyCode::Char('q')
-            if !state.running
-                && state.input.is_empty()
-                && state.pasted_attachments.is_empty()
-                && state.image_attachments.is_empty() =>
-        {
-            return true;
-        }
-        KeyCode::Char('y') if modifiers == KeyModifiers::NONE && !state.pending.is_empty() => {
-            if let Some(req) = state.pop_permission() {
-                let _ = req.responder.send(true);
-            }
-        }
-        KeyCode::Char('n') if modifiers == KeyModifiers::NONE && !state.pending.is_empty() => {
-            if let Some(req) = state.pop_permission() {
-                let _ = req.responder.send(false);
-            }
-        }
-        KeyCode::Char('a') if modifiers == KeyModifiers::NONE && !state.pending.is_empty() => {
-            if let Some(req) = state.pop_permission() {
-                let _ = req.responder.send(true);
-            }
-        }
-        KeyCode::Char('d') if modifiers == KeyModifiers::NONE && !state.pending.is_empty() => {
-            if let Some(req) = state.pop_permission() {
-                let _ = req.responder.send(false);
+                c.cancel();
+            } else if hint_count > 0 {
+                state.input.clear();
+                state.input_cursor = None;
+                state.slash_selected = 0;
             }
         }
         KeyCode::Tab if hint_count > 0 => {
@@ -968,25 +1184,35 @@ pub(crate) fn handle_key(
             let items = slash_hint_items(&state.input, &custom);
             let (name, _) = items[state.slash_selected.min(items.len() - 1)].clone();
             state.input = format!("{name} ");
+            state.input_cursor = None;
             state.slash_selected = 0;
         }
-        KeyCode::Char(c) if state.pending.is_empty() => {
-            state.begin_composing();
-            state.input.push(c);
+        KeyCode::Char(c)
+            if state.pending.is_empty()
+                && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            state.insert_input(&c.to_string());
             state.slash_selected = 0;
         }
         KeyCode::Backspace => {
             if state.input.is_empty() {
                 state.remove_last_attachment();
             } else {
-                state.input.pop();
+                state.backspace_input();
             }
             state.slash_selected = 0;
         }
+        KeyCode::Delete => {
+            state.delete_input();
+        }
+        KeyCode::Left => state.move_input_left(),
+        KeyCode::Right => state.move_input_right(),
+        KeyCode::Home => state.move_input_home(),
+        KeyCode::End => state.move_input_end(),
         KeyCode::Up => {
             if hint_count > 0 {
                 state.slash_selected = state.slash_selected.saturating_sub(1);
-            } else {
+            } else if !state.move_input_vertical(-1) && !state.history_previous() {
                 state.scroll = state.scroll.saturating_sub(1);
                 state.follow = false;
             }
@@ -994,7 +1220,7 @@ pub(crate) fn handle_key(
         KeyCode::Down => {
             if hint_count > 0 {
                 state.slash_selected = (state.slash_selected + 1).min(hint_count - 1);
-            } else {
+            } else if !state.move_input_vertical(1) && !state.history_next() {
                 state.scroll = state.scroll.saturating_add(1);
             }
         }
@@ -1143,6 +1369,43 @@ pub(crate) fn copy_to_clipboard(text: &str) -> Result<usize, ()> {
 
 #[allow(dead_code)]
 pub(crate) type Backend = CrosstermBackend<Stdout>;
+
+#[cfg(test)]
+mod native_log_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires the installed zindeks library; run explicitly for terminal-log QA"]
+    async fn embedded_watcher_log_goes_to_tui_log_file() {
+        let root = std::env::temp_dir().join(format!(
+            "kode-watcher-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        let library =
+            crate::engine_assets::zindeks_library(&KodeConfig::default().zindeks).unwrap();
+        let log_path = kode_core::kode_home_dir()
+            .unwrap()
+            .join("logs/tui-stderr.log");
+        let before = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+        let guard = TuiStderrGuard::redirect().unwrap();
+        let engine =
+            kode_intel::EmbeddedZindeks::open(&library, &root, &root.join("store"), true).unwrap();
+        engine.index_repository().await.unwrap();
+        drop(engine);
+        drop(guard);
+        let log = std::fs::read(&log_path).unwrap();
+        assert!(
+            String::from_utf8_lossy(&log[before as usize..]).contains("file watcher enabled"),
+            "zindeks watcher log was not captured"
+        );
+    }
+}
 
 #[cfg(test)]
 mod failure_persistence_tests {

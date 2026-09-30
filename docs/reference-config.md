@@ -66,7 +66,6 @@ enabled = true
 
 | Key | Type | Default | Effect |
 |---|---|---|---|
-| `max_tool_calls` | integer | `0` (unlimited) | Optional upper bound on total tool calls per task. Keep `0` for normal long-running work; set a non-zero value only when an external policy requires a hard cap. |
 | `model_retries` | integer | `3` | Retries a transient model failure without consuming another agent iteration. Capped at 10; set to `0` to disable. A stream is retried only before any model delta, so partial responses and tool calls are never duplicated. |
 | `model_retry_base_ms` | integer | `500` | Initial retry delay in milliseconds. Subsequent retries use exponential backoff, capped at 30 seconds, and remain immediately cancellable. |
 | `max_context_tokens` | integer | `0` (auto) | Total model window Kode may use. Auto reads live provider metadata when available, then falls back conservatively. Set a non-zero value to override detection. |
@@ -74,9 +73,10 @@ enabled = true
 | `history_budget_tokens` | integer | `0` (auto) | Verbatim recent-session budget. Auto uses roughly 30% of the resolved window, bounded to 6k–256k. Older turns remain stored in the session even when omitted from verbatim replay. |
 | `auto_compact` | bool | `true` | At 80% of the usable window, ask the selected model for a structured continuation summary, then retain system/repository context, the newest task, and the latest tool protocol in bounded form. Failed compaction falls back to safe truncation instead of failing the task. |
 
+Agent iterations and tool calls have no count limit. Legacy `max_iterations` and `max_tool_calls` keys are ignored; Esc or Ctrl+C cancels an active TUI run immediately.
+
 ```toml
 [agent]
-max_tool_calls = 0
 model_retries = 3
 model_retry_base_ms = 500
 max_context_tokens = 0
@@ -277,7 +277,6 @@ enabled = true
 # store_path = "/custom/memory.sqlite3"
 
 [agent]
-max_tool_calls = 0
 model_retries = 3
 model_retry_base_ms = 500
 max_context_tokens = 0

@@ -6,9 +6,11 @@ never reimplemented in Kode.
 
 ## Design System
 Always read DESIGN.md before making any visual or TUI decisions.
-Palette, pane layout, glyph vocabulary, motion rules, and anti-slop constraints
-are defined there. Do not deviate without explicit user approval.
-Preview of every surface: `.kode-design-preview.html`.
+The approved layout (thread ledger), provenance colors, glyphs, event-driven
+motion, interaction states, and reduced-motion rules are defined there. Do not
+deviate without explicit user approval. Flag TUI code that does not match it.
+`docs/tui-redesign-2026-09-28.md` covers the input/picker/permission contracts
+that DESIGN.md carries over; its visual sections are superseded.
 
 ## Conventions
 - Task pipeline (`crates/kode/src/pipeline.rs`) communicates ONLY via KodeEvent —

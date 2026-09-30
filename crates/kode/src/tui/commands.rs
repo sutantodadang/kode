@@ -21,6 +21,8 @@ pub enum SlashCommand {
     Copy,
     /// `/resume` — opens the session picker.
     Resume,
+    Status,
+    Exit,
     /// `/plan` — toggles plan mode (session-only; see `AppState::plan_mode`).
     Plan,
     /// `/image <path>` — attaches an image file to the next user turn.
@@ -43,7 +45,8 @@ pub enum SlashCommand {
 /// [`SLASH_COMMANDS`]. Custom commands never shadow these; discovery
 /// filters them out up front.
 pub const BUILTIN_COMMAND_NAMES: &[&str] = &[
-    "model", "effort", "provider", "copy", "resume", "plan", "image", "router", "help",
+    "model", "effort", "provider", "copy", "resume", "status", "exit", "plan", "image", "router",
+    "help",
 ];
 
 /// The providers `/provider` accepts, in picker display order.
@@ -65,6 +68,8 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/provider", "pick provider"),
     ("/copy", "copy last response to clipboard"),
     ("/resume", "resume a previous session"),
+    ("/status", "show model, mode, and available context"),
+    ("/exit", "exit Kode"),
     ("/image", "attach PNG, JPEG, GIF, or WebP"),
     (
         "/plan",
@@ -124,6 +129,8 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         }),
         "/copy" => SlashCommand::Copy,
         "/resume" => SlashCommand::Resume,
+        "/status" => SlashCommand::Status,
+        "/exit" => SlashCommand::Exit,
         "/plan" => SlashCommand::Plan,
         "/image" => SlashCommand::Image(rest.to_string()),
         "/router" => SlashCommand::Router(rest.to_string()),
@@ -168,7 +175,7 @@ pub fn provider_auth_state(
             if opencode_keys.iter().any(|k| k == provider) {
                 " ✓ logged in"
             } else {
-                ""
+                " · login required"
             }
         }
         "openai" => {
@@ -302,23 +309,15 @@ pub fn picker_filtered_items(items: &[String], filter: &str) -> Vec<String> {
         .collect()
 }
 
-/// Decides what Enter selects in the picker: the highlighted row in
-/// `filtered`, or — when there's no matching row and the filter text is
-/// non-empty — the typed text verbatim. Returns `None` when there is
-/// nothing to select (no rows, empty filter).
+/// Decides what Enter selects in the picker. Unmatched text is never
+/// interpreted as a provider or model; `/model <name>` is the explicit
+/// custom-model path.
 pub fn picker_enter_selection(
     filtered: &[String],
-    filter: &str,
+    _filter: &str,
     selected: usize,
 ) -> Option<String> {
-    if let Some(item) = filtered.get(selected) {
-        return Some(item.clone());
-    }
-    let trimmed = filter.trim();
-    if !trimmed.is_empty() {
-        return Some(trimmed.to_string());
-    }
-    None
+    filtered.get(selected).cloned()
 }
 
 /// Effect requested by a key press while the picker is open.
@@ -367,6 +366,16 @@ pub fn handle_picker_key(state: &mut AppState, code: KeyCode) -> PickerOutcome {
     }
 }
 
+pub(crate) fn append_picker_filter(state: &mut AppState, pasted: &str) {
+    if state.pending.is_empty() {
+        state
+            .picker
+            .filter
+            .extend(pasted.chars().filter(|c| !c.is_control()));
+        state.picker.selected = 0;
+    }
+}
+
 /// Opens the picker (clearing prior filter/items) and spawns a best-effort
 /// catalog fetch for `provider`, delivered back via `tx`.
 pub(crate) fn open_picker(
@@ -378,6 +387,7 @@ pub(crate) fn open_picker(
     let request_id = state.picker.request_id;
     state.picker.open = true;
     state.picker.kind = PickerKind::Model;
+    state.picker.provider = provider.clone();
     state.picker.filter.clear();
     state.picker.selected = 0;
     state.picker.items.clear();
@@ -446,27 +456,58 @@ pub(crate) fn open_provider_picker(state: &mut AppState) {
         .collect();
 }
 
-/// Applies a validated `/provider` switch: persists the new provider
-/// (clearing `model` — it's very unlikely to be valid across providers),
-/// updates in-memory state, and auto-opens the model picker for the new
-/// provider so the user isn't left at "(no model)".
+pub(crate) fn open_command_picker(state: &mut AppState, cwd: &Path) {
+    state.picker.request_id = state.picker.request_id.wrapping_add(1);
+    state.picker.open = true;
+    state.picker.kind = PickerKind::Command;
+    state.picker.filter.clear();
+    state.picker.selected = 0;
+    state.picker.note = None;
+    let custom = custom_commands::discover(cwd, BUILTIN_COMMAND_NAMES);
+    state.picker.items = slash_hint_items("/", &custom)
+        .into_iter()
+        .map(|(name, desc)| format!("{name}  · {desc}"))
+        .collect();
+}
+
+/// Browses a provider's models without changing the active pair. Selection
+/// commits provider and model together; Esc leaves both as they were.
 pub(crate) fn apply_provider_selection(
     state: &mut AppState,
-    cwd: &Path,
-    config: &mut KodeConfig,
     picker_tx: &mpsc::UnboundedSender<PickerLoaded>,
     provider: &str,
 ) {
-    state.status.provider = provider.to_string();
-    state.status.model = String::new();
-    config.model.provider = provider.to_string();
-    config.model.model = String::new();
-    let _ = KodeConfig::update_model_config(cwd, Some(provider), Some(""), None);
+    open_picker(state, provider.to_string(), picker_tx);
+}
+
+pub(crate) fn commit_model_selection(
+    state: &mut AppState,
+    cwd: &Path,
+    config: &mut KodeConfig,
+    model: &str,
+) -> bool {
+    let provider = if state.picker.open && state.picker.kind == PickerKind::Model {
+        state.picker.provider.clone()
+    } else {
+        config.model.provider.clone()
+    };
+    if let Err(err) = KodeConfig::update_model_config(cwd, Some(&provider), Some(model), None) {
+        state.transcript.push(TranscriptLine::new(
+            Gutter::Note,
+            format!("could not save model selection: {err}"),
+        ));
+        return false;
+    }
+    state.status.provider = provider.clone();
+    state.status.model = model.to_string();
+    config.model.provider = provider.clone();
+    config.model.model = model.to_string();
+    state.picker.open = false;
     state.transcript.push(TranscriptLine::new(
         Gutter::Note,
-        format!("provider set: {provider}"),
+        format!("model set: {provider} / {model}"),
     ));
-    open_picker(state, provider.to_string(), picker_tx);
+    true
 }
 
 /// Applies a parsed slash command to `state`/`config`. `/model` with no
@@ -493,13 +534,12 @@ pub(crate) fn handle_slash_command(
             open_picker(state, config.model.provider.clone(), picker_tx);
         }
         SlashCommand::Model(Some(name)) => {
-            state.status.model = name.clone();
-            config.model.model = name.clone();
-            let _ = KodeConfig::update_model_selection(cwd, Some(&name), None);
-            state.transcript.push(TranscriptLine::new(
-                Gutter::Note,
-                format!("model set: {name}"),
-            ));
+            if commit_model_selection(state, cwd, config, &name) {
+                state.transcript.push(TranscriptLine::new(
+                    Gutter::Note,
+                    "custom model name was not catalog-validated",
+                ));
+            }
         }
         SlashCommand::Effort(value) => match validate_effort(&value) {
             Ok(v) => {
@@ -520,7 +560,7 @@ pub(crate) fn handle_slash_command(
         }
         SlashCommand::Provider(Some(name)) => {
             if VALID_PROVIDERS.contains(&name.as_str()) {
-                apply_provider_selection(state, cwd, config, picker_tx, &name);
+                apply_provider_selection(state, picker_tx, &name);
             } else {
                 state.transcript.push(TranscriptLine::new(
                     Gutter::Note,
@@ -532,6 +572,34 @@ pub(crate) fn handle_slash_command(
             }
         }
         SlashCommand::Copy => perform_copy(state),
+        SlashCommand::Status => {
+            let mode = match (state.plan_mode, state.auto_mode) {
+                (true, true) => "PLAN · AUTO",
+                (true, false) => "PLAN · manual",
+                (false, true) => "BUILD · AUTO",
+                (false, false) => "BUILD · manual",
+            };
+            state.transcript.push(TranscriptLine::new(
+                Gutter::Note,
+                format!(
+                    "status: {mode} · {} / {}",
+                    state.status.provider, state.status.model
+                ),
+            ));
+            state.transcript.push(TranscriptLine::new(
+                Gutter::Note,
+                match &state.knowledge {
+                    Some(k) => format!(
+                        "context: {} code facts · {} memories · {} git facts",
+                        k.zindeks.len(),
+                        k.ingat.len(),
+                        k.git.len()
+                    ),
+                    None => "context: not compiled for this session".to_string(),
+                },
+            ));
+        }
+        SlashCommand::Exit => {}
         SlashCommand::Router(args) => {
             let lines = if args.trim().is_empty() {
                 crate::router_cmd::describe_last(cwd)
@@ -546,6 +614,13 @@ pub(crate) fn handle_slash_command(
             }
         }
         SlashCommand::Resume => {
+            if state.running {
+                state.transcript.push(TranscriptLine::new(
+                    Gutter::Note,
+                    "finish the current run before resuming another session",
+                ));
+                return None;
+            }
             let metas = crate::session::list(cwd, 20);
             if metas.is_empty() {
                 state
@@ -556,14 +631,16 @@ pub(crate) fn handle_slash_command(
                     request_id: state.picker.request_id.wrapping_add(1),
                     open: true,
                     kind: PickerKind::Session,
+                    provider: String::new(),
                     items: metas
                         .iter()
                         .map(|m| {
                             format!(
-                                "{}  {}  · {} turns",
+                                "{}  {}  · {} turns · {}",
                                 m.id,
                                 truncate_chars(&m.first_task, 40),
-                                m.turns
+                                m.turns,
+                                m.created.get(..16).unwrap_or(&m.created)
                             )
                         })
                         .collect(),
@@ -606,12 +683,12 @@ pub(crate) fn handle_slash_command(
             state.transcript.push(TranscriptLine::new(
                 Gutter::Note,
                 "commands: /model [name], /effort <minimal|low|medium|high|xhigh|max|ultra>, \
-                 /provider [name], /image <path>, /copy, /plan, /help · shift+tab toggles auto mode (tools run \
+                 /provider [name], /resume, /status, /exit, /image <path>, /copy, /plan, /help · shift+tab toggles auto mode (tools run \
                  without asking) · shift+enter adds a newline · long paste becomes a compact \
-                 attachment; paste or drag an image path to attach it · Enter follows the composer label: send, steer, or queue · \
-                 ? opens shortcuts · Ctrl+A inspects attachments · Ctrl+Y copies the last response · Ctrl+T toggles select mode \
+                 attachment; paste or drag an image path to attach it · Enter follows the composer label: send, steer, or queue · Alt+Enter explicitly queues · \
+                 ? opens shortcuts · Ctrl+P opens commands · Ctrl+A inspects attachments · Ctrl+Y copies the last response · Ctrl+T toggles select mode \
                  (releases mouse capture for native text selection) · Ctrl+K expands evidence, \
-                 Ctrl+L opens the Run Map, Esc closes overlays or press Esc twice to interrupt a run · skills are auto-discovered; name one as $skill · \
+                 Ctrl+L opens the Run Map, Esc cancels an active run or closes an overlay · skills are auto-discovered; name one as $skill · \
                  click a tool-group header to expand/collapse it",
             ));
         }

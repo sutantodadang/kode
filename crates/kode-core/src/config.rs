@@ -29,10 +29,6 @@ fn default_zindeks_watch() -> bool {
     true
 }
 
-fn default_max_tool_calls() -> u32 {
-    0
-}
-
 fn default_model_retries() -> u32 {
     3
 }
@@ -293,8 +289,6 @@ impl Default for IngatConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentConfig {
-    #[serde(default = "default_max_tool_calls")]
-    pub max_tool_calls: u32,
     /// Number of retries after the initial model request for transient errors.
     #[serde(default = "default_model_retries")]
     pub model_retries: u32,
@@ -317,7 +311,6 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            max_tool_calls: default_max_tool_calls(),
             model_retries: default_model_retries(),
             model_retry_base_ms: default_model_retry_base_ms(),
             max_context_tokens: default_max_context_tokens(),
@@ -600,7 +593,6 @@ mod tests {
         assert!(cfg.zindeks.watch);
         assert!(cfg.ingat.enabled);
         assert_eq!(cfg.ingat.store_path, None);
-        assert_eq!(cfg.agent.max_tool_calls, 0);
         assert_eq!(cfg.agent.model_retries, 3);
         assert_eq!(cfg.agent.model_retry_base_ms, 500);
         assert_eq!(cfg.agent.max_context_tokens, 0);
@@ -678,7 +670,7 @@ timeout_seconds = 120
         std::fs::create_dir_all(&kode_dir).unwrap();
         std::fs::write(
             kode_dir.join("config.toml"),
-            concat!("[agent]\n", "max_tool_calls = 5\n"),
+            concat!("[agent]\n", "model_retries = 5\n"),
         )
         .unwrap();
 
@@ -688,7 +680,8 @@ timeout_seconds = 120
 
     #[test]
     fn legacy_max_iterations_is_ignored() {
-        let cfg: KodeConfig = toml::from_str("[agent]\nmax_iterations = 1\n").unwrap();
+        let cfg: KodeConfig =
+            toml::from_str("[agent]\nmax_iterations = 1\nmax_tool_calls = 1\n").unwrap();
 
         assert_eq!(cfg.agent, AgentConfig::default());
     }
@@ -834,12 +827,12 @@ effort = "high"
         std::fs::create_dir_all(&kode_dir).unwrap();
         std::fs::write(
             kode_dir.join("config.toml"),
-            "[agent]\nmax_tool_calls = 7\n\n[permissions]\ndefault = \"deny\"\n",
+            "[agent]\nmodel_retries = 7\n\n[permissions]\ndefault = \"deny\"\n",
         )
         .unwrap();
 
         let cfg = KodeConfig::load(&dir).unwrap();
-        assert_eq!(cfg.agent.max_tool_calls, 7);
+        assert_eq!(cfg.agent.model_retries, 7);
         assert_eq!(cfg.permissions.default_mode, PermissionMode::Deny);
     }
 
@@ -928,14 +921,14 @@ effort = "high"
         std::fs::create_dir_all(&kode_dir).unwrap();
         std::fs::write(
             kode_dir.join("config.toml"),
-            "[agent]\nmax_tool_calls = 7\n\n[model]\nprovider = \"codex\"\n",
+            "[agent]\nmodel_retries = 7\n\n[model]\nprovider = \"codex\"\n",
         )
         .unwrap();
 
         KodeConfig::update_model_selection(&dir, Some("gpt-5.6-sol"), None).unwrap();
 
         let cfg = KodeConfig::load(&dir).unwrap();
-        assert_eq!(cfg.agent.max_tool_calls, 7);
+        assert_eq!(cfg.agent.model_retries, 7);
         assert_eq!(cfg.model.provider, "codex");
         assert_eq!(cfg.model.model, "gpt-5.6-sol");
         assert_eq!(cfg.model.effort, "");
@@ -948,7 +941,7 @@ effort = "high"
         std::fs::create_dir_all(&kode_dir).unwrap();
         std::fs::write(
             kode_dir.join("config.toml"),
-            "[agent]\nmax_tool_calls = 7\n\n[mcp.servers.everything]\ncommand = \"npx\"\n",
+            "[agent]\nmodel_retries = 7\n\n[mcp.servers.everything]\ncommand = \"npx\"\n",
         )
         .unwrap();
 
@@ -957,7 +950,7 @@ effort = "high"
         let cfg = KodeConfig::load(&dir).unwrap();
         assert_eq!(cfg.model.provider, "codex");
         assert_eq!(cfg.model.model, "");
-        assert_eq!(cfg.agent.max_tool_calls, 7);
+        assert_eq!(cfg.agent.model_retries, 7);
         assert_eq!(cfg.mcp.servers.get("everything").unwrap().command, "npx");
     }
 

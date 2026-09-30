@@ -3,7 +3,7 @@
 //! Spec: docs/superpowers/specs/2026-08-17-resume-chat-design.md
 
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use kode_core::ImageAttachment;
@@ -26,6 +26,7 @@ pub struct SessionMeta {
     pub id: String,
     pub first_task: String,
     pub turns: usize,
+    pub created: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -42,6 +43,18 @@ fn sessions_dir(cwd: &Path) -> PathBuf {
 
 fn session_path(cwd: &Path, id: &str) -> PathBuf {
     sessions_dir(cwd).join(format!("{id}.jsonl"))
+}
+
+fn read_header(cwd: &Path, id: &str) -> Option<Header> {
+    let mut first = String::new();
+    let file = fs::File::open(session_path(cwd, id)).ok()?;
+    std::io::BufReader::new(file).read_line(&mut first).ok()?;
+    serde_json::from_str(&first).ok()
+}
+
+pub fn model_for(cwd: &Path, id: &str) -> Option<(String, String)> {
+    let header = read_header(cwd, id)?;
+    Some((header.provider, header.model))
 }
 
 /// Current UTC time as (`YYYYMMDD-HHMMSS` id stamp, RFC3339 seconds).
@@ -120,10 +133,14 @@ pub fn list(cwd: &Path, limit: usize) -> Vec<SessionMeta> {
         if let Ok((turns, _)) = load(cwd, &id)
             && !turns.is_empty()
         {
+            let created = read_header(cwd, &id)
+                .map(|header| header.created)
+                .unwrap_or_else(|| id.clone());
             out.push(SessionMeta {
                 first_task: turns[0].task.clone(),
                 turns: turns.len(),
                 id,
+                created,
             });
         }
     }

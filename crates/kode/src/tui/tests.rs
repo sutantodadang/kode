@@ -192,6 +192,78 @@ fn contextual_workbench_renders_major_states_at_60_by_20() {
 }
 
 #[test]
+fn permission_at_60_columns_shows_action_scope_and_choices() {
+    let mut s = state();
+    let (tx, _rx) = oneshot::channel();
+    s.push_permission(PermReq {
+        summary: "write report.md".into(),
+        responder: tx,
+    });
+    let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+    terminal
+        .draw(|frame| draw(frame, &mut s, std::path::Path::new("C:\\work\\school")))
+        .unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(screen.contains("write report.md"), "{screen}");
+    assert!(screen.contains("C:\\work\\school"), "{screen}");
+    assert!(screen.contains("[A]") && screen.contains("[D]"), "{screen}");
+}
+
+#[test]
+fn long_permission_action_keeps_scope_visible_at_60_columns() {
+    let mut s = state();
+    let (tx, _rx) = oneshot::channel();
+    s.push_permission(PermReq {
+        summary: format!("run {} end-marker", "cargo test --workspace ".repeat(5)),
+        responder: tx,
+    });
+    let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+    terminal
+        .draw(|frame| draw(frame, &mut s, std::path::Path::new("C:\\work\\school")))
+        .unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(screen.contains("end-marker"), "{screen}");
+    assert!(screen.contains("this invocation only"), "{screen}");
+    assert!(screen.contains("[A]") && screen.contains("[D]"), "{screen}");
+}
+
+#[test]
+fn narrow_terminal_keeps_prompt_visible_with_run_and_command_hints() {
+    let mut s = state();
+    s.running = true;
+    s.steering_active = true;
+    s.input = "/".to_string();
+    s.status.state = RunState::Tool;
+    s.current_tool = Some("read_file".to_string());
+    let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+    terminal
+        .draw(|frame| draw(frame, &mut s, std::path::Path::new(".")))
+        .unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(text.contains("Enter steer"), "{text}");
+    assert!(text.contains("tool: read_file"), "{text}");
+    assert!(s.transcript_hit.as_ref().unwrap().area.height >= 3);
+}
+
+#[test]
 fn model_token_buffers_short_chunks_until_boundary() {
     let mut s = state();
     apply_event(&mut s, KodeEvent::ModelToken { text: "hel".into() });
@@ -242,6 +314,27 @@ fn steered_model_responses_are_separated_in_saved_response() {
     );
 
     assert_eq!(s.last_response, "first\n\nsecond");
+}
+
+#[test]
+fn completion_does_not_report_unknown_usage_as_zero() {
+    let mut s = state();
+    apply_event(
+        &mut s,
+        KodeEvent::TaskFinished {
+            iterations: 1,
+            tool_calls: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+        },
+    );
+    let receipt = focus_surface_lines(&s)
+        .iter()
+        .map(line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(receipt.contains("? not reported"), "{receipt}");
+    assert!(!receipt.contains("0→0 tokens"), "{receipt}");
 }
 
 #[test]
@@ -457,8 +550,8 @@ fn router_decision_renders_as_note_line() {
         },
     );
     let last = s.transcript.last().expect("a transcript line");
-    assert_eq!(last.gutter, Gutter::Note);
-    assert_eq!(last.text, "router: tier=heavy (laya 0.82)");
+    assert_eq!(last.gutter, Gutter::Route);
+    assert_eq!(last.text, "route tier=heavy  ■■■■■■■■□□ 0.82");
 }
 
 #[test]
@@ -721,14 +814,14 @@ fn spinner_glyph_animates_normally() {
 
 #[test]
 fn spinner_glyph_static_when_reduced_motion() {
-    assert_eq!(spinner_glyph(250, true, false), SPINNER_FRAMES[2]);
-    assert_eq!(spinner_glyph(500, true, false), SPINNER_FRAMES[2]);
+    assert_eq!(spinner_glyph(250, true, false), '◐');
+    assert_eq!(spinner_glyph(500, true, false), '◐');
 }
 
 #[test]
 fn spinner_glyph_static_while_streaming() {
-    assert_eq!(spinner_glyph(250, false, true), SPINNER_FRAMES[2]);
-    assert_eq!(spinner_glyph(500, false, true), SPINNER_FRAMES[2]);
+    assert_eq!(spinner_glyph(250, false, true), '◐');
+    assert_eq!(spinner_glyph(500, false, true), '◐');
 }
 
 #[test]
@@ -811,15 +904,161 @@ async fn handle_key_n_resolves_pending_permission_as_false() {
 }
 
 #[test]
-fn handle_key_q_quits_when_idle_and_input_empty() {
+fn permission_blocks_composer_edits_and_submission_until_decided() {
     let mut s = state();
-    assert!(handle_key(
+    s.input = "keep this draft".to_string();
+    let (tx, _rx) = oneshot::channel();
+    s.push_permission(PermReq {
+        summary: "run tests".into(),
+        responder: tx,
+    });
+    let cwd = std::path::Path::new(".");
+    handle_key(&mut s, cwd, KeyCode::Backspace, KeyModifiers::NONE, &None);
+    handle_key(&mut s, cwd, KeyCode::Enter, KeyModifiers::NONE, &None);
+    assert_eq!(s.input, "keep this draft");
+    assert!(!s.composer_has_content());
+    assert_eq!(s.pending.len(), 1);
+}
+
+#[test]
+fn permission_takes_focus_from_open_picker() {
+    let mut s = state();
+    s.picker.open = true;
+    s.input = "draft".into();
+    let (tx, _rx) = oneshot::channel();
+    s.push_permission(PermReq {
+        summary: "write a file".into(),
+        responder: tx,
+    });
+    assert!(!s.picker.open);
+    assert_eq!(s.input, "draft");
+}
+
+#[test]
+fn permission_blocks_paste_and_ctrl_c_until_decided() {
+    let mut s = state();
+    s.running = true;
+    s.input = "keep this draft".to_string();
+    let (tx, _rx) = oneshot::channel();
+    s.push_permission(PermReq {
+        summary: "run tests".into(),
+        responder: tx,
+    });
+    let cancel = kode_core::CancellationToken::new();
+    append_paste_at(&mut s, std::path::Path::new("."), "pasted");
+    handle_key(
+        &mut s,
+        std::path::Path::new("."),
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL,
+        &Some(cancel.clone()),
+    );
+    assert_eq!(s.input, "keep this draft");
+    assert!(!cancel.is_cancelled());
+    assert_eq!(s.pending.len(), 1);
+}
+
+#[test]
+fn handle_key_q_starts_prompt_without_quitting() {
+    let mut s = state();
+    assert!(!handle_key(
         &mut s,
         std::path::Path::new("."),
         KeyCode::Char('q'),
         KeyModifiers::NONE,
         &None
     ));
+    assert_eq!(s.input, "q");
+}
+
+#[test]
+fn missing_model_requires_picker_before_consuming_task_draft() {
+    let mut s = state_no_model();
+    s.input = "review the diff".into();
+    assert!(requires_model_before_send(&s, std::path::Path::new(".")));
+    assert_eq!(s.input, "review the diff");
+    s.input = "/help".into();
+    assert!(!requires_model_before_send(&s, std::path::Path::new(".")));
+    s.input = "/he".into();
+    assert!(!requires_model_before_send(&s, std::path::Path::new(".")));
+    s.input = "/custom-command".into();
+    assert!(requires_model_before_send(&s, std::path::Path::new(".")));
+}
+
+#[test]
+fn idle_ctrl_c_requires_repeat_without_discarding_draft() {
+    let mut s = state();
+    s.input = "unsent draft".to_string();
+    let cwd = std::path::Path::new(".");
+    assert!(!handle_key(
+        &mut s,
+        cwd,
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL,
+        &None
+    ));
+    assert_eq!(s.input, "unsent draft");
+    assert!(handle_key(
+        &mut s,
+        cwd,
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL,
+        &None
+    ));
+}
+
+#[test]
+fn ctrl_d_deletes_at_cursor_then_requires_repeat_to_exit() {
+    let mut s = state();
+    s.input = "ab".to_string();
+    let cwd = std::path::Path::new(".");
+    handle_key(&mut s, cwd, KeyCode::Home, KeyModifiers::NONE, &None);
+    assert!(!handle_key(
+        &mut s,
+        cwd,
+        KeyCode::Char('d'),
+        KeyModifiers::CONTROL,
+        &None
+    ));
+    assert_eq!(s.input, "b");
+    s.input.clear();
+    assert!(!handle_key(
+        &mut s,
+        cwd,
+        KeyCode::Char('d'),
+        KeyModifiers::CONTROL,
+        &None
+    ));
+    assert!(handle_key(
+        &mut s,
+        cwd,
+        KeyCode::Char('d'),
+        KeyModifiers::CONTROL,
+        &None
+    ));
+}
+
+#[test]
+fn ctrl_p_opens_commands_without_losing_draft() {
+    let mut s = state();
+    s.input = "review this".to_string();
+    handle_key(
+        &mut s,
+        std::path::Path::new("."),
+        KeyCode::Char('p'),
+        KeyModifiers::CONTROL,
+        &None,
+    );
+    assert!(s.picker.open);
+    assert!(s.picker.items.iter().any(|item| item.starts_with("/model")));
+    assert!(
+        s.picker
+            .items
+            .iter()
+            .any(|item| item.starts_with("/effort"))
+    );
+    assert!(s.picker.items.iter().any(|item| item.starts_with("/image")));
+    assert_eq!(s.input, "review this");
 }
 
 #[test]
@@ -834,6 +1073,44 @@ fn handle_key_q_types_when_input_nonempty() {
         &None
     ));
     assert_eq!(s.input, "say q");
+}
+
+#[test]
+fn prompt_edits_in_middle_without_splitting_emoji() {
+    let mut s = state();
+    s.input = "a👩‍💻b".to_string();
+    let cwd = std::path::Path::new(".");
+    handle_key(&mut s, cwd, KeyCode::Left, KeyModifiers::NONE, &None);
+    handle_key(&mut s, cwd, KeyCode::Backspace, KeyModifiers::NONE, &None);
+    handle_key(&mut s, cwd, KeyCode::Char('Z'), KeyModifiers::NONE, &None);
+    assert_eq!(s.input, "aZb");
+}
+
+#[test]
+fn prompt_history_restores_unsent_draft_after_recall() {
+    let mut s = state();
+    s.input = "first task".to_string();
+    s.take_composer_submission();
+    s.input = "unsent draft".to_string();
+    let cwd = std::path::Path::new(".");
+    handle_key(&mut s, cwd, KeyCode::Up, KeyModifiers::NONE, &None);
+    assert_eq!(s.input, "first task");
+    handle_key(&mut s, cwd, KeyCode::Down, KeyModifiers::NONE, &None);
+    assert_eq!(s.input, "unsent draft");
+}
+
+#[test]
+fn typing_followup_keeps_failure_visible_until_submission() {
+    let mut s = state();
+    s.last_error = Some("test failed".to_string());
+    handle_key(
+        &mut s,
+        std::path::Path::new("."),
+        KeyCode::Char('f'),
+        KeyModifiers::NONE,
+        &None,
+    );
+    assert_eq!(s.last_error.as_deref(), Some("test failed"));
 }
 
 #[test]
@@ -1130,7 +1407,7 @@ fn composer_mode_names_the_next_enter_action() {
 }
 
 #[test]
-fn typing_dismisses_completion_and_recovery_receipts() {
+fn receipts_remain_visible_while_composing_and_clear_on_submission() {
     let mut s = state();
     apply_event(
         &mut s,
@@ -1149,7 +1426,7 @@ fn typing_dismisses_completion_and_recovery_receipts() {
         KeyModifiers::NONE,
         &None,
     );
-    assert!(s.completion.is_none());
+    assert!(s.completion.is_some());
 
     apply_event(
         &mut s,
@@ -1165,6 +1442,9 @@ fn typing_dismisses_completion_and_recovery_receipts() {
         KeyModifiers::NONE,
         &None,
     );
+    assert!(s.last_error.is_some());
+    s.start_new_task("next task", false);
+    assert!(s.completion.is_none());
     assert!(s.last_error.is_none());
 }
 
@@ -1248,57 +1528,75 @@ fn knowledge_band_visible_false_when_toggled_closed() {
 
 #[test]
 fn meter_zero_percent() {
-    assert_eq!(meter(0, 16_000, 8), "░░░░░░░░");
+    assert_eq!(meter(0, 16_000, 8), "□□□□□□□□");
 }
 
 #[test]
 fn meter_fifty_percent() {
-    assert_eq!(meter(8_000, 16_000, 8), "▓▓▓▓░░░░");
+    assert_eq!(meter(8_000, 16_000, 8), "■■■■□□□□");
 }
 
 #[test]
 fn meter_hundred_percent() {
-    assert_eq!(meter(16_000, 16_000, 8), "▓▓▓▓▓▓▓▓");
+    assert_eq!(meter(16_000, 16_000, 8), "■■■■■■■■");
 }
 
 #[test]
 fn meter_zero_budget_is_all_empty() {
-    assert_eq!(meter(500, 0, 8), "░░░░░░░░");
+    assert_eq!(meter(500, 0, 8), "□□□□□□□□");
 }
 
 // -- gutter mapping -------------------------------------------------
 
+fn gutter_text(gutter: Gutter, edit: bool, wide: bool) -> String {
+    gutter_spans(gutter, edit, wide)
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
 #[test]
-fn gutter_prefix_matches_glyph_vocabulary() {
-    assert_eq!(gutter_prefix(&Gutter::None).0, "  ");
-    assert_eq!(gutter_prefix(&Gutter::Prose).0, "│ ");
-    assert_eq!(gutter_prefix(&Gutter::Tool).0, "T▸");
-    assert_eq!(gutter_prefix(&Gutter::ToolFail).0, "T▸");
-    assert_eq!(gutter_prefix(&Gutter::Verify).0, "V ");
-    assert_eq!(gutter_prefix(&Gutter::Note).0, "· ");
-    assert_eq!(gutter_prefix(&Gutter::Zindeks).0, "Z ");
-    assert_eq!(gutter_prefix(&Gutter::Ingat).0, "I ");
-    assert_eq!(gutter_prefix(&Gutter::Git).0, "G ");
-    assert_eq!(gutter_prefix(&Gutter::Error).0, "× ");
-    assert_eq!(gutter_prefix(&Gutter::User).0, "U ");
+fn gutter_spans_wide_matches_thread_vocabulary() {
+    assert_eq!(gutter_text(Gutter::None, false, true), "");
+    assert_eq!(gutter_text(Gutter::Prose, false, true), "│ │ │  ");
+    assert_eq!(gutter_text(Gutter::Zindeks, false, true), "●─┼─┼─ ");
+    assert_eq!(gutter_text(Gutter::Ingat, false, true), "│ ●─┼─ ");
+    assert_eq!(gutter_text(Gutter::Git, false, true), "│ │ ●─ ");
+    assert_eq!(gutter_text(Gutter::Route, false, true), "╰─┴─┴▶ ");
+    assert_eq!(gutter_text(Gutter::Tool, true, true), "●═╪═╪═ ");
+    assert_eq!(gutter_text(Gutter::Tool, false, true), "│ │ │  ");
+    assert_eq!(gutter_text(Gutter::Verify, false, true), "┆ ┆ ┆  ");
+    assert_eq!(gutter_text(Gutter::Error, false, true), "│ │ │  ");
+}
+
+#[test]
+fn gutter_spans_narrow_uses_letter_knots() {
+    assert_eq!(gutter_text(Gutter::Zindeks, false, false), "g● ");
+    assert_eq!(gutter_text(Gutter::Ingat, false, false), "m● ");
+    assert_eq!(gutter_text(Gutter::Git, false, false), "t● ");
+    assert_eq!(gutter_text(Gutter::Route, false, false), "▶  ");
+    assert_eq!(gutter_text(Gutter::Tool, true, false), "●═ ");
+    assert_eq!(gutter_text(Gutter::Prose, false, false), "   ");
 }
 
 #[test]
 fn user_turn_is_bold_while_agent_prose_is_not() {
-    let user = transcript_line_to_ratatui(&TranscriptLine::new(Gutter::User, "fix the bug"));
-    let agent = transcript_line_to_ratatui(&TranscriptLine::new(Gutter::Prose, "fixed"));
+    let user = transcript_line_to_ratatui(&TranscriptLine::new(Gutter::User, "fix the bug"), 100);
+    let agent = transcript_line_to_ratatui(&TranscriptLine::new(Gutter::Prose, "fixed"), 100);
 
+    assert_eq!(line_text(&user), "YOU  fix the bug");
     assert!(user.spans[0].style.add_modifier.contains(Modifier::BOLD));
-    assert!(user.spans[1].style.add_modifier.contains(Modifier::BOLD));
+    assert!(user.spans[2].style.add_modifier.contains(Modifier::BOLD));
     assert!(!agent.spans[0].style.add_modifier.contains(Modifier::BOLD));
     assert!(!agent.spans[1].style.add_modifier.contains(Modifier::BOLD));
 }
 
 #[test]
-fn gutter_prefix_zindeks_ingat_git_use_distinct_colors() {
-    assert_eq!(gutter_prefix(&Gutter::Zindeks).1, theme::Z);
-    assert_eq!(gutter_prefix(&Gutter::Ingat).1, theme::I);
-    assert_eq!(gutter_prefix(&Gutter::Git).1, theme::DIM);
+fn gutter_zindeks_ingat_git_use_distinct_colors() {
+    let color = |g| gutter_spans(g, false, true).last().unwrap().style.fg;
+    assert_eq!(color(Gutter::Zindeks), Some(theme::Z));
+    assert_eq!(color(Gutter::Ingat), Some(theme::I));
+    assert_eq!(color(Gutter::Git), Some(theme::G));
 }
 
 // -- slash commands -----------------------------------------------
@@ -1463,11 +1761,11 @@ fn provider_auth_state_opencode_family_matches_key() {
     );
     assert_eq!(
         provider_auth_state("opencode", false, &keys, false, false, false),
-        ""
+        " · login required"
     );
     assert_eq!(
         provider_auth_state("kilo", false, &keys, false, false, false),
-        ""
+        " · login required"
     );
 }
 
@@ -1598,10 +1896,10 @@ fn picker_enter_selection_picks_highlighted_row_when_present() {
 }
 
 #[test]
-fn picker_enter_selection_uses_typed_text_when_no_match() {
+fn picker_enter_selection_rejects_unmatched_text() {
     let filtered: Vec<String> = vec![];
     let selected = picker_enter_selection(&filtered, "custom-model", 0);
-    assert_eq!(selected, Some("custom-model".to_string()));
+    assert_eq!(selected, None);
 }
 
 #[test]
@@ -1618,6 +1916,18 @@ fn handle_picker_key_typing_updates_filter_and_resets_selection() {
     handle_picker_key(&mut s, KeyCode::Char('x'));
     assert_eq!(s.picker.filter, "x");
     assert_eq!(s.picker.selected, 0);
+}
+
+#[test]
+fn pasted_picker_filter_selects_matching_command() {
+    let mut s = state();
+    open_command_picker(&mut s, std::path::Path::new("."));
+    append_picker_filter(&mut s, "exit");
+    assert_eq!(s.picker.filter, "exit");
+    assert_eq!(
+        handle_picker_key(&mut s, KeyCode::Enter),
+        PickerOutcome::Select("/exit  · exit Kode".into())
+    );
 }
 
 #[test]
@@ -1648,12 +1958,12 @@ fn handle_picker_key_esc_cancels() {
 }
 
 #[test]
-fn handle_picker_key_enter_selects_typed_text_when_no_match() {
+fn handle_picker_key_enter_keeps_unmatched_filter_open() {
     let mut s = state();
     s.picker.filter = "typed-model".to_string();
     assert_eq!(
         handle_picker_key(&mut s, KeyCode::Enter),
-        PickerOutcome::Select("typed-model".to_string())
+        PickerOutcome::Continue
     );
 }
 
@@ -1666,6 +1976,26 @@ fn handle_picker_key_enter_selects_highlighted_row() {
         handle_picker_key(&mut s, KeyCode::Enter),
         PickerOutcome::Select("gpt-5.6-codex".to_string())
     );
+}
+
+#[test]
+fn picker_scrolls_to_keep_selected_model_visible() {
+    let picker = PickerState {
+        open: true,
+        items: (0..20).map(|i| format!("model-{i:02}")).collect(),
+        selected: 15,
+        ..Default::default()
+    };
+    let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+    terminal.draw(|frame| draw_picker(frame, &picker)).unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(text.contains("model-15"));
 }
 
 // -- handle_slash_command: persistence side effects -------------------
@@ -1805,10 +2135,12 @@ fn handle_slash_command_provider_invalid_pushes_error_without_persisting() {
 }
 
 #[tokio::test]
-async fn handle_slash_command_provider_valid_persists_clears_model_and_opens_picker() {
+async fn selecting_provider_waits_for_model_before_changing_config() {
     let dir = temp_project_dir();
     let mut s = state();
     let mut cfg = KodeConfig::default();
+    cfg.model.provider = "openai".to_string();
+    cfg.model.model = "gpt-test".to_string();
     let (tx, _rx) = mpsc::unbounded_channel();
 
     handle_slash_command(
@@ -1819,30 +2151,57 @@ async fn handle_slash_command_provider_valid_persists_clears_model_and_opens_pic
         SlashCommand::Provider(Some("codex".to_string())),
     );
 
-    assert_eq!(s.status.provider, "codex");
-    assert_eq!(cfg.model.provider, "codex");
-    assert_eq!(s.status.model, "");
-    assert_eq!(cfg.model.model, "");
+    assert_eq!(s.status.provider, "openai");
+    assert_eq!(cfg.model.provider, "openai");
+    assert_eq!(s.status.model, "gpt-test");
+    assert_eq!(cfg.model.model, "gpt-test");
     assert!(s.picker.open);
     assert_eq!(s.picker.kind, PickerKind::Model);
+    assert!(!KodeConfig::config_path(&dir).exists());
+}
 
-    let reloaded = KodeConfig::load(&dir).unwrap();
-    assert_eq!(reloaded.model.provider, "codex");
-    assert_eq!(reloaded.model.model, "");
+#[tokio::test]
+async fn selecting_model_commits_provider_and_model_together() {
+    let dir = temp_project_dir();
+    let mut s = state();
+    let mut cfg = KodeConfig::default();
+    cfg.model.provider = "openai".to_string();
+    cfg.model.model = "gpt-test".to_string();
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    apply_provider_selection(&mut s, &tx, "codex");
+    handle_slash_command(
+        &mut s,
+        &dir,
+        &mut cfg,
+        &tx,
+        SlashCommand::Model(Some("gpt-6-sol".to_string())),
+    );
+
+    assert_eq!(s.status.provider, "codex");
+    assert_eq!(s.status.model, "gpt-6-sol");
+    assert_eq!(cfg.model.provider, "codex");
+    assert_eq!(cfg.model.model, "gpt-6-sol");
+    let saved = KodeConfig::load(&dir).unwrap();
+    assert_eq!(saved.model.provider, "codex");
+    assert_eq!(saved.model.model, "gpt-6-sol");
+    assert!(
+        s.transcript
+            .iter()
+            .any(|line| line.text.contains("not catalog-validated"))
+    );
 }
 
 // -- verify step events ------------------------------------------------
 
 #[tokio::test]
 async fn reselecting_provider_refetches_and_ignores_previous_catalog() {
-    let dir = temp_project_dir();
     let mut s = state();
-    let mut cfg = KodeConfig::default();
     let (tx, _rx) = mpsc::unbounded_channel();
-    apply_provider_selection(&mut s, &dir, &mut cfg, &tx, "codex");
+    apply_provider_selection(&mut s, &tx, "codex");
     let previous = s.picker.request_id;
     s.picker.items = vec!["old model".into()];
-    apply_provider_selection(&mut s, &dir, &mut cfg, &tx, "codex");
+    apply_provider_selection(&mut s, &tx, "codex");
     let current = s.picker.request_id;
     assert_ne!(previous, current);
     assert!(s.picker.items.is_empty());
@@ -1903,7 +2262,7 @@ fn verify_step_passed_pushes_verify_gutter_with_check() {
     );
     assert_eq!(s.transcript.len(), 1);
     assert_eq!(s.transcript[0].gutter, Gutter::Verify);
-    assert_eq!(s.transcript[0].text, "cargo test · 1.5s ✓");
+    assert_eq!(s.transcript[0].text, "cargo test · 1.5s");
     assert_eq!(
         s.ledger.verify_steps,
         vec![("cargo test".to_string(), StepStatusLite::Passed)]
@@ -1923,7 +2282,7 @@ fn verify_step_failed_pushes_verifyfail_gutter_with_cross() {
         },
     );
     assert_eq!(s.transcript[0].gutter, Gutter::VerifyFail);
-    assert_eq!(s.transcript[0].text, "cargo clippy · 0.3s ×");
+    assert_eq!(s.transcript[0].text, "cargo clippy · 0.3s");
     assert_eq!(
         s.ledger.verify_steps,
         vec![("cargo clippy".to_string(), StepStatusLite::Failed)]
@@ -1943,7 +2302,7 @@ fn verify_step_skipped_pushes_verifyskip_gutter_with_dash() {
         },
     );
     assert_eq!(s.transcript[0].gutter, Gutter::VerifySkip);
-    assert_eq!(s.transcript[0].text, "cargo fmt · 0.0s – (skipped)");
+    assert_eq!(s.transcript[0].text, "cargo fmt · 0.0s");
     assert_eq!(
         s.ledger.verify_steps,
         vec![("cargo fmt".to_string(), StepStatusLite::Skipped)]
@@ -2217,9 +2576,14 @@ fn sourced_note_pushes_matching_gutter() {
             source: NoteSource::Ingat,
         },
     );
+    assert!(s.transcript[1].born.is_some() && s.transcript[2].born.is_some());
+    for line in &mut s.transcript {
+        line.born = None;
+    }
     assert_eq!(
         s.transcript,
         vec![
+            TranscriptLine::new(Gutter::ThreadHead, ""),
             TranscriptLine::new(Gutter::Zindeks, "zindeks index refreshed"),
             TranscriptLine::new(Gutter::Ingat, "engineering memory unavailable"),
         ]
@@ -2350,6 +2714,7 @@ fn knowledge_event_git_only_has_truthful_context_receipt() {
 fn model_token_after_knowledge_keeps_context_receipt_visible() {
     let mut s = state();
     s.running = true;
+    s.knowledge_band_open = true;
     apply_event(
         &mut s,
         KodeEvent::Knowledge {
@@ -2390,29 +2755,22 @@ fn tool_started_after_knowledge_prioritizes_tool_surface() {
         },
     );
     assert_eq!(s.current_tool.as_deref(), Some("read_file"));
-    assert!(
-        focus_surface_lines(&s)
-            .iter()
-            .any(|line| line_text(line).contains("TOOL"))
-    );
+    assert!(focus_surface_lines(&s).is_empty());
+    assert!(line_text(&now_line(&s, 80)).contains("tool: read_file"));
 }
 
 #[test]
-fn armed_interrupt_becomes_the_primary_running_action() {
+fn running_tool_surface_advertises_immediate_cancel() {
     let mut s = state();
     s.running = true;
     s.status.state = RunState::Tool;
     s.current_tool = Some("run_command · cargo test".to_string());
     s.tool_started = Some(Instant::now());
-    s.interrupt_armed_at = Some(Instant::now());
 
-    let lines = focus_surface_lines(&s);
-    let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+    let text = line_text(&now_line(&s, 80));
 
-    assert!(text.contains("INTERRUPT ARMED"));
-    assert!(text.contains("Esc again"));
-    assert!(text.contains("any other key keeps running"));
-    assert!(!text.contains("Esc twice to interrupt"));
+    assert!(text.contains("Esc cancel"));
+    assert!(!text.contains("Esc twice"));
 }
 
 #[test]
@@ -2436,11 +2794,12 @@ fn start_new_task_collapses_expanded_evidence() {
 // -- low-frequency motion contract ---------------------------------------
 
 #[test]
-fn spinner_holds_frame_below_one_second() {
-    assert_eq!(
-        spinner_glyph(0, false, false),
-        spinner_glyph(500, false, false)
-    );
+fn spinner_advances_every_quarter_second() {
+    assert_eq!(spinner_glyph(0, false, false), '◐');
+    assert_eq!(spinner_glyph(249, false, false), '◐');
+    assert_eq!(spinner_glyph(250, false, false), '◓');
+    assert_eq!(spinner_glyph(750, false, false), '◒');
+    assert_eq!(spinner_glyph(1000, false, false), '◐');
 }
 
 #[test]
@@ -2466,10 +2825,16 @@ fn run_map_pulse_changes_each_second_unless_reduced_motion() {
 // -- gutter mapping (extended) --------------------------------------------
 
 #[test]
-fn gutter_prefix_verify_variants_share_glyph_distinct_colors() {
-    assert_eq!(gutter_prefix(&Gutter::Verify), ("V ", theme::OK));
-    assert_eq!(gutter_prefix(&Gutter::VerifyFail), ("V ", theme::ERR));
-    assert_eq!(gutter_prefix(&Gutter::VerifySkip), ("V ", theme::DIM));
+fn verify_gutter_variants_share_threads_and_differ_by_result_glyph() {
+    let render = |g| {
+        line_text(&transcript_line_to_ratatui(
+            &TranscriptLine::new(g, "fmt · 0.4s"),
+            100,
+        ))
+    };
+    assert_eq!(render(Gutter::Verify), "┆ ┆ ┆  fmt · 0.4s ✓");
+    assert_eq!(render(Gutter::VerifyFail), "┆ ┆ ┆  fmt · 0.4s ✗");
+    assert_eq!(render(Gutter::VerifySkip), "┆ ┆ ┆  fmt · 0.4s ⊘ skipped");
 }
 
 #[test]
@@ -2555,13 +2920,23 @@ fn input_suffix_counts_when_knowledge_present() {
 
 #[test]
 fn multiline_input_height_grows_and_caps() {
-    assert_eq!(input_height(""), 4);
-    assert_eq!(input_height("one\ntwo"), 5);
-    assert_eq!(input_height("1\n2\n3\n4\n5\n6\n7"), 9);
-
     let mut s = state();
+    assert_eq!(composer_height(&s), 3);
+    s.input = "one\ntwo".to_string();
+    assert_eq!(composer_height(&s), 4);
+    s.input = "1\n2\n3\n4\n5\n6\n7".to_string();
+    assert_eq!(composer_height(&s), 8);
+    s.input.clear();
     s.add_paste("1\n2\n3\n4\n5\n6\n7\n8");
-    assert_eq!(composer_height(&s), 5);
+    assert_eq!(composer_height(&s), 4);
+}
+
+#[test]
+fn composer_reserves_rows_for_wrapped_wide_text() {
+    let mut s = state();
+    s.input_columns = 4;
+    s.input = "ab界cd".to_string();
+    assert_eq!(composer_height(&s), 4);
 }
 
 // -- breadcrumb model nudge -------------------------------------------
@@ -2573,7 +2948,7 @@ fn line_text(line: &Line) -> String {
 #[test]
 fn breadcrumb_line_nudges_when_model_unset() {
     let s = state_no_model();
-    assert!(line_text(&breadcrumb_line(&s)).contains("BUILD · pick model"));
+    assert!(line_text(&breadcrumb_line(&s)).contains("pick model"));
 }
 
 #[test]
@@ -2622,7 +2997,7 @@ fn breadcrumb_line_shows_auto_badge_only_when_on() {
     let mut s = state();
     assert!(!line_text(&breadcrumb_line(&s)).contains("AUTO"));
     s.auto_mode = true;
-    assert!(line_text(&breadcrumb_line(&s)).contains("AUTO ·"));
+    assert!(line_text(&breadcrumb_line(&s)).contains("AUTO"));
 }
 
 #[test]
@@ -2630,7 +3005,16 @@ fn breadcrumb_line_shows_plan_badge_only_when_on() {
     let mut s = state();
     assert!(!line_text(&breadcrumb_line(&s)).contains("PLAN"));
     s.plan_mode = true;
-    assert!(line_text(&breadcrumb_line(&s)).contains("PLAN ·"));
+    assert!(line_text(&breadcrumb_line(&s)).contains("PLAN"));
+}
+
+#[test]
+fn scope_keeps_plan_and_auto_authority_visible_together_at_60_columns() {
+    let mut s = state();
+    s.plan_mode = true;
+    s.auto_mode = true;
+    let text = line_text(&scope_line(&s, 60));
+    assert!(text.contains("PLAN") && text.contains("AUTO"), "{text}");
 }
 
 #[tokio::test]
@@ -2752,6 +3136,24 @@ fn handle_slash_command_resume_with_no_sessions_notes() {
 }
 
 #[test]
+fn resume_waits_for_active_run_to_finish() {
+    let dir = temp_project_dir();
+    let mut s = state();
+    s.running = true;
+    let mut cfg = KodeConfig::default();
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    handle_slash_command(&mut s, &dir, &mut cfg, &tx, SlashCommand::Resume);
+
+    assert!(!s.picker.open);
+    assert!(
+        s.transcript
+            .iter()
+            .any(|line| line.text.contains("finish the current run"))
+    );
+}
+
+#[test]
 fn handle_slash_command_resume_with_sessions_opens_picker() {
     let dir = temp_project_dir();
     let id = crate::session::create(&dir, "codex", "gpt-test").unwrap();
@@ -2855,6 +3257,39 @@ fn handle_slash_command_builtin_name_never_shadowed_by_custom_file() {
 
     assert_eq!(submitted, None);
     assert!(s.transcript.iter().any(|l| l.text.contains("/model")));
+}
+
+#[test]
+fn status_command_reports_active_model_and_authority() {
+    let dir = temp_project_dir();
+    let mut s = state();
+    s.plan_mode = true;
+    s.auto_mode = true;
+    let mut cfg = KodeConfig::default();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let cmd = parse_slash_command("/status").unwrap();
+    handle_slash_command(&mut s, &dir, &mut cfg, &tx, cmd);
+    assert!(
+        s.transcript
+            .iter()
+            .any(|line| line.text.contains("gpt-test"))
+    );
+    assert!(
+        s.transcript
+            .iter()
+            .any(|line| line.text.contains("PLAN · AUTO"))
+    );
+}
+
+#[test]
+fn exit_is_an_explicit_discoverable_builtin() {
+    assert!(BUILTIN_COMMAND_NAMES.contains(&"exit"));
+    assert!(SLASH_COMMANDS.iter().any(|(name, _)| *name == "/exit"));
+    let command = parse_slash_command("/exit").unwrap();
+    assert!(!matches!(
+        command,
+        SlashCommand::Custom { .. } | SlashCommand::Unknown(_)
+    ));
 }
 
 // -- last_response tracking -----------------------------------------------
@@ -3019,6 +3454,9 @@ fn restore_session_replays_transcript_and_history() {
     .unwrap();
 
     let mut s = state();
+    s.input = "unsent draft".to_string();
+    s.last_error = Some("old failure".to_string());
+    s.prompt_history.push("other session task".to_string());
     let ok = restore_session(&mut s, &dir, &id);
     assert!(ok);
 
@@ -3036,6 +3474,11 @@ fn restore_session_replays_transcript_and_history() {
     assert_eq!(s.history.len(), 2);
     assert_eq!(s.session_id.as_deref(), Some(id.as_str()));
     assert_eq!(s.last_response, "second answer");
+    assert_eq!(s.status.provider, "codex");
+    assert_eq!(s.status.model, "gpt-test");
+    assert!(s.last_error.is_none());
+    assert_eq!(s.input, "unsent draft");
+    assert_eq!(s.prompt_history, ["first task", "second task"]);
 }
 
 #[test]
@@ -3508,24 +3951,39 @@ fn handle_key_esc_clears_input_when_hint_visible() {
 }
 
 #[test]
-fn running_esc_requires_second_press_to_cancel() {
+fn running_esc_cancels_immediately_and_keeps_draft() {
     let dir = temp_project_dir();
     let mut s = state();
     s.running = true;
+    s.input = "next task".into();
     let cancel = kode_core::CancellationToken::new();
     let current = Some(cancel.clone());
 
     handle_key(&mut s, &dir, KeyCode::Esc, KeyModifiers::NONE, &current);
-    assert!(s.interrupt_confirmation_active());
-    assert!(!cancel.is_cancelled());
-
-    handle_key(&mut s, &dir, KeyCode::Esc, KeyModifiers::NONE, &current);
     assert!(cancel.is_cancelled());
-    assert!(!s.interrupt_confirmation_active());
+    assert_eq!(s.input, "next task");
+}
+
+#[test]
+fn esc_closes_run_map_before_cancelling_run() {
+    let dir = temp_project_dir();
+    let mut s = state();
+    s.running = true;
+    s.ledger_open = true;
+    let cancel = kode_core::CancellationToken::new();
+    handle_key(
+        &mut s,
+        &dir,
+        KeyCode::Esc,
+        KeyModifiers::NONE,
+        &Some(cancel.clone()),
+    );
+    assert!(!s.ledger_open);
+    assert!(!cancel.is_cancelled());
 }
 
 #[tokio::test]
-async fn running_double_esc_cancels_active_command_end_to_end() {
+async fn running_single_esc_cancels_active_command_end_to_end() {
     let dir = temp_project_dir();
     let cancel = kode_core::CancellationToken::new();
     let tool_ctx = kode_tools::ToolContext {
@@ -3553,7 +4011,6 @@ async fn running_double_esc_cancels_active_command_end_to_end() {
         s.running = true;
         let current = Some(cancel.clone());
         handle_key(&mut s, &dir, KeyCode::Esc, KeyModifiers::NONE, &current);
-        handle_key(&mut s, &dir, KeyCode::Esc, KeyModifiers::NONE, &current);
     };
 
     let (result, ()) = tokio::join!(run, cancel_from_ui);
@@ -3562,31 +4019,6 @@ async fn running_double_esc_cancels_active_command_end_to_end() {
         result.unwrap_err(),
         kode_tools::ToolError::Cancelled
     ));
-}
-
-#[test]
-fn expired_or_abandoned_interrupt_confirmation_does_not_cancel() {
-    let dir = temp_project_dir();
-    let mut s = state();
-    s.running = true;
-    let cancel = kode_core::CancellationToken::new();
-    let current = Some(cancel.clone());
-
-    s.interrupt_armed_at =
-        Some(Instant::now() - INTERRUPT_CONFIRM_WINDOW - Duration::from_millis(1));
-    handle_key(&mut s, &dir, KeyCode::Esc, KeyModifiers::NONE, &current);
-    assert!(s.interrupt_confirmation_active());
-    assert!(!cancel.is_cancelled());
-
-    handle_key(
-        &mut s,
-        &dir,
-        KeyCode::Char('x'),
-        KeyModifiers::NONE,
-        &current,
-    );
-    assert!(!s.interrupt_confirmation_active());
-    assert!(!cancel.is_cancelled());
 }
 
 #[test]
@@ -3676,4 +4108,288 @@ fn mixed_attachments_preserve_chronology_and_backspace_removes_latest() {
     assert!(s.image_attachments.is_empty());
 
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+// -- Kode Benang static layout ---------------------------------------
+
+fn render_rows(state: &mut AppState, width: u16, height: u16) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal
+        .draw(|frame| draw(frame, state, std::path::Path::new(".")))
+        .unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn working_state() -> AppState {
+    let mut s = state();
+    // Static frame: motion tests live in the Kode Benang motion section.
+    s.reduced_motion = true;
+    s.running = true;
+    s.run_started = Some(Instant::now());
+    s.tool_started = Some(Instant::now());
+    s.status.state = RunState::Tool;
+    s.current_tool = Some("read_file".to_string());
+    for i in 0..3 {
+        s.transcript
+            .push(TranscriptLine::new(Gutter::Prose, format!("prose {i}")));
+    }
+    apply_event(
+        &mut s,
+        KodeEvent::SourcedNote {
+            text: "zindeks index refreshed".into(),
+            source: NoteSource::Zindeks,
+        },
+    );
+    s
+}
+
+#[test]
+fn working_frame_at_80x24_shows_rail_thread_and_now_line() {
+    let mut s = working_state();
+    let text = render_rows(&mut s, 80, 24);
+    assert!(text.contains("UNDERSTAND"), "{text}");
+    assert!(text.contains("VERIFY"), "{text}");
+    assert!(text.contains("●─┼─┼─"), "{text}");
+    assert!(text.contains("tool: "), "{text}");
+}
+
+#[test]
+fn working_frame_at_60x20_keeps_prompt_now_line_and_narrow_gutter() {
+    let mut s = working_state();
+    let text = render_rows(&mut s, 60, 20);
+    assert!(text.contains(" › "), "{text}");
+    assert!(text.contains("tool: "), "{text}");
+    assert!(text.contains("g●"), "{text}");
+    assert!(!text.contains("●─┼─┼─"), "{text}");
+    assert!(s.transcript_hit.as_ref().unwrap().area.height >= 3);
+}
+
+#[test]
+fn scope_row_shows_plan_and_auto_together() {
+    let mut s = state();
+    s.plan_mode = true;
+    s.auto_mode = true;
+    let text = line_text(&scope_line(&s, 80));
+    assert!(text.contains("PLAN") && text.contains("AUTO"), "{text}");
+    assert!(!text.contains("BUILD"), "{text}");
+}
+
+#[test]
+fn scope_row_shows_ctx_dash_before_knowledge() {
+    let s = state();
+    assert!(line_text(&scope_line(&s, 80)).contains("ctx —"));
+}
+
+#[test]
+fn receipt_zero_tokens_and_skipped_check_are_honest() {
+    let mut s = state();
+    apply_event(
+        &mut s,
+        KodeEvent::VerifyStep {
+            name: "cargo fmt".into(),
+            passed: false,
+            skipped: true,
+            duration_ms: 0,
+        },
+    );
+    apply_event(
+        &mut s,
+        KodeEvent::TaskFinished {
+            iterations: 1,
+            tool_calls: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+        },
+    );
+    let text = focus_surface_lines(&s)
+        .iter()
+        .map(line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("? not reported"), "{text}");
+    assert!(text.contains("⊘"), "{text}");
+    assert!(!text.contains("✓"), "{text}");
+}
+
+#[test]
+fn now_line_distinguishes_writing_from_thinking() {
+    let mut s = state();
+    s.running = true;
+    s.run_started = Some(Instant::now());
+    s.status.state = RunState::Thinking;
+    assert!(line_text(&now_line(&s, 80)).contains("model thinking"));
+    s.current_stream = "partial".to_string();
+    let text = line_text(&now_line(&s, 80));
+    assert!(text.contains("model writing"), "{text}");
+    assert!(!text.contains("model thinking"), "{text}");
+}
+
+// -- Kode Benang motion ------------------------------------------------
+
+fn motion_text(line: &TranscriptLine, width: u16, now: Instant, rm: bool) -> String {
+    line_text(&transcript_line_at(line, width, now, rm, false))
+}
+
+#[test]
+fn motion_helpers_start_mid_final_and_reduced() {
+    assert_eq!(thread_pull_frame(0, false), 0);
+    assert_eq!(thread_pull_frame(50, false), 1);
+    assert_eq!(thread_pull_frame(100, false), 2);
+    assert_eq!(thread_pull_frame(500, false), 3);
+    assert_eq!(thread_pull_frame(0, true), 3);
+
+    assert_eq!(converge_cells(0, false), 0);
+    assert_eq!(converge_cells(100, false), 3);
+    assert_eq!(converge_cells(200, false), 6);
+    assert_eq!(converge_cells(0, true), 6);
+
+    assert_eq!(bar_fill_cells(0, 7, false), 0);
+    assert_eq!(bar_fill_cells(199, 7, false), 0);
+    assert_eq!(bar_fill_cells(200, 7, false), 1);
+    assert_eq!(bar_fill_cells(260, 7, false), 3);
+    assert_eq!(bar_fill_cells(5000, 7, false), 7);
+    assert_eq!(bar_fill_cells(0, 7, true), 7);
+
+    assert_eq!(rail_fill_cells(0, false), 1);
+    assert_eq!(rail_fill_cells(89, false), 1);
+    assert_eq!(rail_fill_cells(90, false), 2);
+    assert_eq!(rail_fill_cells(0, true), 2);
+
+    assert_eq!(pulse_level(0, 10), 0);
+    assert_eq!(pulse_level(5, 0), 0);
+    assert_eq!(pulse_level(1, 100), 1);
+    assert_eq!(pulse_level(5, 10), 3);
+    assert_eq!(pulse_level(10, 10), 6);
+
+    let now = Instant::now();
+    assert!(line_animating(Some(now), now, false));
+    assert!(!line_animating(Some(now), now, true));
+    assert!(!line_animating(None, now, false));
+    assert!(!line_animating(
+        Some(now),
+        now + Duration::from_millis(700),
+        false
+    ));
+}
+
+#[test]
+fn thread_pull_hides_fact_text_until_final_frame() {
+    let now = Instant::now();
+    let mut line = TranscriptLine::new(Gutter::Zindeks, "index refreshed");
+    line.born = Some(now);
+    let early = motion_text(&line, 100, now, false);
+    assert!(early.contains('●'), "{early}");
+    assert!(!early.contains("index refreshed"), "{early}");
+
+    let late = motion_text(&line, 100, now + Duration::from_secs(1), false);
+    assert!(late.contains("index refreshed"), "{late}");
+    assert!(late.contains("graph"), "{late}");
+
+    let reduced = motion_text(&line, 100, now, true);
+    assert!(reduced.contains("index refreshed"), "{reduced}");
+}
+
+fn laya_answers(confidence: f32) -> Vec<kode_core::event::RouteAnswer> {
+    vec![kode_core::event::RouteAnswer {
+        key: "tier".into(),
+        value: "fast".into(),
+        source: kode_core::event::RouteSource::Laya,
+        confidence: Some(confidence),
+    }]
+}
+
+#[test]
+fn route_bar_fills_and_reveals_score_at_the_end() {
+    let now = Instant::now();
+    let mut line = TranscriptLine::new(Gutter::Route, route_line_text(&laya_answers(0.71)));
+    line.born = Some(now);
+    let done = motion_text(&line, 100, now + Duration::from_secs(1), false);
+    assert_eq!(done.matches('■').count(), 7, "{done}");
+    assert_eq!(done.matches('□').count(), 3, "{done}");
+    assert!(done.contains("0.71"), "{done}");
+    let early = motion_text(&line, 100, now, false);
+    assert!(!early.contains("0.71"), "{early}");
+    assert_eq!(early.matches('■').count(), 0, "{early}");
+}
+
+#[test]
+fn route_line_text_marks_low_confidence() {
+    assert!(route_line_text(&laya_answers(0.41)).ends_with(" low"));
+    assert!(!route_line_text(&laya_answers(0.71)).ends_with(" low"));
+}
+
+#[test]
+fn sample_pulse_records_wait_tool_tokens_once_per_second() {
+    let mut s = state();
+    let t0 = Instant::now();
+    s.sample_pulse(t0);
+    assert!(s.pulse.is_empty(), "not running");
+    s.running = true;
+    s.pulse_tokens = 4;
+    s.sample_pulse(t0);
+    assert_eq!(s.pulse.back(), Some(&PulseCell::Tokens(4)));
+    assert_eq!(s.pulse_tokens, 0);
+    s.sample_pulse(t0 + Duration::from_millis(500));
+    assert_eq!(s.pulse.len(), 1);
+    s.status.state = RunState::Tool;
+    s.sample_pulse(t0 + Duration::from_millis(1100));
+    assert_eq!(s.pulse.back(), Some(&PulseCell::Tool));
+    let (tx, _rx) = oneshot::channel();
+    s.push_permission(PermReq {
+        summary: "run".into(),
+        responder: tx,
+    });
+    s.sample_pulse(t0 + Duration::from_millis(2200));
+    assert_eq!(s.pulse.back(), Some(&PulseCell::Wait));
+}
+
+#[test]
+fn trace_back_state_follows_verification_and_resets() {
+    let mut s = state();
+    let epoch = s.style_epoch;
+    apply_event(&mut s, KodeEvent::VerificationFinished { ok: true });
+    assert!(matches!(s.trace_back, Some(Some(_))));
+    assert!(s.style_epoch > epoch);
+    apply_event(&mut s, KodeEvent::VerificationFinished { ok: false });
+    assert_eq!(s.trace_back, Some(None));
+    let epoch = s.style_epoch;
+    s.start_new_task("next", false);
+    assert_eq!(s.trace_back, None);
+    assert!(s.style_epoch > epoch);
+
+    let mut rm = state();
+    rm.reduced_motion = true;
+    apply_event(&mut rm, KodeEvent::VerificationFinished { ok: true });
+    assert_eq!(rm.trace_back, None);
+    apply_event(&mut rm, KodeEvent::VerificationFinished { ok: false });
+    assert_eq!(rm.trace_back, Some(None));
+}
+
+#[test]
+fn transcript_cache_settles_after_animation_window() {
+    let now = Instant::now();
+    let mut line = TranscriptLine::new(Gutter::Zindeks, "index refreshed");
+    line.born = Some(now);
+    let transcript = vec![line];
+    let ctx = |at| MotionCtx {
+        now: at,
+        reduced_motion: false,
+        epoch: 0,
+        trace_from: None,
+    };
+    let mut cache = TranscriptCache::default();
+    let render = |cache: &TranscriptCache| line_text(cache.probe(0).unwrap().0);
+    cache.update(&transcript, 100, ctx(now));
+    assert!(!render(&cache).contains("index refreshed"));
+    cache.update(&transcript, 100, ctx(now + Duration::from_secs(1)));
+    assert!(render(&cache).contains("index refreshed"));
+    assert!(cache.probe(0).unwrap().1);
 }
