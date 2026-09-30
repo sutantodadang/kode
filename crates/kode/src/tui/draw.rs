@@ -51,8 +51,7 @@ pub fn knowledge_band_visible(state: &AppState) -> bool {
 
 /// True when the transcript area should render the idle empty-state block
 /// (version/tagline, engine status, input nudge) instead of the normal
-/// transcript. Per `DESIGN.md`, this is the calm-instrument first-run
-/// surface — it stays true while nothing but startup `Note` hints (model
+/// transcript. This is the idle screen — it stays true while nothing but startup `Note` hints (model
 /// unset, provider suggestion) have landed, and goes away for good once
 /// any real activity (user input, prose, tool, verify, error) appears.
 /// Never true while a task is running.
@@ -153,8 +152,8 @@ pub(crate) fn engine_status_spans(
 
 /// Builds the idle empty-state block on the thread gutter: column heads,
 /// one knot row per engine (graph, memory, git), then the input nudge.
-/// Top-left anchored, one blank row down — never vertically centered, per
-/// `DESIGN.md`'s calm-instrument direction. `width` picks the wide (7-cell)
+/// Top-left anchored, one blank row down — never vertically centered.
+/// `width` picks the wide (7-cell)
 /// or narrow (3-cell) gutter.
 pub(crate) fn empty_state_lines(state: &AppState, width: u16) -> Vec<Line<'static>> {
     let wide = is_wide(width);
@@ -229,8 +228,8 @@ fn compact_tokens(tokens: usize) -> String {
     }
 }
 
-/// The single heartbeat advances every 250 ms (4 frames per second-long
-/// turn of the glyph); it is the only animated cell on screen.
+/// The running glyph advances every 250 ms (4 frames per turn); every
+/// running glyph shares this one phase.
 pub(crate) fn spinner_frame(elapsed_ms: u128) -> char {
     let idx = ((elapsed_ms / 250) % 4) as usize;
     SPINNER_FRAMES[idx]
@@ -238,10 +237,9 @@ pub(crate) fn spinner_frame(elapsed_ms: u128) -> char {
 
 /// The spinner glyph to actually render: cycles through `SPINNER_FRAMES` at
 /// 250 ms per frame normally, but holds a single static frame when `reduced_motion` is
-/// on (`[ui] reduced_motion`, item 1) or a token stream is actively
-/// producing (`streaming`, item 2 — the transcript is the one moving
-/// region while tokens flow; the spinner resumes once no tokens are in
-/// flight).
+/// on (`[ui] reduced_motion`) or a token stream is actively producing
+/// (`streaming` — the now-line shows `▸` then; the glyph resumes once no
+/// tokens are in flight).
 pub(crate) fn spinner_glyph(elapsed_ms: u128, reduced_motion: bool, streaming: bool) -> char {
     if reduced_motion || streaming {
         SPINNER_FRAMES[0]
@@ -264,10 +262,9 @@ pub(crate) fn should_flush_stream_buffer(buf: &str, elapsed_since_window_start: 
 
 /// Whether a knowledge-band evidence row inserted at `since_tick` should
 /// still render dim at `current_tick`: true for its first 2 render ticks,
-/// normal from the 3rd (`DESIGN.md`: "New Z/I evidence steps dim→normal
-/// over 3 frames"). A row with no recorded insertion tick, or when
+/// normal from the 3rd. A row with no recorded insertion tick, or when
 /// `reduced_motion` is on, always renders normal. Pure so the fade policy
-/// (item 3) is unit-testable without driving the real tick loop.
+/// is unit-testable without driving the real tick loop.
 pub(crate) fn evidence_row_dim(
     current_tick: u64,
     since_tick: Option<u64>,
@@ -284,7 +281,7 @@ pub(crate) fn evidence_row_dim(
 
 /// The Run Map's active-step marker alternates at 1 Hz while a task is
 /// running; static `●` when idle or
-/// `reduced_motion` is on. Per `DESIGN.md`, motion stays below 2 Hz.
+/// `reduced_motion` is on.
 pub(crate) fn ledger_pulse_glyph(elapsed_ms: u128, running: bool, reduced_motion: bool) -> char {
     if running && !reduced_motion && !(elapsed_ms / 1000).is_multiple_of(2) {
         '◉'
@@ -963,7 +960,7 @@ pub(crate) fn lines_as_u16(count: usize) -> u16 {
 /// multiple wrapped rows maps every one of those rows to the same index.
 /// `None` when `content_row` falls past the end of the rendered content, or
 /// lands on a line with no transcript index (`None` — prose, plain tool
-/// lines, expanded children, the stream line, the spinner label).
+/// lines, expanded children, the stream line, the now-line).
 pub(crate) fn hit_test_row(rows: &[(u16, Option<usize>)], content_row: u16) -> Option<usize> {
     let mut cursor = 0u16;
     for (count, idx) in rows {
@@ -1754,7 +1751,7 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
         // `state.transcript` index to toggle on click, when it's an
         // expandable tool-group header (`Some`) — everything else
         // (prose, plain tool lines, expanded children, the stream line,
-        // the spinner label) is `None`.
+        // the now-line) is `None`.
         let transcript_area = areas[idx];
         state.transcript_cache.update(
             &state.transcript,
@@ -2073,7 +2070,7 @@ pub(crate) fn task_step_label(step: TaskStep) -> &'static str {
 /// (`✓` done / `●`/`◉` active pulse / `○` pending — no borders, DIM rule
 /// spacing only), CURRENT CHANGE, and WHY. Every row traces to a real
 /// event; no invented captions. `running`/`elapsed_ms`/`reduced_motion`
-/// drive the active marker's 4 Hz pulse (item 4).
+/// drive the active marker's 1 Hz pulse.
 pub(crate) fn draw_ledger(
     f: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
@@ -2173,7 +2170,7 @@ pub(crate) fn draw_ledger(
     } else {
         const MAX_ROWS: usize = 3;
         for row in ledger.numstat.iter().take(MAX_ROWS) {
-            // Diff isn't a Z/I/G provenance source, so per DESIGN.md ("color
+            // Diff isn't a graph/memory/git provenance source, so per DESIGN.md ("color
             // = provenance, never decoration") the whole row stays dim/plain
             // — only the `+`/`-` glyphs (already in the vocabulary) carry
             // meaning, not color.

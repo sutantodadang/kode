@@ -75,7 +75,7 @@ pub enum AttachmentKind {
     Image,
 }
 
-/// The agent run's current phase, shown in the breadcrumb/spinner.
+/// The agent run's current phase, shown in the now-line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
     Idle,
@@ -107,8 +107,8 @@ impl StatusInfo {
     }
 }
 
-/// Provenance tag for one transcript line, rendered as a 2-col gutter
-/// prefix (see `gutter_prefix`). Per `DESIGN.md`: color = provenance,
+/// Provenance tag for one transcript line, rendered as thread-gutter cells
+/// (see `gutter_spans`). Per `DESIGN.md`: color = provenance,
 /// never decoration — never fake provenance on prose the sources didn't
 /// produce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,7 +300,7 @@ pub struct LedgerState {
     pub verify_steps: Vec<(String, StepStatusLite)>,
     /// Real per-file `git diff --numstat` rows for the CURRENT CHANGE
     /// section — refreshed by the same lazy git poll that drives the
-    /// breadcrumb's dirty indicator (see `spawn_git_poll`/`apply_repo_state`),
+    /// scope row's dirty indicator (see `spawn_git_poll`/`apply_repo_state`),
     /// not by counting tool calls.
     pub numstat: Vec<NumstatRow>,
     pub why: Vec<(WhySource, String)>,
@@ -428,16 +428,16 @@ pub struct AppState {
     /// User-toggled visibility of the Knowledge Band (Ctrl+K).
     pub knowledge_band_open: bool,
     /// Last path component of the working directory, shown in the
-    /// breadcrumb. Set once at startup.
+    /// scope row. Set once at startup.
     pub repo_dir: String,
     /// Current git branch (`git branch --show-current`), best-effort, read
     /// once at startup. `None` when not a git repo / git unavailable.
     pub branch: Option<String>,
     /// Working-tree dirty flag from the lazy git poll (TUI start + after
-    /// each task completes — see `spawn_git_poll`). Drives the breadcrumb's
+    /// each task completes — see `spawn_git_poll`). Drives the scope row's
     /// dim `*` suffix on the branch segment.
     pub dirty: bool,
-    /// When the current run started, for the elapsed-time spinner label.
+    /// When the current run started, for the now-line's elapsed counter.
     pub run_started: Option<Instant>,
     /// Name of the tool currently running, if any (drives the spinner
     /// label: tool name vs. generic "thinking").
@@ -560,7 +560,7 @@ const PULSE_CAP: usize = 240;
 /// where `transcript_idx` is `Some(i)` when that logical line is a
 /// clickable tool-group header (`state.transcript[i]`), `None` for
 /// everything else (prose, plain tool lines, expanded children, the stream
-/// line, the spinner label).
+/// line, the now-line).
 #[derive(Debug, Clone, Default)]
 pub struct TranscriptHit {
     pub area: ratatui::layout::Rect,
@@ -1229,7 +1229,7 @@ pub(crate) fn ledger_objective(task: &str) -> String {
 }
 
 /// Applies a lazily-polled `RepoState` (see `spawn_git_poll`) to `state`:
-/// the breadcrumb's dirty flag and the Ledger's CURRENT CHANGE numstat
+/// the scope row's dirty flag and the Ledger's CURRENT CHANGE numstat
 /// rows. Pure — no I/O, called from the `git_rx` arm of the event loop.
 pub(crate) fn apply_repo_state(state: &mut AppState, repo: RepoState) {
     state.dirty = repo.dirty;

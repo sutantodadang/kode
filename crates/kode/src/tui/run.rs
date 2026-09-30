@@ -32,6 +32,7 @@ use super::commands::*;
 use super::draw::{draw, line_animating};
 use super::events::{apply_event, flush_model_stream};
 use super::state::*;
+use super::theme;
 use crate::custom_commands;
 use crate::pipeline;
 use crate::team_memory;
@@ -562,6 +563,11 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
     state.zindeks_enabled = config.zindeks.enabled;
     state.ingat_enabled = config.ingat.enabled;
     state.reduced_motion = config.ui.reduced_motion;
+    let palette = theme::palette_mode(
+        config.ui.theme == kode_core::config::UiTheme::Light,
+        std::env::var("COLORTERM").ok().as_deref(),
+        std::env::var_os("WT_SESSION").is_some(),
+    );
 
     if let Ok(Some(adapter)) = crate::memory_backend::connect(&config.ingat).await
         && tokio::time::timeout(Duration::from_secs(3), adapter.health())
@@ -631,7 +637,10 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
     // frame.
     let mut mouse_captured = true;
 
-    terminal.draw(|f| draw(f, &mut state, cwd))?;
+    terminal.draw(|f| {
+        draw(f, &mut state, cwd);
+        theme::adapt(f.buffer_mut(), palette);
+    })?;
 
     // Warm the process-wide Laya cache while the user composes the first
     // task. Drawing/input never waits for model loading.
@@ -971,7 +980,10 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
             }
         }
 
-        terminal.draw(|f| draw(f, &mut state, cwd))?;
+        terminal.draw(|f| {
+            draw(f, &mut state, cwd);
+            theme::adapt(f.buffer_mut(), palette);
+        })?;
     }
 
     if let Some(child) = current_cancel {
