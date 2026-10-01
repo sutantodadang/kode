@@ -1120,7 +1120,7 @@ dependencies = [
 
 [[package]]
 name = "kode"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1153,7 +1153,7 @@ dependencies = [
 
 [[package]]
 name = "kode-agent"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "async-trait",
  "futures",
@@ -1169,7 +1169,7 @@ dependencies = [
 
 [[package]]
 name = "kode-context"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "async-trait",
  "futures",
@@ -1184,7 +1184,7 @@ dependencies = [
 
 [[package]]
 name = "kode-core"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "libc",
  "serde",
@@ -1198,7 +1198,7 @@ dependencies = [
 
 [[package]]
 name = "kode-intel"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "async-trait",
  "futures",
@@ -1212,7 +1212,7 @@ dependencies = [
 
 [[package]]
 name = "kode-local"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "async-trait",
  "futures",
@@ -1231,7 +1231,7 @@ dependencies = [
 
 [[package]]
 name = "kode-mcp"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "async-trait",
  "kode-core",
@@ -1245,7 +1245,7 @@ dependencies = [
 
 [[package]]
 name = "kode-memory"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1263,7 +1263,7 @@ dependencies = [
 
 [[package]]
 name = "kode-model"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "async-trait",
  "futures",
@@ -1278,7 +1278,7 @@ dependencies = [
 
 [[package]]
 name = "kode-tools"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "async-trait",
  "kode-core",
@@ -1294,7 +1294,7 @@ dependencies = [
 
 [[package]]
 name = "kode-verify"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "kode-core",
  "serde_json",
