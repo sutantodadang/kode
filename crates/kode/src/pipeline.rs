@@ -668,6 +668,7 @@ async fn execute_task(
                     tool_calls: outcome.tool_calls,
                     input_tokens: outcome.usage.input_tokens,
                     output_tokens: outcome.usage.output_tokens,
+                    cached_tokens: outcome.usage.cache_read_tokens,
                 });
                 return Ok(TaskOutcome {
                     status: TaskStatus::Cancelled,
@@ -798,13 +799,12 @@ async fn execute_task(
         }
     }
 
-    let (iterations, tool_calls, input_tokens, output_tokens, mutated_any) = match &outcome2 {
+    let (iterations, tool_calls, usage, mutated_any) = match &outcome2 {
         Some(o2) => combine_outcomes(&outcome1, o2),
         None => (
             outcome1.iterations,
             outcome1.tool_calls,
-            outcome1.usage.input_tokens,
-            outcome1.usage.output_tokens,
+            outcome1.usage,
             outcome1.mutated,
         ),
     };
@@ -837,8 +837,9 @@ async fn execute_task(
     events.emit(KodeEvent::TaskFinished {
         iterations,
         tool_calls,
-        input_tokens,
-        output_tokens,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cached_tokens: usage.cache_read_tokens,
     });
 
     Ok(TaskOutcome {
@@ -848,12 +849,7 @@ async fn execute_task(
         repair_attempted: outcome2.is_some(),
         iterations,
         tool_calls,
-        usage: Usage {
-            input_tokens,
-            output_tokens,
-
-            ..Default::default()
-        },
+        usage,
     })
 }
 
@@ -991,17 +987,18 @@ fn verification_status(verdict: Verdict) -> VerificationStatus {
 
 /// Aggregates two agent runs (initial + retry) into the metrics
 /// `TaskFinished` reports: summed iterations, summed tool calls, summed
-/// input/output tokens, and `mutated` OR'd across both runs (a mutation in
-/// either run means the workspace changed).
+/// usage, and `mutated` OR'd across both runs (a mutation in either run
+/// means the workspace changed).
 fn combine_outcomes(
     a: &kode_agent::AgentOutcome,
     b: &kode_agent::AgentOutcome,
-) -> (u32, u32, u64, u64, bool) {
+) -> (u32, u32, Usage, bool) {
+    let mut usage = a.usage;
+    usage += b.usage;
     (
         a.iterations + b.iterations,
         a.tool_calls + b.tool_calls,
-        a.usage.input_tokens + b.usage.input_tokens,
-        a.usage.output_tokens + b.usage.output_tokens,
+        usage,
         a.mutated || b.mutated,
     )
 }
@@ -1424,16 +1421,17 @@ mod verification_tests {
 
     #[test]
     fn combine_outcomes_sums_metrics_and_ors_mutated() {
-        let a = outcome(3, 5, 100, 200, true);
+        let mut a = outcome(3, 5, 100, 200, true);
+        a.usage.cache_read_tokens = Some(60);
         let b = outcome(2, 4, 50, 75, false);
 
-        let (iterations, tool_calls, input_tokens, output_tokens, mutated) =
-            combine_outcomes(&a, &b);
+        let (iterations, tool_calls, usage, mutated) = combine_outcomes(&a, &b);
 
         assert_eq!(iterations, 5);
         assert_eq!(tool_calls, 9);
-        assert_eq!(input_tokens, 150);
-        assert_eq!(output_tokens, 275);
+        assert_eq!(usage.input_tokens, 150);
+        assert_eq!(usage.output_tokens, 275);
+        assert_eq!(usage.cache_read_tokens, Some(60));
         assert!(mutated);
     }
 
@@ -1442,8 +1440,9 @@ mod verification_tests {
         let a = outcome(1, 1, 10, 10, false);
         let b = outcome(1, 1, 10, 10, false);
 
-        let (.., mutated) = combine_outcomes(&a, &b);
+        let (.., usage, mutated) = combine_outcomes(&a, &b);
         assert!(!mutated);
+        assert_eq!(usage.cache_read_tokens, None);
     }
 }
 

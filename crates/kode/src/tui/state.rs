@@ -218,6 +218,7 @@ pub struct CompletionReceipt {
     pub tool_calls: u32,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cached_tokens: Option<u64>,
     pub elapsed_ms: u128,
     pub verify_steps: Vec<(String, StepStatusLite)>,
     pub numstat: Vec<NumstatRow>,

@@ -147,8 +147,12 @@ pub enum KodeEvent {
     TaskFinished {
         iterations: u32,
         tool_calls: u32,
+        /// Total input tokens, cached share included.
         input_tokens: u64,
         output_tokens: u64,
+        /// Input tokens served from the provider cache. `None` means the
+        /// provider did not report it; never render that as zero.
+        cached_tokens: Option<u64>,
     },
     /// Emitted once per context compilation, alongside `ContextCompiled`.
     /// Carries a UI-ready digest of what the agent knows for this task:
