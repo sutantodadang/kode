@@ -47,7 +47,16 @@ pub(crate) fn new_cache_key() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    format!("kode-{}-{nanos}", std::process::id())
+    cache_key_at(nanos)
+}
+
+static CACHE_KEY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The sequence number keeps keys distinct when two calls fall in the same
+/// clock tick; some platforms only report microseconds.
+fn cache_key_at(nanos: u128) -> String {
+    let seq = CACHE_KEY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("kode-{}-{nanos}-{seq}", std::process::id())
 }
 
 fn should_report_context_budget(provider: &str, model: &str, window: u32) -> bool {
@@ -1228,10 +1237,10 @@ mod plan_phase_tests {
 
     #[test]
     fn cache_keys_are_process_scoped_and_distinct() {
-        let a = new_cache_key();
-        let b = new_cache_key();
-        assert!(a.starts_with(&format!("kode-{}-", std::process::id())));
-        assert_ne!(a, b);
+        assert!(new_cache_key().starts_with(&format!("kode-{}-", std::process::id())));
+        // Back-to-back calls can land in the same clock tick (CI runners
+        // report microseconds); keys must still differ.
+        assert_ne!(cache_key_at(42), cache_key_at(42));
     }
 
     #[tokio::test]
