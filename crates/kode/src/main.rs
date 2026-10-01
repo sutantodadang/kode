@@ -16,6 +16,7 @@ mod remember;
 mod router_cmd;
 mod routing;
 mod session;
+mod session_runtime;
 mod setup;
 mod status;
 mod team_memory;
