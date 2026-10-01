@@ -11,6 +11,20 @@ const TOOL_ROUNDS_DROPPED: &str = "(older agent tool interactions dropped to fit
 const IMAGE_TOKEN_ESTIMATE: usize = 1600;
 const AUTO_COMPACT_TRIGGER_PERCENT: usize = 80;
 
+const MASK_TRIGGER_PERCENT: usize = 60;
+/// Tool rounds whose outputs always stay in full: the model is still
+/// working with them.
+pub(crate) const KEEP_RECENT_TOOL_ROUNDS: usize = 4;
+pub(crate) const TOOL_OUTPUT_MASKED: &str =
+    "[output omitted to save context; call the tool again if you need it]";
+/// Outputs at or below this size stay: masking them saves nothing, and short
+/// outputs are usually errors the model should keep seeing.
+const MASK_MIN_BYTES: usize = 200;
+/// How far `enforce` shrinks an over-budget prompt. Dropping well below the
+/// limit in one go means the next several requests need no further drops, so
+/// the prompt prefix shifts once instead of on every request.
+const DROP_TARGET_PERCENT: usize = 75;
+
 /// Opens the message that carries the compiled repository context.
 pub(crate) const CONTEXT_PREFIX: &str = "Repository and session context:";
 
@@ -72,6 +86,50 @@ impl PromptBudget {
                 >= self
                     .input_budget()
                     .saturating_mul(AUTO_COMPACT_TRIGGER_PERCENT)
+    }
+
+    /// True once the prompt is large enough that stale tool outputs should be
+    /// omitted. Lower than the compaction trigger: masking is free, a
+    /// summary is a model call.
+    pub(crate) fn should_mask(&self, messages: &[Message], tools: &[ToolSpec]) -> bool {
+        self.input_budget() > 0
+            && estimate_request(messages, tools).saturating_mul(100)
+                >= self.input_budget().saturating_mul(MASK_TRIGGER_PERCENT)
+    }
+
+    /// When the prompt no longer fits, removes the oldest completed tool
+    /// rounds from `messages` itself until it is back under
+    /// [`DROP_TARGET_PERCENT`] of the budget, and returns how many rounds it
+    /// removed. The newest round always stays. A user-role marker is left
+    /// where the rounds were: a system marker would change the system block
+    /// and invalidate the provider's cache for the whole conversation.
+    pub(crate) fn enforce(&self, messages: &mut Vec<Message>, tools: &[ToolSpec]) -> usize {
+        let budget = self.input_budget();
+        if estimate_request(messages, tools) <= budget {
+            return 0;
+        }
+        let target = budget * DROP_TARGET_PERCENT / 100;
+        let mut dropped = 0;
+        let mut gap = None;
+        while estimate_request(messages, tools) > target {
+            let rounds = completed_tool_rounds(messages);
+            if rounds.len() <= 1 {
+                break;
+            }
+            let (start, end) = rounds[0];
+            messages.drain(start..end);
+            gap.get_or_insert(start);
+            dropped += 1;
+        }
+        let marked = messages
+            .iter()
+            .any(|message| matches!(message, Message::User(text) if text == TOOL_ROUNDS_DROPPED));
+        if let Some(index) = gap
+            && !marked
+        {
+            messages.insert(index, Message::User(TOOL_ROUNDS_DROPPED.to_string()));
+        }
+        dropped
     }
 
     pub(crate) fn prepare(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<Vec<Message>> {
@@ -246,6 +304,27 @@ pub(crate) fn completed_tool_rounds(messages: &[Message]) -> Vec<(usize, usize)>
         index = end;
     }
     rounds
+}
+
+/// Replaces the output of every completed tool round except the newest
+/// `keep_recent` with a short placeholder and returns how many outputs it
+/// replaced. Calls, arguments and ids stay, so the model still sees what it
+/// did and the tool protocol stays valid. Idempotent.
+pub(crate) fn mask_old_tool_outputs(messages: &mut [Message], keep_recent: usize) -> usize {
+    let rounds = completed_tool_rounds(messages);
+    let maskable = rounds.len().saturating_sub(keep_recent);
+    let mut masked = 0;
+    for &(start, end) in &rounds[..maskable] {
+        for message in &mut messages[start..end] {
+            if let Message::Tool { content, .. } = message
+                && content.len() > MASK_MIN_BYTES
+            {
+                *content = TOOL_OUTPUT_MASKED.to_string();
+                masked += 1;
+            }
+        }
+    }
+    masked
 }
 
 fn oldest_history_turn(messages: &[Message]) -> Option<(usize, usize)> {
@@ -439,5 +518,220 @@ mod tests {
             .prepare(&[Message::System("system".into())], &tools())
             .unwrap_err();
         assert!(matches!(error, AgentError::ContextWindowExceeded { .. }));
+    }
+
+    fn round(id: &str, output: String) -> [Message; 2] {
+        [
+            Message::Assistant {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: id.into(),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({"path": format!("{id}.txt")}),
+                }],
+            },
+            Message::Tool {
+                tool_call_id: id.into(),
+                content: output,
+            },
+        ]
+    }
+
+    fn conversation(rounds: usize, output_bytes: usize) -> Vec<Message> {
+        let mut messages = vec![
+            Message::System("system".into()),
+            Message::User("task".into()),
+        ];
+        for n in 0..rounds {
+            messages.extend(round(&format!("r{n}"), "o".repeat(output_bytes)));
+        }
+        messages
+    }
+
+    fn tool_content<'a>(messages: &'a [Message], id: &str) -> &'a str {
+        messages
+            .iter()
+            .find_map(|message| match message {
+                Message::Tool {
+                    tool_call_id,
+                    content,
+                } if tool_call_id == id => Some(content.as_str()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no tool result for {id}"))
+    }
+
+    #[test]
+    fn masking_keeps_the_newest_rounds_and_is_idempotent() {
+        let mut messages = conversation(6, 1_000);
+
+        let masked = mask_old_tool_outputs(&mut messages, KEEP_RECENT_TOOL_ROUNDS);
+
+        assert_eq!(masked, 2);
+        assert_eq!(tool_content(&messages, "r0"), TOOL_OUTPUT_MASKED);
+        assert_eq!(tool_content(&messages, "r1"), TOOL_OUTPUT_MASKED);
+        for id in ["r2", "r3", "r4", "r5"] {
+            assert_eq!(tool_content(&messages, id).len(), 1_000, "{id}");
+        }
+        // Every call still has its result: the tool protocol is intact.
+        assert_eq!(completed_tool_rounds(&messages).len(), 6);
+        assert_eq!(messages.len(), 2 + 6 * 2);
+
+        assert_eq!(
+            mask_old_tool_outputs(&mut messages, KEEP_RECENT_TOOL_ROUNDS),
+            0
+        );
+    }
+
+    #[test]
+    fn masking_leaves_short_outputs_such_as_errors_readable() {
+        let mut messages = vec![
+            Message::System("system".into()),
+            Message::User("task".into()),
+        ];
+        messages.extend(round("failed", "error: file not found".into()));
+        for n in 0..5 {
+            messages.extend(round(&format!("r{n}"), "o".repeat(1_000)));
+        }
+
+        mask_old_tool_outputs(&mut messages, KEEP_RECENT_TOOL_ROUNDS);
+
+        assert_eq!(tool_content(&messages, "failed"), "error: file not found");
+        assert_eq!(tool_content(&messages, "r0"), TOOL_OUTPUT_MASKED);
+    }
+
+    #[test]
+    fn masking_never_touches_user_or_system_messages() {
+        let mut messages = conversation(3, 1_000);
+        messages.insert(4, Message::User("steer: focus on the parser".into()));
+        messages.extend(conversation(4, 1_000).into_iter().skip(2));
+        let non_tool_before: Vec<Message> = messages
+            .iter()
+            .filter(|message| !matches!(message, Message::Tool { .. }))
+            .cloned()
+            .collect();
+
+        mask_old_tool_outputs(&mut messages, KEEP_RECENT_TOOL_ROUNDS);
+
+        let non_tool_after: Vec<Message> = messages
+            .iter()
+            .filter(|message| !matches!(message, Message::Tool { .. }))
+            .cloned()
+            .collect();
+        assert_eq!(non_tool_before, non_tool_after);
+    }
+
+    #[test]
+    fn nothing_is_masked_when_there_are_few_rounds() {
+        let mut messages = conversation(KEEP_RECENT_TOOL_ROUNDS, 1_000);
+        assert_eq!(
+            mask_old_tool_outputs(&mut messages, KEEP_RECENT_TOOL_ROUNDS),
+            0
+        );
+    }
+
+    #[test]
+    fn should_mask_triggers_before_should_compact() {
+        // 4,000-token window: 1,000 reserved for output, 3,000 input budget.
+        let budget = PromptBudget::new(4_000);
+        let empty = conversation(0, 0);
+        let at_65_percent = conversation(1, 7_600); // about 1,950 tokens
+        let at_85_percent = conversation(1, 10_000); // about 2,550 tokens
+
+        assert!(!budget.should_mask(&empty, &[]));
+        assert!(budget.should_mask(&at_65_percent, &[]));
+        assert!(!budget.should_compact(&at_65_percent, &[]));
+        assert!(budget.should_mask(&at_85_percent, &[]));
+        assert!(budget.should_compact(&at_85_percent, &[]));
+    }
+
+    #[test]
+    fn enforce_drops_a_block_and_marks_the_gap() {
+        // 3,000-token input budget; eight rounds of about 530 tokens each.
+        let budget = PromptBudget::new(4_000);
+        let mut messages = conversation(8, 2_000);
+        assert!(estimate_request(&messages, &[]) > budget.input_budget());
+
+        let dropped = budget.enforce(&mut messages, &[]);
+
+        assert!(dropped >= 2, "one block, not one round: {dropped}");
+        assert!(estimate_request(&messages, &[]) <= budget.input_budget() * 75 / 100);
+        // The marker sits where the rounds were, as a user message.
+        assert_eq!(messages[0], Message::System("system".into()));
+        assert_eq!(messages[1], Message::User("task".into()));
+        assert_eq!(messages[2], Message::User(TOOL_ROUNDS_DROPPED.into()));
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(message, Message::System(_)))
+                .count(),
+            1
+        );
+        // The newest round survives in full.
+        assert_eq!(tool_content(&messages, "r7").len(), 2_000);
+        assert_eq!(completed_tool_rounds(&messages).len(), 8 - dropped);
+
+        // Stable afterwards: the next request does not shift the prefix again.
+        let snapshot = messages.clone();
+        assert_eq!(budget.enforce(&mut messages, &[]), 0);
+        assert_eq!(messages, snapshot);
+    }
+
+    #[test]
+    fn enforce_is_a_noop_within_budget() {
+        let budget = PromptBudget::new(4_000);
+        let mut messages = conversation(2, 2_000);
+        let snapshot = messages.clone();
+
+        assert_eq!(budget.enforce(&mut messages, &[]), 0);
+        assert_eq!(messages, snapshot);
+    }
+
+    #[test]
+    fn enforce_never_drops_the_only_round() {
+        let budget = PromptBudget::new(4_000);
+        let mut messages = conversation(1, 20_000);
+        let snapshot = messages.clone();
+
+        assert_eq!(budget.enforce(&mut messages, &[]), 0);
+        assert_eq!(messages, snapshot);
+    }
+
+    #[test]
+    fn enforce_keeps_user_steering_between_rounds() {
+        let budget = PromptBudget::new(4_000);
+        let mut messages = conversation(8, 2_000);
+        // After round r0 (indices 2 and 3).
+        messages.insert(4, Message::User("steer: focus on the parser".into()));
+
+        budget.enforce(&mut messages, &[]);
+
+        assert!(
+            messages
+                .iter()
+                .any(|message| message == &Message::User("steer: focus on the parser".into()))
+        );
+    }
+
+    #[test]
+    fn enforce_adds_only_one_marker_across_repeated_overflows() {
+        let budget = PromptBudget::new(4_000);
+        let mut messages = conversation(8, 2_000);
+        budget.enforce(&mut messages, &[]);
+        for n in 8..14 {
+            messages.extend(round(&format!("r{n}"), "o".repeat(2_000)));
+        }
+
+        budget.enforce(&mut messages, &[]);
+
+        assert_eq!(
+            messages
+                .iter()
+                .filter(
+                    |message| matches!(message, Message::User(text) if text == TOOL_ROUNDS_DROPPED)
+                )
+                .count(),
+            1
+        );
     }
 }
