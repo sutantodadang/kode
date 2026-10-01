@@ -3,6 +3,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use kode_context::{ContextReranker, RerankOutcome};
 use kode_core::config::RouterConfig;
@@ -95,14 +96,16 @@ pub async fn load(cfg: &RouterConfig, root: &Path) -> LocalStack {
         label,
     });
 
-    // Model verification/loading belongs inside the context rerank timeout,
-    // rather than delaying every route before context candidates exist.
+    // Routing never waits for the reranker: it loads in the background from
+    // here, and the context rerank call waits for it inside its own timeout.
     let reranker = cfg.rerank.then(|| {
-        Arc::new(LocalReranker {
+        let reranker = LocalReranker {
             paths: Arc::new(paths),
             pref,
             allow_cpu: cfg.rerank_on_cpu,
-        }) as Arc<dyn ContextReranker>
+        };
+        reranker.warm_in_background();
+        Arc::new(reranker) as Arc<dyn ContextReranker>
     });
 
     LocalStack {
@@ -130,6 +133,42 @@ pub struct LocalReranker {
     paths: Arc<LocalPaths>,
     pref: DevicePref,
     allow_cpu: bool,
+}
+
+/// Set while a warm-up is running or has succeeded in this process.
+static RERANK_WARMING: AtomicBool = AtomicBool::new(false);
+
+impl LocalReranker {
+    /// Loads the model and scores one tiny batch in the background, once per
+    /// process, so the first real rerank finds it warm. The cold load alone
+    /// takes ~2.9 s on an RTX 4070 SUPER, longer than the default 2 s
+    /// `rerank_timeout_ms`. A failed warm-up clears the flag so a later task
+    /// can try again; `rerank` reports the failure itself.
+    fn warm_in_background(&self) -> Option<tokio::task::JoinHandle<()>> {
+        if self.pref == DevicePref::Cpu && !self.allow_cpu {
+            return None;
+        }
+        if RERANK_WARMING.swap(true, Ordering::SeqCst) {
+            return None;
+        }
+        let paths = self.paths.clone();
+        let pref = self.pref;
+        let allow_cpu = self.allow_cpu;
+        Some(tokio::task::spawn_blocking(move || {
+            let warm = || -> Result<(), LocalError> {
+                let dir = verify_model_dir(&paths, MODELS_REVISION, MODEL_FILES, RERANKER_DIR)?;
+                let model = shared_reranker(&dir, pref)?;
+                if model.device().is_gpu() || allow_cpu {
+                    model.score_all("warm up", &["warm up".to_string()])?;
+                }
+                Ok(())
+            };
+            if let Err(error) = warm() {
+                tracing::debug!(%error, "reranker warm-up failed");
+                RERANK_WARMING.store(false, Ordering::SeqCst);
+            }
+        }))
+    }
 }
 
 #[async_trait::async_trait]
@@ -230,6 +269,31 @@ mod tests {
             matches!(reranker.rerank("query", &["doc".to_string()]).await,
             RerankOutcome::Skipped(reason) if reason.contains("no gpu"))
         );
+    }
+
+    #[tokio::test]
+    async fn warm_up_skips_cpu_when_cpu_rerank_is_off_and_retries_after_failure() {
+        let off = LocalReranker {
+            paths: Arc::new(LocalPaths {
+                root: std::path::PathBuf::from("missing-qa-models"),
+            }),
+            pref: DevicePref::Cpu,
+            allow_cpu: false,
+        };
+        assert!(off.warm_in_background().is_none());
+
+        let missing = LocalReranker {
+            allow_cpu: true,
+            ..off
+        };
+        // Missing models: the warm-up fails, and a failure must not block a
+        // later attempt (e.g. after `kode setup`).
+        missing
+            .warm_in_background()
+            .expect("first warm-up starts")
+            .await
+            .unwrap();
+        assert!(missing.warm_in_background().is_some());
     }
 
     #[tokio::test]

@@ -23,7 +23,9 @@ const MEMORY_SEARCH_LIMIT: u32 = 12;
 
 /// Candidates scored per task. Measured on an RTX 4070 SUPER (DirectML,
 /// batched): 24 ≈ 0.8 s warm / 1.6 s cold, 36 ≈ 1.3 s, 66 ≈ 2.3 s — so 24
-/// stays inside the default 2 s `rerank_timeout_ms`.
+/// stays inside the default 2 s `rerank_timeout_ms`. These exclude loading
+/// the model (~2.9 s), which `kode::local` starts in the background when the
+/// router loads.
 const MAX_RERANK_CANDIDATES: u32 = 24;
 /// With a reranker, fetch this many memories, then keep the best
 /// `MEMORY_SEARCH_LIMIT` after reranking.
