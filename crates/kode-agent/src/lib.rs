@@ -469,6 +469,7 @@ impl Agent {
         let mut mutated = false;
         let mut steering_open = steering.is_some();
         let mut compaction_available = self.auto_compact;
+        let mut masking_announced = false;
 
         let task_message = Message::user(task.clone());
         let mut iteration = 0_u32;
@@ -490,6 +491,20 @@ impl Agent {
             }
 
             let tools = self.tools.specs();
+            // Cheapest relief first: stale tool outputs go before any model
+            // call is spent on a summary.
+            if self.prompt_budget.should_mask(&messages, &tools) {
+                let masked = prompt_budget::mask_old_tool_outputs(
+                    &mut messages,
+                    prompt_budget::KEEP_RECENT_TOOL_ROUNDS,
+                );
+                if masked > 0 && !masking_announced {
+                    masking_announced = true;
+                    self.events.emit(KodeEvent::Note {
+                        text: "context trimmed: older tool outputs omitted; the agent re-runs a tool if it needs one again".to_string(),
+                    });
+                }
+            }
             if compaction_available && self.prompt_budget.should_compact(&messages, &tools) {
                 match self.compact_messages(&mut messages, &tools, task).await {
                     Ok(Some((compact_usage, before, after))) => {
@@ -517,6 +532,14 @@ impl Agent {
                         });
                     }
                 }
+            }
+
+            // Last resort, when compaction is off or could not help.
+            let dropped = self.prompt_budget.enforce(&mut messages, &tools);
+            if dropped > 0 {
+                self.events.emit(KodeEvent::Note {
+                    text: format!("context full: dropped the {dropped} oldest tool rounds"),
+                });
             }
 
             self.events.emit(KodeEvent::ModelStarted);
@@ -2521,5 +2544,76 @@ mod tests {
 
         assert!(matches!(result, Err(AgentError::Cancelled)));
         assert_eq!(mock.requests().len(), 1);
+    }
+
+    fn masked_outputs(request: &ModelRequest) -> usize {
+        request
+            .messages
+            .iter()
+            .filter(|message| {
+                matches!(message, Message::Tool { content, .. } if content == prompt_budget::TOOL_OUTPUT_MASKED)
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn stale_tool_outputs_are_masked_instead_of_summarised() {
+        let dir = temp_dir();
+        write_round_files(&dir, 18);
+        let model = Arc::new(ReactiveModel::new(18, CompactionReply::Summary));
+        let events = EventBus::new(512);
+        let mut rx = events.subscribe();
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        // 35,000-token input budget: 60% is reached after about 13 rounds of
+        // 1,500 tokens; 80% is never reached once old outputs are masked.
+        let agent_cfg = AgentConfig {
+            max_context_tokens: 40_000,
+            auto_compact: true,
+            ..Default::default()
+        };
+        let agent = Agent::new(model.clone(), tools, events, &agent_cfg);
+
+        let outcome = agent.run("read the files", &ctx(dir)).await.unwrap();
+
+        assert_eq!(outcome.final_text, "done");
+        assert_eq!(outcome.tool_calls, 18);
+
+        let requests = model.requests();
+        assert!(
+            !requests.iter().any(is_compaction),
+            "masking must make the LLM summary unnecessary"
+        );
+
+        let last = requests.last().unwrap();
+        assert!(masked_outputs(last) >= 8, "{}", masked_outputs(last));
+        assert_eq!(masked_outputs(&requests[1]), 0);
+        // The four newest results are intact.
+        let recent: Vec<&str> = last
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Tool { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .rev()
+            .take(prompt_budget::KEEP_RECENT_TOOL_ROUNDS)
+            .collect();
+        assert!(
+            recent
+                .iter()
+                .all(|content| content.contains("important detail"))
+        );
+
+        let mut mask_notes = 0;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(&event, KodeEvent::Note { text } if text.contains("older tool outputs omitted"))
+            {
+                mask_notes += 1;
+            }
+        }
+        assert_eq!(
+            mask_notes, 1,
+            "announce masking once per run, not per request"
+        );
     }
 }
