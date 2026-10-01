@@ -139,6 +139,8 @@ pub enum Gutter {
     Error,
     /// Echoed user input.
     User,
+    /// The `KODE` label row that opens the model's reply, once per task.
+    Reply,
     /// The router's decision line (`route tier=… · effort=…`).
     Route,
     /// Column heads (`g m t`) drawn once before a run's first source line.
@@ -401,6 +403,8 @@ pub struct AppState {
     pub steering_active: bool,
     /// Whether this run already emitted its `ThreadHead` transcript line.
     pub thread_head_shown: bool,
+    /// Whether this run already emitted its `KODE` reply label.
+    pub reply_label_shown: bool,
     pub pending: VecDeque<PermReq>,
     pub scroll: u16,
     pub follow: bool,
@@ -583,6 +587,7 @@ impl AppState {
             running: false,
             steering_active: false,
             thread_head_shown: false,
+            reply_label_shown: false,
             pending: VecDeque::new(),
             scroll: 0,
             follow: true,
@@ -689,6 +694,7 @@ impl AppState {
         self.ledger = LedgerState::new(ledger_objective(&task.text), plan_mode);
         self.steering_active = true;
         self.thread_head_shown = false;
+        self.reply_label_shown = false;
         self.run_transcript_start = self.transcript.len();
         if self.trace_back.take().is_some() {
             self.style_epoch += 1;
@@ -1201,6 +1207,11 @@ pub(crate) fn restore_session(state: &mut AppState, cwd: &Path, id: &str) -> boo
                         text: t.task.clone(),
                         images: t.images.clone(),
                     }));
+                if t.response.lines().any(|l| !l.is_empty()) {
+                    state
+                        .transcript
+                        .push(TranscriptLine::new(Gutter::Reply, "KODE"));
+                }
                 let mut in_code_block = false;
                 for line in t.response.lines() {
                     let rendered = markdown::render_line(line, &mut in_code_block);

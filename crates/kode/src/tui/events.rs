@@ -23,9 +23,19 @@ pub(crate) fn flush_model_stream(state: &mut AppState) {
             if line.is_empty() {
                 state.transcript.push(TranscriptLine::new(Gutter::None, ""));
             } else {
+                if !state.reply_label_shown {
+                    state.reply_label_shown = true;
+                    if !matches!(state.transcript.last(), Some(l) if l.gutter == Gutter::None && l.text.is_empty())
+                    {
+                        state.transcript.push(TranscriptLine::new(Gutter::None, ""));
+                    }
+                    state
+                        .transcript
+                        .push(TranscriptLine::new(Gutter::Reply, "KODE"));
+                }
                 let rendered = markdown::render_line(line, &mut state.md_in_code_block);
                 if rendered.kind == markdown::MdKind::Heading
-                    && !matches!(state.transcript.last(), Some(l) if l.gutter == Gutter::None)
+                    && !matches!(state.transcript.last(), Some(l) if matches!(l.gutter, Gutter::None | Gutter::Reply))
                 {
                     state.transcript.push(TranscriptLine::new(Gutter::None, ""));
                 }
