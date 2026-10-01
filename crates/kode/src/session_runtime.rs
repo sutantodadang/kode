@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! Backends that outlive a single task.
 //!
 //! Opening the code-intelligence engine, the memory store and every MCP

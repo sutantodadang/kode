@@ -494,6 +494,8 @@ pub struct AppState {
     pub session_id: Option<String>,
     /// Provider prompt-cache key for every task this TUI process runs.
     pub cache_key: String,
+    /// Backends kept open across the tasks of this TUI process.
+    pub runtime: Arc<crate::session_runtime::SessionRuntime>,
     /// Task text of the in-flight run; consumed when TaskFinished arrives.
     pub pending_task: Option<UserInput>,
     /// Stable receipt for the most recently completed run. Cleared as soon
@@ -619,6 +621,7 @@ impl AppState {
             history: Vec::new(),
             session_id: None,
             cache_key: crate::pipeline::new_cache_key(),
+            runtime: Arc::new(crate::session_runtime::SessionRuntime::new()),
             pending_task: None,
             completion: None,
             last_error: None,

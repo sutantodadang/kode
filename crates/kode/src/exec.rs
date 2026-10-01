@@ -213,6 +213,7 @@ pub async fn run(
         (response_buf, final_tool_calls)
     });
 
+    let runtime = crate::session_runtime::SessionRuntime::new();
     let result = pipeline::run_task_with_input(
         &input,
         cwd,
@@ -224,6 +225,7 @@ pub async fn run(
         plan_mode,
         None,
         Some(pipeline::new_cache_key()),
+        &runtime,
     )
     .await;
 

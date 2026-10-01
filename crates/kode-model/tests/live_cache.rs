@@ -57,8 +57,8 @@ async fn anthropic_second_call_reads_cache() {
 #[ignore = "live: needs `kode auth login codex` and KODE_LIVE_CODEX_MODEL"]
 async fn codex_second_call_reads_cache() {
     let auth = kode_model::codex::default_auth_path().expect("home directory");
-    let model = kode_model::CodexModel::new(auth, model_id("KODE_LIVE_CODEX_MODEL"))
-        .expect("codex auth");
+    let model =
+        kode_model::CodexModel::new(auth, model_id("KODE_LIVE_CODEX_MODEL")).expect("codex auth");
     second_call_reads_cache(&model).await;
 }
 

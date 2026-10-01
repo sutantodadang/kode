@@ -19,6 +19,7 @@ use kode_tools::tools::UseSkill;
 use tokio::sync::mpsc;
 
 use crate::intel_tools::{CodeSearchTool, FileOutlineTool};
+use crate::session_runtime::SessionRuntime;
 
 /// Appended to the task text for the plan-mode turn (see
 /// [`run_plan_phase`]). The turn exposes no implementation tools; only the
@@ -267,6 +268,7 @@ pub async fn run_task(
     plan_mode: bool,
     steering: Option<mpsc::UnboundedReceiver<UserInput>>,
 ) -> anyhow::Result<TaskOutcome> {
+    let runtime = SessionRuntime::new();
     run_task_with_input(
         &UserInput::text(task),
         cwd,
@@ -278,6 +280,7 @@ pub async fn run_task(
         plan_mode,
         steering,
         None,
+        &runtime,
     )
     .await
 }
@@ -294,6 +297,7 @@ pub async fn run_task_with_input(
     plan_mode: bool,
     steering: Option<mpsc::UnboundedReceiver<UserInput>>,
     cache_key: Option<String>,
+    runtime: &SessionRuntime,
 ) -> anyhow::Result<TaskOutcome> {
     let routed = crate::routing::route_task(input, cwd, config, plan_mode, &events, &cancel).await;
     let result = execute_task(
@@ -309,6 +313,7 @@ pub async fn run_task_with_input(
         config,
         routed.reranker,
         cache_key,
+        runtime,
     )
     .await;
     if let Some(decision) = &routed.decision
@@ -372,6 +377,7 @@ async fn execute_task(
     fallback_config: &KodeConfig,
     reranker: Option<Arc<dyn kode_context::ContextReranker>>,
     cache_key: Option<String>,
+    runtime: &SessionRuntime,
 ) -> anyhow::Result<TaskOutcome> {
     let model = match ModelFactory::create(config) {
         Ok(model) => model,
@@ -423,64 +429,73 @@ async fn execute_task(
     // (as an incremental refresh) after edits. The trait exposes lifecycle
     // parity, so no concrete adapter type is retained here.
     let mut bound_backend: Option<Arc<dyn CodeIntelligence>> = None;
-    let intel: Option<Arc<dyn CodeIntelligence>> = if config.zindeks.enabled {
-        match crate::intel_backend::connect(&config.zindeks, cwd).await {
-            Ok(Some(backend)) => match backend.ensure_bound().await {
+    let intel: Option<Arc<dyn CodeIntelligence>> = match runtime.intel(&config.zindeks, cwd).await {
+        Ok(Some(handle)) => {
+            // A reused handle is already bound. Without the watcher it
+            // still needs a refresh to see edits made between tasks.
+            let bind = if handle.fresh || !handle.backend.watching() {
+                handle.backend.ensure_bound().await
+            } else {
+                Ok(())
+            };
+            match bind {
                 Ok(()) => {
-                    bound_backend = Some(backend.clone());
-                    Some(backend)
+                    bound_backend = Some(handle.backend.clone());
+                    Some(handle.backend)
                 }
                 Err(e) => {
+                    // Do not keep a backend that could not bind: the
+                    // next task must try again, e.g. after `kode index`.
+                    runtime.forget_intel().await;
                     events.emit(KodeEvent::SourcedNote {
                         text: format!("code intelligence unavailable: {e}"),
                         source: NoteSource::Zindeks,
                     });
                     None
                 }
-            },
-            Ok(None) => None,
-            Err(e) => {
-                events.emit(KodeEvent::SourcedNote {
-                    text: format!("code intelligence unavailable: {e}"),
-                    source: NoteSource::Zindeks,
-                });
-                None
             }
         }
-    } else {
-        None
+        Ok(None) => None,
+        Err(e) => {
+            events.emit(KodeEvent::SourcedNote {
+                text: format!("code intelligence unavailable: {e}"),
+                source: NoteSource::Zindeks,
+            });
+            None
+        }
     };
 
-    let memory: Option<Arc<dyn EngineeringMemory>> =
-        match crate::memory_backend::connect(&config.ingat).await {
-            Ok(Some(backend)) => {
-                match tokio::time::timeout(Duration::from_secs(3), backend.health()).await {
-                    Ok(Ok(())) => Some(backend),
-                    Ok(Err(e)) => {
-                        events.emit(KodeEvent::SourcedNote {
-                            text: format!("engineering memory unavailable: {e}"),
-                            source: NoteSource::Ingat,
-                        });
-                        None
-                    }
-                    Err(_) => {
-                        events.emit(KodeEvent::SourcedNote {
-                            text: "engineering memory unavailable: request timed out".to_string(),
-                            source: NoteSource::Ingat,
-                        });
-                        None
-                    }
+    let memory: Option<Arc<dyn EngineeringMemory>> = match runtime.memory(&config.ingat).await {
+        Ok(Some(backend)) => {
+            match tokio::time::timeout(Duration::from_secs(3), backend.health()).await {
+                Ok(Ok(())) => Some(backend),
+                Ok(Err(e)) => {
+                    runtime.forget_memory().await;
+                    events.emit(KodeEvent::SourcedNote {
+                        text: format!("engineering memory unavailable: {e}"),
+                        source: NoteSource::Ingat,
+                    });
+                    None
+                }
+                Err(_) => {
+                    runtime.forget_memory().await;
+                    events.emit(KodeEvent::SourcedNote {
+                        text: "engineering memory unavailable: request timed out".to_string(),
+                        source: NoteSource::Ingat,
+                    });
+                    None
                 }
             }
-            Ok(None) => None,
-            Err(e) => {
-                events.emit(KodeEvent::SourcedNote {
-                    text: format!("engineering memory unavailable: {e}"),
-                    source: NoteSource::Ingat,
-                });
-                None
-            }
-        };
+        }
+        Ok(None) => None,
+        Err(e) => {
+            events.emit(KodeEvent::SourcedNote {
+                text: format!("engineering memory unavailable: {e}"),
+                source: NoteSource::Ingat,
+            });
+            None
+        }
+    };
 
     let skills = Arc::new(SkillCatalog::discover(cwd));
     if !skills.is_empty() {
@@ -563,23 +578,17 @@ async fn execute_task(
     }
 
     // Generic external MCP servers (kept architecturally separate from the
-    // first-class Zindeks/Ingat integrations above). `_mcp_manager` owns the
-    // spawned child processes and must outlive the agent run.
-    let _mcp_manager = if !config.mcp.servers.is_empty() {
-        let mut notes = Vec::new();
-        let manager = kode_mcp::McpManager::connect_all(&config.mcp.servers, &mut notes).await;
-        for text in notes {
-            events.emit(KodeEvent::Note { text });
-        }
-        for handle in &manager.handles {
-            for tool in &handle.tools {
-                registry.register(tool.clone());
-            }
-        }
-        Some(manager)
-    } else {
-        None
-    };
+    // first-class Zindeks/Ingat integrations above). The session runtime
+    // owns the server processes, so they survive from task to task and the
+    // tools keep the same order in every request.
+    let mut mcp_notes = Vec::new();
+    let mcp_tools = runtime.mcp_tools(&config.mcp, &mut mcp_notes).await;
+    for text in mcp_notes {
+        events.emit(KodeEvent::Note { text });
+    }
+    for tool in mcp_tools {
+        registry.register(tool);
+    }
 
     let tools = ToolRuntime::new(registry, config.permissions.default_mode, handler.clone());
     let agent = Agent::new(model.clone(), tools, events.clone(), &agent_config)
