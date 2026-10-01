@@ -588,12 +588,12 @@ fn map_sse_json(v: &Value, state: &mut SseState) -> Vec<StreamEvent> {
 
 fn read_usage(resp: &Value, state: &mut SseState) {
     if let Some(u) = resp.get("usageMetadata") {
-        let get = |k: &str| u.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
+        let get = |k: &str| u.get(k).and_then(|n| n.as_u64());
         state.usage = Some(Usage {
-            input_tokens: get("promptTokenCount"),
-            output_tokens: get("candidatesTokenCount"),
-
-            ..Default::default()
+            input_tokens: get("promptTokenCount").unwrap_or(0),
+            output_tokens: get("candidatesTokenCount").unwrap_or(0),
+            cache_read_tokens: get("cachedContentTokenCount"),
+            cache_write_tokens: None,
         });
     }
 }
@@ -1033,5 +1033,37 @@ mod tests {
     #[test]
     fn empty_stream_is_parse_error() {
         assert!(SseState::default().finished_event().is_err());
+    }
+
+    #[test]
+    fn read_usage_reports_cached_content_tokens() {
+        let mut state = SseState::default();
+        read_usage(
+            &serde_json::json!({"usageMetadata": {
+                "promptTokenCount": 900,
+                "candidatesTokenCount": 12,
+                "cachedContentTokenCount": 512
+            }}),
+            &mut state,
+        );
+        assert_eq!(
+            state.usage,
+            Some(Usage {
+                input_tokens: 900,
+                output_tokens: 12,
+                cache_read_tokens: Some(512),
+                cache_write_tokens: None,
+            })
+        );
+
+        let mut state = SseState::default();
+        read_usage(
+            &serde_json::json!({"usageMetadata": {
+                "promptTokenCount": 5,
+                "candidatesTokenCount": 1
+            }}),
+            &mut state,
+        );
+        assert_eq!(state.usage.unwrap().cache_read_tokens, None);
     }
 }
