@@ -98,6 +98,8 @@ fn system_prompt() -> String {
 
 Environment: OS is `{os}`. `run_command` spawns the program directly with NO shell: no pipes, redirects, globs or builtins, and Unix tools such as `rg`, `grep`, `find`, `cat`, `ls`, `sed` are NOT guaranteed to exist (they usually do not on Windows). When `code_search` and `file_outline` are offered, use them first for conceptual, symbol, implementation, and call-site discovery because they query the indexed code graph. Use `git grep` through `run_command` only for exact literal matching or when code-intelligence tools are unavailable. To read exact file contents use `read_file`. Do not retry a program that was reported as not found.
 
+Tool output: long results are shortened. `read_file` returns one window and its footer gives the `offset` of the next window; call it again with that offset instead of re-reading from the start. Other tools keep the beginning and the end and mark how much was omitted in between; narrow the request (a path, a filter, a smaller range) to see the omitted part.
+
 Skills: when repository context lists available skills, call `use_skill` before taking task actions if the user names a skill (for example `$review`) or the task clearly matches a skill description. Read `SKILL.md` first, then use `use_skill` with a relative `path` for any referenced resource you need. User instructions override skill instructions.
 
 Memory: when `remember` is offered, use it before the final answer for new, durable engineering facts you verified during the task, including important findings returned by subagents after you verify or integrate them. Do not store progress updates, guesses, transient command output, raw conversation, or facts already present in recalled memory. Never set `team: true` unless the user explicitly asks to share the memory.
@@ -1288,96 +1290,180 @@ mod tests {
         shorter.len() <= longer.len() && shorter == &longer[..shorter.len()]
     }
 
-    #[tokio::test]
-    async fn auto_compact_summarizes_before_model_window_is_exhausted() {
-        let dir = temp_dir();
-        std::fs::write(dir.join("large.txt"), "important detail\n".repeat(2_500)).unwrap();
+    enum CompactionReply {
+        Summary,
+        StrayToolCall,
+    }
 
-        let mock = MockModel::new();
-        let mut tool_call = read_file_call(0, "call_1", "large.txt");
-        tool_call.push(StreamEvent::Finished {
-            reason: FinishReason::ToolCalls,
-            usage: Some(Usage {
-                input_tokens: 10,
-                output_tokens: 5,
+    /// Answers by request content instead of by position, so a test does not
+    /// depend on the exact iteration at which compaction triggers. Issues
+    /// `rounds` `read_file` calls on `f0.txt`, `f1.txt`, ... and then "done".
+    struct ReactiveModel {
+        requests: Mutex<Vec<ModelRequest>>,
+        issued: AtomicUsize,
+        rounds: usize,
+        compaction_reply: CompactionReply,
+    }
 
-                ..Default::default()
-            }),
-        });
-        mock.push_script(tool_call);
-        mock.push_script(vec![
-            StreamEvent::TextDelta(
-                "Objective: inspect large.txt. Observed: important detail repeats. Remaining: report."
-                    .to_string(),
-            ),
-            StreamEvent::Finished {
-                reason: FinishReason::Stop,
-                usage: Some(Usage {
-                    input_tokens: 11_000,
-                    output_tokens: 30,
+    impl ReactiveModel {
+        fn new(rounds: usize, compaction_reply: CompactionReply) -> Self {
+            Self {
+                requests: Mutex::new(Vec::new()),
+                issued: AtomicUsize::new(0),
+                rounds,
+                compaction_reply,
+            }
+        }
 
-                ..Default::default()
-                }),
-            },
-        ]);
-        mock.push_script(vec![
-            StreamEvent::TextDelta("done".to_string()),
-            StreamEvent::Finished {
-                reason: FinishReason::Stop,
-                usage: Some(Usage {
-                    input_tokens: 3_000,
-                    output_tokens: 4,
+        fn requests(&self) -> Vec<ModelRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
 
-                    ..Default::default()
-                }),
-            },
-        ]);
+    fn is_compaction(request: &ModelRequest) -> bool {
+        request.messages.iter().any(|message| {
+            matches!(
+                message,
+                Message::System(text) | Message::User(text)
+                    if text.contains("compacting an active coding-agent conversation")
+            )
+        })
+    }
 
-        let mock = Arc::new(mock);
-        let events = EventBus::new(64);
-        let mut rx = events.subscribe();
+    #[async_trait::async_trait]
+    impl Model for ReactiveModel {
+        async fn stream(&self, request: ModelRequest) -> kode_model::Result<ModelStream> {
+            let compaction = is_compaction(&request);
+            self.requests.lock().unwrap().push(request);
+
+            let events = if compaction {
+                match self.compaction_reply {
+                    CompactionReply::Summary => vec![
+                        StreamEvent::TextDelta(
+                            "Objective: read the files. Observed: important detail repeats. Remaining: report."
+                                .to_string(),
+                        ),
+                        StreamEvent::Finished {
+                            reason: FinishReason::Stop,
+                            usage: None,
+                        },
+                    ],
+                    CompactionReply::StrayToolCall => {
+                        let mut call = read_file_call(0, "stray", "f0.txt");
+                        call.push(StreamEvent::Finished {
+                            reason: FinishReason::ToolCalls,
+                            usage: None,
+                        });
+                        call
+                    }
+                }
+            } else {
+                let n = self.issued.fetch_add(1, Ordering::SeqCst);
+                if n < self.rounds {
+                    let mut call = read_file_call(0, &format!("call_{n}"), &format!("f{n}.txt"));
+                    call.push(StreamEvent::Finished {
+                        reason: FinishReason::ToolCalls,
+                        usage: None,
+                    });
+                    call
+                } else {
+                    vec![
+                        StreamEvent::TextDelta("done".to_string()),
+                        StreamEvent::Finished {
+                            reason: FinishReason::Stop,
+                            usage: None,
+                        },
+                    ]
+                }
+            };
+            Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+        }
+
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities {
+                id: "reactive".to_string(),
+                supports_tools: true,
+                supports_streaming: true,
+            }
+        }
+    }
+
+    /// 6 KB files: each fits one `read_file` window, about 1,500 tokens.
+    fn write_round_files(dir: &std::path::Path, rounds: usize) {
+        for n in 0..rounds {
+            std::fs::write(
+                dir.join(format!("f{n}.txt")),
+                "important detail\n".repeat(353),
+            )
+            .unwrap();
+        }
+    }
+
+    /// A 9,000-token window leaves a 6,952-token input budget. System prompt
+    /// and tool specs take roughly 1,600, so three rounds cross the 80%
+    /// compaction trigger while still fitting. Kept this small on purpose:
+    /// compaction must be reached within the newest four rounds, which later
+    /// context trimming never masks.
+    fn compacting_agent(model: Arc<ReactiveModel>, events: EventBus) -> Agent {
         let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
         let agent_cfg = AgentConfig {
-            max_context_tokens: 12_000,
+            max_context_tokens: 9_000,
             auto_compact: true,
             ..Default::default()
         };
-        let agent = Agent::new(mock.clone(), tools, events, &agent_cfg);
+        Agent::new(model, tools, events, &agent_cfg)
+    }
+
+    #[tokio::test]
+    async fn auto_compact_summarizes_before_model_window_is_exhausted() {
+        let dir = temp_dir();
+        write_round_files(&dir, 8);
+        let model = Arc::new(ReactiveModel::new(8, CompactionReply::Summary));
+        let events = EventBus::new(256);
+        let mut rx = events.subscribe();
+        let agent = compacting_agent(model.clone(), events);
 
         let outcome = agent
-            .run_with_context("inspect large.txt", Some("CTX_KEEP"), &[], false, &ctx(dir))
+            .run_with_context("read the files", Some("CTX_KEEP"), &[], false, &ctx(dir))
             .await
             .unwrap();
         assert_eq!(outcome.final_text, "done");
-        assert_eq!(outcome.usage.input_tokens, 14_010);
+        assert_eq!(outcome.tool_calls, 8);
 
-        let requests = mock.requests();
-        assert_eq!(requests.len(), 3);
+        let requests = model.requests();
+        let at = requests
+            .iter()
+            .position(is_compaction)
+            .expect("the window must fill up and trigger compaction");
+        assert!(at > 0);
+
         // The compaction request reuses the running prefix: same tools, same
         // messages, instruction appended at the tail.
-        assert_eq!(requests[1].tools, requests[0].tools);
-        assert!(!requests[1].tools.is_empty());
-        assert!(is_prefix(&requests[0].messages, &requests[1].messages));
+        assert_eq!(requests[at].tools, requests[at - 1].tools);
+        assert!(!requests[at].tools.is_empty());
+        assert!(is_prefix(
+            &requests[at - 1].messages,
+            &requests[at].messages
+        ));
         assert!(matches!(
-            requests[1].messages.last(),
+            requests[at].messages.last(),
             Some(Message::User(text)) if text.contains("compacting an active coding-agent conversation")
         ));
-        assert!(
-            matches!(&requests[1].messages[0], Message::System(text) if text.starts_with("You are Kode"))
-        );
 
-        assert!(requests[2].messages.iter().any(|message| {
+        let after = &requests[at + 1].messages;
+        assert!(after.iter().any(|message| {
             matches!(message, Message::System(text) if text.starts_with(COMPACTED_CONTEXT_PREFIX))
         }));
-        assert!(requests[2].messages.iter().any(|message| {
-            matches!(message, Message::User(text) if text == "inspect large.txt")
-        }));
-        assert!(requests[2].messages.iter().any(|message| {
+        assert!(
+            after.iter().any(|message| {
+                matches!(message, Message::User(text) if text == "read the files")
+            })
+        );
+        assert!(after.iter().any(|message| {
             matches!(message, Message::User(text) if text.contains("CTX_KEEP"))
         }));
-        assert!(!requests[2].messages.iter().any(|message| {
-            matches!(message, Message::User(text) if text.contains("compacting an active"))
-        }));
+        assert!(!is_compaction(&requests[at + 1]));
+
         let mut saw_compaction = false;
         while let Ok(event) = rx.try_recv() {
             saw_compaction |= matches!(
@@ -1391,48 +1477,25 @@ mod tests {
     #[tokio::test]
     async fn compaction_that_calls_a_tool_falls_back_to_truncation() {
         let dir = temp_dir();
-        std::fs::write(dir.join("large.txt"), "important detail\n".repeat(2_500)).unwrap();
-
-        let mock = MockModel::new();
-        let mut tool_call = read_file_call(0, "call_1", "large.txt");
-        tool_call.push(StreamEvent::Finished {
-            reason: FinishReason::ToolCalls,
-            usage: None,
-        });
-        mock.push_script(tool_call);
-        // Compaction turn: the model ignores the instruction and calls a tool.
-        let mut stray = read_file_call(0, "call_2", "large.txt");
-        stray.push(StreamEvent::Finished {
-            reason: FinishReason::ToolCalls,
-            usage: None,
-        });
-        mock.push_script(stray);
-        mock.push_script(vec![
-            StreamEvent::TextDelta("done".to_string()),
-            StreamEvent::Finished {
-                reason: FinishReason::Stop,
-                usage: None,
-            },
-        ]);
-
-        let mock = Arc::new(mock);
-        let events = EventBus::new(64);
+        write_round_files(&dir, 8);
+        let model = Arc::new(ReactiveModel::new(8, CompactionReply::StrayToolCall));
+        let events = EventBus::new(256);
         let mut rx = events.subscribe();
-        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
-        let agent_cfg = AgentConfig {
-            max_context_tokens: 12_000,
-            auto_compact: true,
-            ..Default::default()
-        };
-        let agent = Agent::new(mock.clone(), tools, events, &agent_cfg);
+        let agent = compacting_agent(model.clone(), events);
 
-        let outcome = agent.run("inspect large.txt", &ctx(dir)).await.unwrap();
+        let outcome = agent.run("read the files", &ctx(dir)).await.unwrap();
 
         assert_eq!(outcome.final_text, "done");
         assert_eq!(
-            outcome.tool_calls, 1,
+            outcome.tool_calls, 8,
             "the stray compaction call must not execute"
         );
+        // Compaction is tried once, fails, and is not tried again.
+        assert_eq!(
+            model.requests().iter().filter(|r| is_compaction(r)).count(),
+            1
+        );
+
         let mut saw_fallback = false;
         while let Ok(event) = rx.try_recv() {
             saw_fallback |= matches!(
@@ -2109,5 +2172,12 @@ mod tests {
         let requests = mock.requests();
         assert_eq!(requests[0].cache_key, None);
         assert_eq!(requests[0].cache_anchor, None);
+    }
+
+    #[test]
+    fn system_prompt_explains_shortened_tool_output() {
+        let prompt = system_prompt();
+        assert!(prompt.contains("gives the `offset` of the next window"));
+        assert!(prompt.contains("keep the beginning and the end"));
     }
 }
