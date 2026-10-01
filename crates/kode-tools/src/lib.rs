@@ -3,6 +3,7 @@ use std::path::PathBuf;
 pub use kode_core::cancel::CancellationToken;
 
 pub mod error;
+pub mod output;
 pub mod path;
 pub mod permission;
 pub mod proc;
