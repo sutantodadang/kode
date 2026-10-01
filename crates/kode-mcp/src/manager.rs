@@ -24,10 +24,17 @@ pub struct McpServerHandle {
     pub name: String,
     #[allow(dead_code)]
     client: Arc<Mutex<McpClient>>,
-    // Kept alive so the spawned child is killed on drop; unused otherwise.
-    #[allow(dead_code)]
+    // Killed on drop. Also polled by `is_alive`.
     child: Child,
     pub tools: Vec<Arc<dyn Tool>>,
+}
+
+impl McpServerHandle {
+    /// False once the server process has exited. A handle that is not alive
+    /// must not be reused: its tools would fail on every call.
+    pub fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
 }
 
 /// Owns every successfully connected MCP server for the run's duration.
