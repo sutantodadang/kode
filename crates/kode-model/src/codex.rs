@@ -320,7 +320,7 @@ impl Model for CodexModel {
         };
 
         let body = build_body(&self.model, &request);
-        let session_id = make_session_id();
+        let session_id = session_id_for(request.cache_key.as_deref());
 
         let mut resp = self
             .send_request(&access_token, &account_id, &session_id, &body)
@@ -473,6 +473,11 @@ fn map_sse_json(v: &Value, state: &mut CodexSseState) -> Result<Vec<StreamEvent>
                 .map(|u| Usage {
                     input_tokens: u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
                     output_tokens: u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                    cache_read_tokens: u
+                        .get("input_tokens_details")
+                        .and_then(|details| details.get("cached_tokens"))
+                        .and_then(|x| x.as_u64()),
+                    cache_write_tokens: None,
                 });
             let reason = if state.saw_fn {
                 FinishReason::ToolCalls
@@ -601,6 +606,10 @@ fn build_body(model: &str, request: &ModelRequest) -> Value {
         body["reasoning"] = serde_json::json!({"effort": effort});
     }
 
+    if let Some(key) = &request.cache_key {
+        body["prompt_cache_key"] = serde_json::json!(key);
+    }
+
     body
 }
 
@@ -682,6 +691,18 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
+fn uuid_shaped(bits: u128) -> String {
+    let hex = format!("{bits:032x}");
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
 /// Generates a uuid-format (8-4-4-4-12) session id without a `uuid`
 /// dependency, mixing current-time nanoseconds with the process id.
 fn make_session_id() -> String {
@@ -696,16 +717,24 @@ fn make_session_id() -> String {
     let a = low.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ pid;
     let b = high.wrapping_add(pid).wrapping_mul(0xBF58_476D_1CE4_E5B9) ^ low.rotate_left(17);
 
-    let combined = ((a as u128) << 64) | (b as u128);
-    let hex = format!("{combined:032x}");
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
-    )
+    uuid_shaped(((a as u128) << 64) | (b as u128))
+}
+
+/// One session id per cache key, so every request of a Kode process reaches
+/// the same backend cache. Without a key each request gets a fresh id.
+fn session_id_for(cache_key: Option<&str>) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let Some(key) = cache_key else {
+        return make_session_id();
+    };
+    let half = |salt: u8| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        salt.hash(&mut hasher);
+        key.hash(&mut hasher);
+        hasher.finish()
+    };
+    uuid_shaped(((half(0) as u128) << 64) | (half(1) as u128))
 }
 
 #[cfg(test)]
@@ -732,6 +761,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
         let body = build_body("gpt-5-codex", &request);
         assert_eq!(body["input"][0]["content"][0]["type"], "input_image");
@@ -786,6 +817,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
 
         let body = build_body("gpt-5-codex", &request);
@@ -830,6 +863,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
 
         let body = build_body("gpt-5-codex", &request);
@@ -849,6 +884,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: Some("high".to_string()),
+
+            ..Default::default()
         };
 
         let body = build_body("gpt-5-codex", &request);
@@ -863,6 +900,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
 
         let body = build_body("gpt-5-codex", &request);
@@ -926,7 +965,9 @@ mod tests {
                 reason: FinishReason::Stop,
                 usage: Some(Usage {
                     input_tokens: 5,
-                    output_tokens: 7
+                    output_tokens: 7,
+
+                    ..Default::default()
                 }),
             }]
         );
@@ -1037,6 +1078,75 @@ mod tests {
         let a = make_session_id();
         let b = make_session_id();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn session_id_is_stable_for_a_cache_key() {
+        let a = session_id_for(Some("kode-1"));
+        let b = session_id_for(Some("kode-1"));
+        let other = session_id_for(Some("kode-2"));
+        assert_eq!(a, b);
+        assert_ne!(a, other);
+
+        let parts: Vec<&str> = a.split('-').collect();
+        assert_eq!(
+            parts.iter().map(|part| part.len()).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12]
+        );
+        assert!(a.chars().all(|c| c == '-' || c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn session_id_without_cache_key_stays_random() {
+        let a = session_id_for(None);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let b = session_id_for(None);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn build_body_sends_prompt_cache_key_when_set() {
+        let keyed = ModelRequest {
+            messages: vec![Message::User("hi".to_string())],
+            cache_key: Some("kode-1".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_body("gpt-5-codex", &keyed)["prompt_cache_key"],
+            serde_json::json!("kode-1")
+        );
+
+        let plain = ModelRequest {
+            messages: vec![Message::User("hi".to_string())],
+            ..Default::default()
+        };
+        assert!(
+            build_body("gpt-5-codex", &plain)
+                .get("prompt_cache_key")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn map_sse_json_completed_reads_cached_tokens() {
+        let mut state = CodexSseState::default();
+        let v: Value = serde_json::from_str(
+            r#"{"type":"response.completed","response":{"usage":{"input_tokens":900,"output_tokens":7,"input_tokens_details":{"cached_tokens":640}}}}"#,
+        )
+        .unwrap();
+        let events = map_sse_json(&v, &mut state).unwrap();
+        assert_eq!(
+            events,
+            vec![StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: Some(Usage {
+                    input_tokens: 900,
+                    output_tokens: 7,
+                    cache_read_tokens: Some(640),
+                    cache_write_tokens: None,
+                }),
+            }]
+        );
     }
 
     #[test]

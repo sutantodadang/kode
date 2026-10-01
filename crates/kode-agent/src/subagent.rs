@@ -27,6 +27,8 @@ pub struct SubagentTool {
     parent_events: EventBus,
     gate: Arc<Semaphore>,
     max_result_chars: usize,
+    system_appendix: Option<String>,
+    cache_key: Option<String>,
 }
 
 impl SubagentTool {
@@ -52,6 +54,8 @@ impl SubagentTool {
             parent_events,
             gate: Arc::new(Semaphore::new(1)),
             max_result_chars: max_result_chars.clamp(MIN_RESULT_CHARS, MAX_RESULT_CHARS),
+            system_appendix: None,
+            cache_key: None,
         }
     }
 
@@ -62,6 +66,20 @@ impl SubagentTool {
         tiers: std::collections::BTreeMap<String, Arc<dyn Model>>,
     ) -> Self {
         self.tiers.extend(tiers);
+        self
+    }
+
+    /// Text appended to each child's system prompt, e.g. the skill catalog
+    /// behind the `use_skill` tool children are offered.
+    pub fn with_system_appendix(mut self, appendix: Option<String>) -> Self {
+        self.system_appendix = appendix;
+        self
+    }
+
+    /// Root cache key. Each child derives `<key>-<child id>` so children do
+    /// not share the root's provider routing quota.
+    pub fn with_cache_key(mut self, cache_key: Option<String>) -> Self {
+        self.cache_key = cache_key;
         self
     }
 
@@ -253,7 +271,13 @@ impl Tool for SubagentTool {
         let leaf_events = EventBus::new(64);
         let mut leaf_event_rx = leaf_events.subscribe();
         let leaf = Agent::new(model, runtime, leaf_events, &self.agent_config)
-            .with_effort(self.effort.clone());
+            .with_effort(self.effort.clone())
+            .with_system_appendix(self.system_appendix.clone())
+            .with_cache_key(
+                self.cache_key
+                    .as_ref()
+                    .map(|key| format!("{key}-{}", args.id)),
+            );
         let leaf_context = format!(
             "You are leaf subagent `{id}`. Complete only the delegated task and return a concise evidence-backed result. You are not the root agent and cannot delegate. Preserve unrelated work in the shared workspace. Mode: {mode}. Declared ownership: {ownership}. Never edit outside ownership.\n\nParent context:\n{context}",
             id = args.id,
@@ -668,5 +692,57 @@ mod tests {
             "activity tail should record the tool the child already ran: {}",
             output.content
         );
+    }
+
+    #[tokio::test]
+    async fn child_gets_derived_cache_key_and_skill_catalog() {
+        let model = Arc::new(MockModel::new());
+        model.push_script(finish_script("found it"));
+
+        tool(model.clone(), EventBus::new(8))
+            .with_system_appendix(Some("SKILL_CATALOG".to_string()))
+            .with_cache_key(Some("kode-root".to_string()))
+            .execute(
+                serde_json::json!({
+                    "id": "scout",
+                    "task": "inspect the implementation"
+                }),
+                &ToolContext {
+                    workspace_root: temp_dir(),
+                    cancel: kode_core::CancellationToken::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let requests = model.requests();
+        assert_eq!(requests[0].cache_key.as_deref(), Some("kode-root-scout"));
+        assert!(matches!(
+            &requests[0].messages[0],
+            kode_model::Message::System(text) if text.ends_with("\n\nSKILL_CATALOG")
+        ));
+        // The leaf briefing is volatile, so it travels as a user message.
+        assert!(requests[0].messages.iter().any(|message| {
+            matches!(message, kode_model::Message::User(text) if text.contains("You are leaf subagent `scout`"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn child_without_root_cache_key_sends_no_hint() {
+        let model = Arc::new(MockModel::new());
+        model.push_script(finish_script("found it"));
+
+        tool(model.clone(), EventBus::new(8))
+            .execute(
+                serde_json::json!({"id": "scout", "task": "inspect"}),
+                &ToolContext {
+                    workspace_root: temp_dir(),
+                    cancel: kode_core::CancellationToken::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(model.requests()[0].cache_key, None);
     }
 }

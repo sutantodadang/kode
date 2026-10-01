@@ -491,6 +491,8 @@ pub(crate) fn submit_task(
         })
         .collect();
     let task_child = child.clone();
+    let task_cache_key = state.cache_key.clone();
+    let task_runtime = state.runtime.clone();
     tokio::spawn(async move {
         if let Err(message) = guard_task(pipeline::run_task_with_input(
             &task,
@@ -502,6 +504,8 @@ pub(crate) fn submit_task(
             &task_history,
             plan_mode,
             Some(steering_rx),
+            Some(task_cache_key),
+            &task_runtime,
         ))
         .await
         {

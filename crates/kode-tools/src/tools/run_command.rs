@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -5,14 +6,19 @@ use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::error::{Result, ToolError};
+use crate::output::clip;
 use crate::path::resolve_in_workspace;
 use crate::proc::{scrub_env, spawn_managed};
 use crate::{RequiredPermission, Tool, ToolContext, ToolOutput};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
-const MAX_OUTPUT_CHARS: usize = 50_000;
-const MAX_CAPTURE_BYTES: usize = MAX_OUTPUT_CHARS * 4;
-const OUTPUT_TRUNCATED_MARKER: &str = "\n[truncated]";
+/// Bytes kept from the start and from the end of each stream while the
+/// child runs. The middle of a very long stream is dropped as it arrives, so
+/// memory stays bounded however much the program prints.
+const CAPTURE_HEAD_BYTES: usize = 16_000;
+const CAPTURE_TAIL_BYTES: usize = 16_000;
+/// Share of the tool result given to each of stdout and stderr.
+const STREAM_OUTPUT_BYTES: usize = 3_600;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -25,45 +31,46 @@ struct Args {
 
 pub struct RunCommand;
 
-async fn read_bounded<R: AsyncRead + Unpin>(
-    mut reader: R,
-    max_bytes: usize,
-) -> std::io::Result<String> {
-    let mut captured = Vec::with_capacity(max_bytes.min(8192));
+/// Drains `reader` to the end, keeping its first [`CAPTURE_HEAD_BYTES`] and
+/// last [`CAPTURE_TAIL_BYTES`], then shapes the text to
+/// [`STREAM_OUTPUT_BYTES`]. Failure summaries sit at the end of long output,
+/// so the tail matters as much as the head.
+async fn read_bounded<R: AsyncRead + Unpin>(mut reader: R) -> std::io::Result<String> {
+    let mut head: Vec<u8> = Vec::with_capacity(8192);
+    let mut tail: VecDeque<u8> = VecDeque::new();
+    let mut dropped = 0_usize;
     let mut buffer = [0_u8; 8192];
-    let mut truncated = false;
 
     loop {
         let read = reader.read(&mut buffer).await?;
         if read == 0 {
             break;
         }
-
-        let remaining = max_bytes.saturating_sub(captured.len());
-        if remaining > 0 {
-            captured.extend_from_slice(&buffer[..read.min(remaining)]);
-        }
-        if read > remaining {
-            truncated = true;
+        let chunk = &buffer[..read];
+        let to_head = (CAPTURE_HEAD_BYTES - head.len()).min(chunk.len());
+        head.extend_from_slice(&chunk[..to_head]);
+        tail.extend(&chunk[to_head..]);
+        if tail.len() > CAPTURE_TAIL_BYTES {
+            let excess = tail.len() - CAPTURE_TAIL_BYTES;
+            tail.drain(..excess);
+            dropped += excess;
         }
     }
 
-    let output = String::from_utf8_lossy(&captured).into_owned();
-    Ok(truncate_chars(output, truncated))
-}
-
-fn truncate_chars(s: String, bytes_were_discarded: bool) -> String {
-    let char_count = s.chars().count();
-    if !bytes_were_discarded && char_count <= MAX_OUTPUT_CHARS {
-        return s;
-    }
-
-    // The marker is part of the public output limit, rather than an
-    // unaccounted suffix that pushes an allegedly bounded result over it.
-    let keep_chars = MAX_OUTPUT_CHARS.saturating_sub(OUTPUT_TRUNCATED_MARKER.chars().count());
-    let mut truncated: String = s.chars().take(keep_chars).collect();
-    truncated.push_str(OUTPUT_TRUNCATED_MARKER);
-    truncated
+    let tail: Vec<u8> = tail.into();
+    let text = if dropped == 0 {
+        // Contiguous bytes: decode once so a character split between the two
+        // buffers is not damaged.
+        head.extend_from_slice(&tail);
+        String::from_utf8_lossy(&head).into_owned()
+    } else {
+        format!(
+            "{}\n[... {dropped} bytes not captured ...]\n{}",
+            String::from_utf8_lossy(&head),
+            String::from_utf8_lossy(&tail)
+        )
+    };
+    Ok(clip(&text, STREAM_OUTPUT_BYTES))
 }
 
 #[async_trait::async_trait]
@@ -156,8 +163,8 @@ impl Tool for RunCommand {
             .stderr
             .take()
             .ok_or_else(|| std::io::Error::other("child stderr was not piped"))?;
-        let mut stdout_task = tokio::spawn(read_bounded(stdout, MAX_CAPTURE_BYTES));
-        let mut stderr_task = tokio::spawn(read_bounded(stderr, MAX_CAPTURE_BYTES));
+        let mut stdout_task = tokio::spawn(read_bounded(stdout));
+        let mut stderr_task = tokio::spawn(read_bounded(stderr));
 
         // Race the child's exit AND the output drain together. A detached
         // grandchild (e.g. `cmd /c start /b server.exe`) exits its parent
@@ -218,20 +225,40 @@ mod tests {
         }
     }
 
-    #[test]
-    fn truncation_marker_is_included_in_character_limit() {
-        let output = truncate_chars("x".repeat(MAX_OUTPUT_CHARS + 1), false);
-
-        assert_eq!(output.chars().count(), MAX_OUTPUT_CHARS);
-        assert!(output.ends_with(OUTPUT_TRUNCATED_MARKER));
+    #[tokio::test]
+    async fn short_stream_is_captured_exactly() {
+        let captured = read_bounded(&b"hello\nworld\n"[..]).await.unwrap();
+        assert_eq!(captured, "hello\nworld\n");
     }
 
-    #[test]
-    fn byte_discard_is_reported_even_when_decoded_text_is_short() {
-        let output = truncate_chars("short".to_string(), true);
+    #[tokio::test]
+    async fn long_stream_keeps_first_and_last_lines() {
+        let text: String = (1..=50_000).map(|n| format!("line {n}\n")).collect();
+        let captured = read_bounded(text.as_bytes()).await.unwrap();
 
-        assert!(output.ends_with(OUTPUT_TRUNCATED_MARKER));
-        assert!(output.chars().count() <= MAX_OUTPUT_CHARS);
+        assert!(captured.len() <= STREAM_OUTPUT_BYTES, "{}", captured.len());
+        assert!(captured.starts_with("line 1\n"));
+        assert!(captured.ends_with("line 50000\n"));
+        assert!(captured.contains("omitted"));
+    }
+
+    #[tokio::test]
+    async fn multibyte_stream_stays_valid_at_the_seam() {
+        let text = "é".repeat(100_000);
+        let captured = read_bounded(text.as_bytes()).await.unwrap();
+
+        assert!(captured.len() <= STREAM_OUTPUT_BYTES);
+        assert!(captured.starts_with('é'));
+        assert!(captured.ends_with('é'));
+    }
+
+    #[tokio::test]
+    async fn stream_just_under_capture_size_has_no_seam_damage() {
+        // Fits in head + tail capture. The leading ASCII byte shifts every
+        // two-byte character so the head/tail split lands mid-character.
+        let text = format!("a{}", "é".repeat((CAPTURE_HEAD_BYTES + 1_000) / 2));
+        let captured = read_bounded(text.as_bytes()).await.unwrap();
+        assert!(!captured.contains('\u{FFFD}'));
     }
 
     #[tokio::test]

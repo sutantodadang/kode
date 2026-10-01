@@ -19,6 +19,7 @@ use kode_tools::tools::UseSkill;
 use tokio::sync::mpsc;
 
 use crate::intel_tools::{CodeSearchTool, FileOutlineTool};
+use crate::session_runtime::SessionRuntime;
 
 /// Appended to the task text for the plan-mode turn (see
 /// [`run_plan_phase`]). The turn exposes no implementation tools; only the
@@ -37,6 +38,16 @@ fn format_token_count(tokens: u32) -> String {
     } else {
         format!("{:.1}m", tokens as f64 / 1_000_000.0)
     }
+}
+
+/// One cache key per Kode process. Providers use it to route every request
+/// of this process to the same warm prompt cache.
+pub(crate) fn new_cache_key() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("kode-{}-{nanos}", std::process::id())
 }
 
 fn should_report_context_budget(provider: &str, model: &str, window: u32) -> bool {
@@ -257,6 +268,7 @@ pub async fn run_task(
     plan_mode: bool,
     steering: Option<mpsc::UnboundedReceiver<UserInput>>,
 ) -> anyhow::Result<TaskOutcome> {
+    let runtime = SessionRuntime::new();
     run_task_with_input(
         &UserInput::text(task),
         cwd,
@@ -267,6 +279,8 @@ pub async fn run_task(
         history,
         plan_mode,
         steering,
+        None,
+        &runtime,
     )
     .await
 }
@@ -282,6 +296,8 @@ pub async fn run_task_with_input(
     history: &[kode_agent::HistoryTurn],
     plan_mode: bool,
     steering: Option<mpsc::UnboundedReceiver<UserInput>>,
+    cache_key: Option<String>,
+    runtime: &SessionRuntime,
 ) -> anyhow::Result<TaskOutcome> {
     let routed = crate::routing::route_task(input, cwd, config, plan_mode, &events, &cancel).await;
     let result = execute_task(
@@ -296,6 +312,8 @@ pub async fn run_task_with_input(
         steering,
         config,
         routed.reranker,
+        cache_key,
+        runtime,
     )
     .await;
     if let Some(decision) = &routed.decision
@@ -358,6 +376,8 @@ async fn execute_task(
     mut steering: Option<mpsc::UnboundedReceiver<UserInput>>,
     fallback_config: &KodeConfig,
     reranker: Option<Arc<dyn kode_context::ContextReranker>>,
+    cache_key: Option<String>,
+    runtime: &SessionRuntime,
 ) -> anyhow::Result<TaskOutcome> {
     let model = match ModelFactory::create(config) {
         Ok(model) => model,
@@ -409,64 +429,73 @@ async fn execute_task(
     // (as an incremental refresh) after edits. The trait exposes lifecycle
     // parity, so no concrete adapter type is retained here.
     let mut bound_backend: Option<Arc<dyn CodeIntelligence>> = None;
-    let intel: Option<Arc<dyn CodeIntelligence>> = if config.zindeks.enabled {
-        match crate::intel_backend::connect(&config.zindeks, cwd).await {
-            Ok(Some(backend)) => match backend.ensure_bound().await {
+    let intel: Option<Arc<dyn CodeIntelligence>> = match runtime.intel(&config.zindeks, cwd).await {
+        Ok(Some(handle)) => {
+            // A reused handle is already bound. Without the watcher it
+            // still needs a refresh to see edits made between tasks.
+            let bind = if handle.fresh || !handle.backend.watching() {
+                handle.backend.ensure_bound().await
+            } else {
+                Ok(())
+            };
+            match bind {
                 Ok(()) => {
-                    bound_backend = Some(backend.clone());
-                    Some(backend)
+                    bound_backend = Some(handle.backend.clone());
+                    Some(handle.backend)
                 }
                 Err(e) => {
+                    // Do not keep a backend that could not bind: the
+                    // next task must try again, e.g. after `kode index`.
+                    runtime.forget_intel().await;
                     events.emit(KodeEvent::SourcedNote {
                         text: format!("code intelligence unavailable: {e}"),
                         source: NoteSource::Zindeks,
                     });
                     None
                 }
-            },
-            Ok(None) => None,
-            Err(e) => {
-                events.emit(KodeEvent::SourcedNote {
-                    text: format!("code intelligence unavailable: {e}"),
-                    source: NoteSource::Zindeks,
-                });
-                None
             }
         }
-    } else {
-        None
+        Ok(None) => None,
+        Err(e) => {
+            events.emit(KodeEvent::SourcedNote {
+                text: format!("code intelligence unavailable: {e}"),
+                source: NoteSource::Zindeks,
+            });
+            None
+        }
     };
 
-    let memory: Option<Arc<dyn EngineeringMemory>> =
-        match crate::memory_backend::connect(&config.ingat).await {
-            Ok(Some(backend)) => {
-                match tokio::time::timeout(Duration::from_secs(3), backend.health()).await {
-                    Ok(Ok(())) => Some(backend),
-                    Ok(Err(e)) => {
-                        events.emit(KodeEvent::SourcedNote {
-                            text: format!("engineering memory unavailable: {e}"),
-                            source: NoteSource::Ingat,
-                        });
-                        None
-                    }
-                    Err(_) => {
-                        events.emit(KodeEvent::SourcedNote {
-                            text: "engineering memory unavailable: request timed out".to_string(),
-                            source: NoteSource::Ingat,
-                        });
-                        None
-                    }
+    let memory: Option<Arc<dyn EngineeringMemory>> = match runtime.memory(&config.ingat).await {
+        Ok(Some(backend)) => {
+            match tokio::time::timeout(Duration::from_secs(3), backend.health()).await {
+                Ok(Ok(())) => Some(backend),
+                Ok(Err(e)) => {
+                    runtime.forget_memory().await;
+                    events.emit(KodeEvent::SourcedNote {
+                        text: format!("engineering memory unavailable: {e}"),
+                        source: NoteSource::Ingat,
+                    });
+                    None
+                }
+                Err(_) => {
+                    runtime.forget_memory().await;
+                    events.emit(KodeEvent::SourcedNote {
+                        text: "engineering memory unavailable: request timed out".to_string(),
+                        source: NoteSource::Ingat,
+                    });
+                    None
                 }
             }
-            Ok(None) => None,
-            Err(e) => {
-                events.emit(KodeEvent::SourcedNote {
-                    text: format!("engineering memory unavailable: {e}"),
-                    source: NoteSource::Ingat,
-                });
-                None
-            }
-        };
+        }
+        Ok(None) => None,
+        Err(e) => {
+            events.emit(KodeEvent::SourcedNote {
+                text: format!("engineering memory unavailable: {e}"),
+                source: NoteSource::Ingat,
+            });
+            None
+        }
+    };
 
     let skills = Arc::new(SkillCatalog::discover(cwd));
     if !skills.is_empty() {
@@ -474,6 +503,10 @@ async fn execute_task(
             text: format!("{} skills available", skills.len()),
         });
     }
+
+    // Part of the cached system prefix: identical for every task while the
+    // skill set is unchanged.
+    let skill_summary = skills.prompt_summary();
 
     let effort = if config.model.effort.is_empty() {
         None
@@ -538,32 +571,30 @@ async fn execute_task(
                 events.clone(),
                 agent_config.subagents.max_result_chars,
             )
-            .with_model_tiers(tiers),
+            .with_model_tiers(tiers)
+            .with_system_appendix(skill_summary.clone())
+            .with_cache_key(cache_key.clone()),
         ));
     }
 
     // Generic external MCP servers (kept architecturally separate from the
-    // first-class Zindeks/Ingat integrations above). `_mcp_manager` owns the
-    // spawned child processes and must outlive the agent run.
-    let _mcp_manager = if !config.mcp.servers.is_empty() {
-        let mut notes = Vec::new();
-        let manager = kode_mcp::McpManager::connect_all(&config.mcp.servers, &mut notes).await;
-        for text in notes {
-            events.emit(KodeEvent::Note { text });
-        }
-        for handle in &manager.handles {
-            for tool in &handle.tools {
-                registry.register(tool.clone());
-            }
-        }
-        Some(manager)
-    } else {
-        None
-    };
+    // first-class Zindeks/Ingat integrations above). The session runtime
+    // owns the server processes, so they survive from task to task and the
+    // tools keep the same order in every request.
+    let mut mcp_notes = Vec::new();
+    let mcp_tools = runtime.mcp_tools(&config.mcp, &mut mcp_notes).await;
+    for text in mcp_notes {
+        events.emit(KodeEvent::Note { text });
+    }
+    for tool in mcp_tools {
+        registry.register(tool);
+    }
 
     let tools = ToolRuntime::new(registry, config.permissions.default_mode, handler.clone());
-    let agent =
-        Agent::new(model.clone(), tools, events.clone(), &agent_config).with_effort(effort.clone());
+    let agent = Agent::new(model.clone(), tools, events.clone(), &agent_config)
+        .with_effort(effort.clone())
+        .with_system_appendix(skill_summary.clone())
+        .with_cache_key(cache_key.clone());
 
     events.emit(KodeEvent::ContextCompilationStarted);
     let mut compiler =
@@ -574,11 +605,12 @@ async fn execute_task(
             Duration::from_millis(config.router.rerank_timeout_ms),
         );
     }
+    let working_set = working_set_from(kode_context::git::repo_state(cwd).await);
     let compiled = compiler
         .compile(
             &ContextRequest {
                 task: input.text.clone(),
-                working_set: vec![],
+                working_set,
             },
             cwd,
         )
@@ -602,8 +634,7 @@ async fn execute_task(
         done: true,
     });
 
-    let skill_summary = skills.prompt_summary();
-    let initial_context = merge_agent_context(compiled.render(), skill_summary.as_deref());
+    let initial_context = compiled.render();
 
     let (kept_history, history_truncated) =
         kode_agent::select_history(history, agent_config.history_budget_tokens as usize);
@@ -631,6 +662,8 @@ async fn execute_task(
             &ctx,
             steering.as_mut(),
             Some(skills.clone()),
+            skill_summary.clone(),
+            cache_key.clone(),
         )
         .await?;
 
@@ -645,6 +678,7 @@ async fn execute_task(
                     tool_calls: outcome.tool_calls,
                     input_tokens: outcome.usage.input_tokens,
                     output_tokens: outcome.usage.output_tokens,
+                    cached_tokens: outcome.usage.cache_read_tokens,
                 });
                 return Ok(TaskOutcome {
                     status: TaskStatus::Cancelled,
@@ -731,11 +765,12 @@ async fn execute_task(
                 }
             }
             events.emit(KodeEvent::ContextCompilationStarted);
+            let repair_working_set = working_set_from(kode_context::git::repo_state(cwd).await);
             let repair_context = compiler
                 .compile(
                     &ContextRequest {
                         task: retry_task.text.clone(),
-                        working_set: vec![],
+                        working_set: repair_working_set,
                     },
                     cwd,
                 )
@@ -744,8 +779,7 @@ async fn execute_task(
                 token_estimate: repair_context.token_estimate(),
                 sections: repair_context.sections.len(),
             });
-            let repair_agent_context =
-                merge_agent_context(repair_context.render(), skill_summary.as_deref());
+            let repair_agent_context = repair_context.render();
 
             let retry_outcome = agent
                 .run_with_context_and_steering(
@@ -776,13 +810,12 @@ async fn execute_task(
         }
     }
 
-    let (iterations, tool_calls, input_tokens, output_tokens, mutated_any) = match &outcome2 {
+    let (iterations, tool_calls, usage, mutated_any) = match &outcome2 {
         Some(o2) => combine_outcomes(&outcome1, o2),
         None => (
             outcome1.iterations,
             outcome1.tool_calls,
-            outcome1.usage.input_tokens,
-            outcome1.usage.output_tokens,
+            outcome1.usage,
             outcome1.mutated,
         ),
     };
@@ -815,8 +848,9 @@ async fn execute_task(
     events.emit(KodeEvent::TaskFinished {
         iterations,
         tool_calls,
-        input_tokens,
-        output_tokens,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cached_tokens: usage.cache_read_tokens,
     });
 
     Ok(TaskOutcome {
@@ -826,10 +860,7 @@ async fn execute_task(
         repair_attempted: outcome2.is_some(),
         iterations,
         tool_calls,
-        usage: Usage {
-            input_tokens,
-            output_tokens,
-        },
+        usage,
     })
 }
 
@@ -849,15 +880,6 @@ fn close_and_defer_steering(
     }
     if !messages.is_empty() {
         events.emit(KodeEvent::SteeringDeferred { messages });
-    }
-}
-
-fn merge_agent_context(repository: Option<String>, skills: Option<&str>) -> Option<String> {
-    match (repository, skills) {
-        (Some(repository), Some(skills)) => Some(format!("{repository}\n\n{skills}")),
-        (Some(repository), None) => Some(repository),
-        (None, Some(skills)) => Some(skills.to_string()),
-        (None, None) => None,
     }
 }
 
@@ -898,6 +920,8 @@ async fn run_plan_phase(
     ctx: &ToolContext,
     steering: Option<&mut mpsc::UnboundedReceiver<UserInput>>,
     skills: Option<Arc<SkillCatalog>>,
+    system_appendix: Option<String>,
+    cache_key: Option<String>,
 ) -> anyhow::Result<PlanOutcome> {
     // No implementation tools are offered on this turn. `Deny` still permits
     // the optional read-only `use_skill` tool.
@@ -906,7 +930,10 @@ async fn run_plan_phase(
         registry.register(Arc::new(UseSkill::new(skills)));
     }
     let tools = ToolRuntime::new(registry, PermissionMode::Deny, handler.clone());
-    let plan_agent = Agent::new(model, tools, events.clone(), agent_cfg).with_effort(effort);
+    let plan_agent = Agent::new(model, tools, events.clone(), agent_cfg)
+        .with_effort(effort)
+        .with_system_appendix(system_appendix)
+        .with_cache_key(cache_key);
 
     let plan_prompt = UserInput {
         text: format!("{}\n\n{PLAN_INSTRUCTION}", task.text),
@@ -971,19 +998,38 @@ fn verification_status(verdict: Verdict) -> VerificationStatus {
 
 /// Aggregates two agent runs (initial + retry) into the metrics
 /// `TaskFinished` reports: summed iterations, summed tool calls, summed
-/// input/output tokens, and `mutated` OR'd across both runs (a mutation in
-/// either run means the workspace changed).
+/// usage, and `mutated` OR'd across both runs (a mutation in either run
+/// means the workspace changed).
 fn combine_outcomes(
     a: &kode_agent::AgentOutcome,
     b: &kode_agent::AgentOutcome,
-) -> (u32, u32, u64, u64, bool) {
+) -> (u32, u32, Usage, bool) {
+    let mut usage = a.usage;
+    usage += b.usage;
     (
         a.iterations + b.iterations,
         a.tool_calls + b.tool_calls,
-        a.usage.input_tokens + b.usage.input_tokens,
-        a.usage.output_tokens + b.usage.output_tokens,
+        usage,
         a.mutated || b.mutated,
     )
+}
+
+const WORKING_SET_MAX: usize = 20;
+
+/// Files with uncommitted changes: the best available signal for what the
+/// user is working on. Code retrieval ranks toward them. Empty outside a
+/// git repository.
+fn working_set_from(state: Option<kode_context::git::RepoState>) -> Vec<String> {
+    state
+        .map(|state| {
+            state
+                .numstat
+                .into_iter()
+                .take(WORKING_SET_MAX)
+                .map(|row| row.path)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Builds a `KodeEvent::Knowledge` digest from a compiled context. Pure —
@@ -1181,15 +1227,44 @@ mod plan_phase_tests {
     use kode_tools::permission::{AutoApprove, AutoDeny};
 
     #[test]
-    fn skill_catalog_is_appended_to_repository_context() {
-        assert_eq!(
-            merge_agent_context(Some("repo".to_string()), Some("skills")),
-            Some("repo\n\nskills".to_string())
-        );
-        assert_eq!(
-            merge_agent_context(None, Some("skills")),
-            Some("skills".to_string())
-        );
+    fn cache_keys_are_process_scoped_and_distinct() {
+        let a = new_cache_key();
+        let b = new_cache_key();
+        assert!(a.starts_with(&format!("kode-{}-", std::process::id())));
+        assert_ne!(a, b);
+    }
+
+    #[tokio::test]
+    async fn plan_phase_forwards_appendix_and_cache_key() {
+        let dir = temp_dir("hints");
+        let mock = Arc::new(MockModel::new());
+        mock.push_script(plan_script("1. do the thing"));
+
+        run_plan_phase(
+            mock.clone(),
+            &EventBus::new(64),
+            Arc::new(AutoApprove),
+            &AgentConfig::default(),
+            None,
+            &UserInput::text("add a widget"),
+            Some("CTX"),
+            &[],
+            false,
+            &ctx(dir),
+            None,
+            None,
+            Some("SKILL_CATALOG".to_string()),
+            Some("kode-plan".to_string()),
+        )
+        .await
+        .unwrap();
+
+        let requests = mock.requests();
+        assert_eq!(requests[0].cache_key.as_deref(), Some("kode-plan"));
+        assert!(matches!(
+            &requests[0].messages[0],
+            Message::System(text) if text.ends_with("\n\nSKILL_CATALOG")
+        ));
     }
 
     #[test]
@@ -1259,6 +1334,8 @@ mod plan_phase_tests {
             &ctx(dir),
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1310,6 +1387,8 @@ mod plan_phase_tests {
             &ctx(dir),
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1344,6 +1423,8 @@ mod verification_tests {
             usage: Usage {
                 input_tokens: input,
                 output_tokens: output,
+
+                ..Default::default()
             },
             mutated,
         }
@@ -1369,16 +1450,17 @@ mod verification_tests {
 
     #[test]
     fn combine_outcomes_sums_metrics_and_ors_mutated() {
-        let a = outcome(3, 5, 100, 200, true);
+        let mut a = outcome(3, 5, 100, 200, true);
+        a.usage.cache_read_tokens = Some(60);
         let b = outcome(2, 4, 50, 75, false);
 
-        let (iterations, tool_calls, input_tokens, output_tokens, mutated) =
-            combine_outcomes(&a, &b);
+        let (iterations, tool_calls, usage, mutated) = combine_outcomes(&a, &b);
 
         assert_eq!(iterations, 5);
         assert_eq!(tool_calls, 9);
-        assert_eq!(input_tokens, 150);
-        assert_eq!(output_tokens, 275);
+        assert_eq!(usage.input_tokens, 150);
+        assert_eq!(usage.output_tokens, 275);
+        assert_eq!(usage.cache_read_tokens, Some(60));
         assert!(mutated);
     }
 
@@ -1387,8 +1469,56 @@ mod verification_tests {
         let a = outcome(1, 1, 10, 10, false);
         let b = outcome(1, 1, 10, 10, false);
 
-        let (.., mutated) = combine_outcomes(&a, &b);
+        let (.., usage, mutated) = combine_outcomes(&a, &b);
         assert!(!mutated);
+        assert_eq!(usage.cache_read_tokens, None);
+    }
+
+    fn row(path: &str) -> kode_context::git::NumstatRow {
+        kode_context::git::NumstatRow {
+            path: path.to_string(),
+            added: 1,
+            deleted: 0,
+        }
+    }
+
+    #[test]
+    fn working_set_is_empty_outside_a_repository() {
+        assert!(working_set_from(None).is_empty());
+    }
+
+    #[test]
+    fn working_set_lists_changed_files_in_git_order() {
+        let state = kode_context::git::RepoState {
+            dirty: true,
+            numstat: vec![row("src/b.rs"), row("src/a.rs")],
+        };
+        assert_eq!(working_set_from(Some(state)), vec!["src/b.rs", "src/a.rs"]);
+    }
+
+    #[test]
+    fn working_set_is_capped() {
+        let state = kode_context::git::RepoState {
+            dirty: true,
+            numstat: (0..50).map(|n| row(&format!("src/f{n}.rs"))).collect(),
+        };
+        let set = working_set_from(Some(state));
+        assert_eq!(set.len(), WORKING_SET_MAX);
+        assert_eq!(set[0], "src/f0.rs");
+    }
+
+    #[tokio::test]
+    async fn working_set_of_a_non_repository_directory_is_empty() {
+        let dir = std::env::temp_dir().join(format!(
+            "kode-working-set-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(working_set_from(kode_context::git::repo_state(&dir).await).is_empty());
     }
 }
 

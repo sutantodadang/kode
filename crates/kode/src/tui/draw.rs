@@ -228,6 +228,13 @@ fn compact_tokens(tokens: usize) -> String {
     }
 }
 
+fn cached_label(cached: Option<u64>) -> String {
+    match cached {
+        Some(tokens) => format!("{} cached", compact_tokens(tokens as usize)),
+        None => "cached ? not reported".to_string(),
+    }
+}
+
 /// The running glyph advances every 250 ms (4 frames per turn); every
 /// running glyph shares this one phase.
 pub(crate) fn spinner_frame(elapsed_ms: u128) -> char {
@@ -1384,8 +1391,9 @@ pub(crate) fn focus_surface_lines(state: &AppState) -> Vec<Line<'static>> {
         } else {
             Line::from(Span::styled(
                 format!(
-                    " {} in · {} out",
+                    " {} in ({}) · {} out",
                     compact_tokens(receipt.input_tokens as usize),
+                    cached_label(receipt.cached_tokens),
                     compact_tokens(receipt.output_tokens as usize)
                 ),
                 Style::default().fg(theme::MUTED),

@@ -186,6 +186,8 @@ fn contextual_workbench_renders_major_states_at_60_by_20() {
             tool_calls: 5,
             input_tokens: 100,
             output_tokens: 50,
+
+            cached_tokens: None,
         },
     );
     render_at_minimum_size(&mut completed);
@@ -310,6 +312,8 @@ fn steered_model_responses_are_separated_in_saved_response() {
             tool_calls: 0,
             input_tokens: 0,
             output_tokens: 0,
+
+            cached_tokens: None,
         },
     );
 
@@ -326,6 +330,8 @@ fn completion_does_not_report_unknown_usage_as_zero() {
             tool_calls: 0,
             input_tokens: 0,
             output_tokens: 0,
+
+            cached_tokens: None,
         },
     );
     let receipt = focus_surface_lines(&s)
@@ -623,6 +629,8 @@ fn task_finished_updates_counters_and_ends_run() {
             tool_calls: 5,
             input_tokens: 100,
             output_tokens: 50,
+
+            cached_tokens: None,
         },
     );
     assert!(!s.running);
@@ -1394,6 +1402,8 @@ fn composer_mode_names_the_next_enter_action() {
             tool_calls: 0,
             input_tokens: 5,
             output_tokens: 2,
+
+            cached_tokens: None,
         },
     );
     assert_eq!(s.composer_mode(), ComposerMode::FollowUp);
@@ -1416,6 +1426,8 @@ fn receipts_remain_visible_while_composing_and_clear_on_submission() {
             tool_calls: 0,
             input_tokens: 5,
             output_tokens: 2,
+
+            cached_tokens: None,
         },
     );
     assert!(s.completion.is_some());
@@ -2491,6 +2503,8 @@ fn apply_repo_state_refreshes_completion_receipt_numstat() {
             tool_calls: 2,
             input_tokens: 10,
             output_tokens: 4,
+
+            cached_tokens: None,
         },
     );
     apply_repo_state(
@@ -3310,6 +3324,8 @@ fn task_finished_swaps_flushed_prose_into_last_response() {
             tool_calls: 0,
             input_tokens: 10,
             output_tokens: 5,
+
+            cached_tokens: None,
         },
     );
     assert_eq!(s.last_response, "done here");
@@ -3362,6 +3378,8 @@ fn task_finished_appends_turn_to_in_memory_history() {
             tool_calls: 2,
             input_tokens: 10,
             output_tokens: 5,
+
+            cached_tokens: None,
         },
     );
     record_completed_turn(&mut s, &dir, "codex", "gpt-test", 2);
@@ -3392,6 +3410,8 @@ fn task_finished_appends_turn_to_in_memory_history() {
             tool_calls: 0,
             input_tokens: 1,
             output_tokens: 1,
+
+            cached_tokens: None,
         },
     );
     record_completed_turn(&mut s, &dir, "codex", "gpt-test", 0);
@@ -4207,6 +4227,8 @@ fn receipt_zero_tokens_and_skipped_check_are_honest() {
             tool_calls: 0,
             input_tokens: 0,
             output_tokens: 0,
+
+            cached_tokens: None,
         },
     );
     let text = focus_surface_lines(&s)
@@ -4392,4 +4414,53 @@ fn transcript_cache_settles_after_animation_window() {
     cache.update(&transcript, 100, ctx(now + Duration::from_secs(1)));
     assert!(render(&cache).contains("index refreshed"));
     assert!(cache.probe(0).unwrap().1);
+}
+
+#[test]
+fn receipt_shows_reported_cached_tokens() {
+    let mut s = state();
+    apply_event(
+        &mut s,
+        KodeEvent::TaskFinished {
+            iterations: 3,
+            tool_calls: 5,
+            input_tokens: 12_400,
+            output_tokens: 1_200,
+            cached_tokens: Some(9_100),
+        },
+    );
+    let receipt = focus_surface_lines(&s)
+        .iter()
+        .map(line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        receipt.contains("12.4k in (9.1k cached) · 1.2k out"),
+        "{receipt}"
+    );
+}
+
+#[test]
+fn receipt_never_shows_unreported_cache_as_zero() {
+    let mut s = state();
+    apply_event(
+        &mut s,
+        KodeEvent::TaskFinished {
+            iterations: 3,
+            tool_calls: 5,
+            input_tokens: 12_400,
+            output_tokens: 1_200,
+            cached_tokens: None,
+        },
+    );
+    let receipt = focus_surface_lines(&s)
+        .iter()
+        .map(line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        receipt.contains("12.4k in (cached ? not reported) · 1.2k out"),
+        "{receipt}"
+    );
+    assert!(!receipt.contains("0 cached"), "{receipt}");
 }

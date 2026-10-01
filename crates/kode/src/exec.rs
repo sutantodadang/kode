@@ -186,10 +186,14 @@ pub async fn run(
                     tool_calls,
                     input_tokens,
                     output_tokens,
+                    cached_tokens,
                 }) => {
+                    let cached = match cached_tokens {
+                        Some(tokens) => format!("{tokens} cached"),
+                        None => "cached ? not reported".to_string(),
+                    };
                     eprintln!(
-                        "— {} iterations, {} tool calls, {}→{} tokens",
-                        iterations, tool_calls, input_tokens, output_tokens
+                        "— {iterations} iterations, {tool_calls} tool calls, {input_tokens}→{output_tokens} tokens ({cached})"
                     );
                     final_tool_calls = tool_calls;
                 }
@@ -209,6 +213,7 @@ pub async fn run(
         (response_buf, final_tool_calls)
     });
 
+    let runtime = crate::session_runtime::SessionRuntime::new();
     let result = pipeline::run_task_with_input(
         &input,
         cwd,
@@ -219,6 +224,8 @@ pub async fn run(
         &history_turns,
         plan_mode,
         None,
+        Some(pipeline::new_cache_key()),
+        &runtime,
     )
     .await;
 

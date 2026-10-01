@@ -296,6 +296,7 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             tool_calls,
             input_tokens,
             output_tokens,
+            cached_tokens,
         } => {
             let elapsed_ms = state
                 .run_started
@@ -306,6 +307,7 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
                 tool_calls,
                 input_tokens,
                 output_tokens,
+                cached_tokens,
                 elapsed_ms,
                 verify_steps: state.ledger.verify_steps.clone(),
                 numstat: state.ledger.numstat.clone(),

@@ -432,7 +432,10 @@ async fn anthropic_sse_step(
 
 #[derive(Default)]
 struct AnthropicSseState {
+    /// Total input tokens: uncached remainder plus cache reads and writes.
     input_tokens: u64,
+    cache_read_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
     finished: bool,
 }
 
@@ -464,12 +467,15 @@ fn map_sse_json(v: &Value, state: &mut AnthropicSseState) -> Result<Vec<StreamEv
     let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
     match ty {
         "message_start" => {
-            state.input_tokens = v
-                .get("message")
-                .and_then(|m| m.get("usage"))
-                .and_then(|u| u.get("input_tokens"))
-                .and_then(|x| x.as_u64())
-                .unwrap_or(0);
+            let usage = v.get("message").and_then(|m| m.get("usage"));
+            let field = |name: &str| usage.and_then(|u| u.get(name)).and_then(|x| x.as_u64());
+            state.cache_read_tokens = field("cache_read_input_tokens");
+            state.cache_write_tokens = field("cache_creation_input_tokens");
+            // Anthropic's `input_tokens` is only the uncached remainder;
+            // Kode's `Usage::input_tokens` is the total.
+            state.input_tokens = field("input_tokens").unwrap_or(0)
+                + state.cache_read_tokens.unwrap_or(0)
+                + state.cache_write_tokens.unwrap_or(0);
             Ok(vec![])
         }
         "content_block_start" => {
@@ -544,6 +550,8 @@ fn map_sse_json(v: &Value, state: &mut AnthropicSseState) -> Result<Vec<StreamEv
             let usage = Usage {
                 input_tokens: state.input_tokens,
                 output_tokens,
+                cache_read_tokens: state.cache_read_tokens,
+                cache_write_tokens: state.cache_write_tokens,
             };
             state.finished = true;
             Ok(vec![StreamEvent::Finished {
@@ -565,6 +573,10 @@ fn map_sse_json(v: &Value, state: &mut AnthropicSseState) -> Result<Vec<StreamEv
     }
 }
 
+fn ephemeral() -> Value {
+    serde_json::json!({"type": "ephemeral"})
+}
+
 /// Builds the Anthropic Messages-API request body. `System` messages are
 /// concatenated (joined by `"\n\n"`) into the top-level `system` field
 /// (omitted entirely when there are none); `Tool` messages map to a `user`
@@ -576,7 +588,11 @@ fn build_body(model: &str, request: &ModelRequest) -> Value {
     let mut system_parts: Vec<&str> = Vec::new();
     let mut messages: Vec<Value> = Vec::new();
 
-    for message in &request.messages {
+    // Hints are opt-in: without a cache key the body is byte-identical to
+    // the uncached one.
+    let caching = request.cache_key.is_some();
+
+    for (index, message) in request.messages.iter().enumerate() {
         match message {
             Message::System(content) => system_parts.push(content.as_str()),
             Message::User(content) => {
@@ -617,6 +633,15 @@ fn build_body(model: &str, request: &ModelRequest) -> Value {
                         "input": tc.arguments,
                     }));
                 }
+                // History breakpoint: cache writes happen only at
+                // breakpoints, so without this one replayed history is
+                // never reused across tasks.
+                if caching
+                    && request.cache_anchor == Some(index)
+                    && let Some(last) = blocks.last_mut()
+                {
+                    last["cache_control"] = ephemeral();
+                }
                 messages.push(serde_json::json!({"role": "assistant", "content": blocks}));
             }
             Message::Tool {
@@ -647,7 +672,22 @@ fn build_body(model: &str, request: &ModelRequest) -> Value {
     });
 
     if !system_parts.is_empty() {
-        body["system"] = serde_json::json!(system_parts.join("\n\n"));
+        body["system"] = if caching {
+            let mut blocks: Vec<Value> = system_parts
+                .iter()
+                .map(|text| serde_json::json!({"type": "text", "text": text}))
+                .collect();
+            if let Some(last) = blocks.last_mut() {
+                last["cache_control"] = ephemeral();
+            }
+            Value::Array(blocks)
+        } else {
+            serde_json::json!(system_parts.join("\n\n"))
+        };
+    }
+    if caching {
+        // Automatic caching: the API places a breakpoint on the last block.
+        body["cache_control"] = ephemeral();
     }
     if !request.tools.is_empty() {
         let tools: Vec<Value> = request
@@ -694,6 +734,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
         let body = build_body("claude-sonnet-5", &request);
         let image = &body["messages"][0]["content"][0];
@@ -734,6 +776,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
 
         let body = build_body("claude-sonnet-5", &request);
@@ -754,6 +798,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
         let body = build_body("claude-sonnet-5", &request);
         assert!(body.get("system").is_none());
@@ -767,6 +813,8 @@ mod tests {
             max_tokens: Some(256),
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
         let body = build_body("claude-sonnet-5", &request);
         assert_eq!(body["max_tokens"], serde_json::json!(256));
@@ -780,6 +828,8 @@ mod tests {
             max_tokens: Some(32_768), // e.g. an escalated retry budget
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
 
         // Claude 3.5-generation models cap at 8,192; a larger budget would
@@ -829,6 +879,8 @@ mod tests {
             max_tokens: Some(100),
             temperature: Some(0.5),
             effort: None,
+
+            ..Default::default()
         };
 
         let body = build_body("claude-sonnet-5", &request);
@@ -867,6 +919,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
         let body = build_body("claude-sonnet-5", &request);
         assert!(body.get("tools").is_none());
@@ -947,6 +1001,7 @@ mod tests {
         let mut state = AnthropicSseState {
             input_tokens: 42,
             finished: false,
+            ..Default::default()
         };
         let v: Value = serde_json::from_str(
             r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}"#,
@@ -960,6 +1015,8 @@ mod tests {
                 usage: Some(Usage {
                     input_tokens: 42,
                     output_tokens: 7,
+
+                    ..Default::default()
                 }),
             }]
         );
@@ -981,6 +1038,8 @@ mod tests {
                 usage: Some(Usage {
                     input_tokens: 0,
                     output_tokens: 3,
+
+                    ..Default::default()
                 }),
             }]
         );
@@ -1000,7 +1059,9 @@ mod tests {
                 reason: FinishReason::Length,
                 usage: Some(Usage {
                     input_tokens: 0,
-                    output_tokens: 10
+                    output_tokens: 10,
+
+                    ..Default::default()
                 }),
             }
         );
@@ -1041,6 +1102,153 @@ mod tests {
         let v: Value = serde_json::from_str(r#"{"type":"some_future_event"}"#).unwrap();
         let events = map_sse_json(&v, &mut state).unwrap();
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn build_body_marks_three_cache_breakpoints() {
+        let request = ModelRequest {
+            messages: vec![
+                Message::System("base".to_string()),
+                Message::System("marker".to_string()),
+                Message::User("old task".to_string()),
+                Message::Assistant {
+                    content: "old answer".to_string(),
+                    tool_calls: vec![],
+                },
+                Message::User("context".to_string()),
+                Message::User("task".to_string()),
+            ],
+            cache_key: Some("kode-1".to_string()),
+            cache_anchor: Some(3),
+            ..Default::default()
+        };
+
+        let body = build_body("claude-sonnet-5", &request);
+
+        let ephemeral = serde_json::json!({"type": "ephemeral"});
+        assert_eq!(body["cache_control"], ephemeral);
+        assert_eq!(
+            body["system"],
+            serde_json::json!([
+                {"type": "text", "text": "base"},
+                {"type": "text", "text": "marker", "cache_control": {"type": "ephemeral"}}
+            ])
+        );
+        assert_eq!(
+            body["messages"][1],
+            serde_json::json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "text",
+                    "text": "old answer",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            })
+        );
+        assert_eq!(
+            body["messages"][0],
+            serde_json::json!({"role": "user", "content": "old task"})
+        );
+    }
+
+    #[test]
+    fn build_body_skips_anchor_without_content_blocks() {
+        let request = ModelRequest {
+            messages: vec![
+                Message::User("old task".to_string()),
+                Message::Assistant {
+                    content: String::new(),
+                    tool_calls: vec![],
+                },
+                Message::User("task".to_string()),
+            ],
+            cache_key: Some("kode-1".to_string()),
+            cache_anchor: Some(1),
+            ..Default::default()
+        };
+
+        let body = build_body("claude-sonnet-5", &request);
+
+        assert_eq!(
+            body["messages"][1],
+            serde_json::json!({"role": "assistant", "content": []})
+        );
+    }
+
+    #[test]
+    fn build_body_ignores_anchor_on_non_assistant_or_out_of_range() {
+        for anchor in [0, 99] {
+            let request = ModelRequest {
+                messages: vec![Message::User("task".to_string())],
+                cache_key: Some("kode-1".to_string()),
+                cache_anchor: Some(anchor),
+                ..Default::default()
+            };
+            let body = build_body("claude-sonnet-5", &request);
+            assert_eq!(
+                body["messages"],
+                serde_json::json!([{"role": "user", "content": "task"}])
+            );
+        }
+    }
+
+    #[test]
+    fn build_body_without_cache_key_sends_no_cache_control() {
+        let request = ModelRequest {
+            messages: vec![
+                Message::System("base".to_string()),
+                Message::User("task".to_string()),
+            ],
+            cache_anchor: Some(1),
+            ..Default::default()
+        };
+        let body = build_body("claude-sonnet-5", &request);
+        assert!(body.get("cache_control").is_none());
+        assert_eq!(body["system"], serde_json::json!("base"));
+    }
+
+    #[test]
+    fn map_sse_json_message_start_totals_cached_input() {
+        let mut state = AnthropicSseState::default();
+        let v: Value = serde_json::from_str(
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":50,"cache_read_input_tokens":200,"cache_creation_input_tokens":30}}}"#,
+        )
+        .unwrap();
+        map_sse_json(&v, &mut state).unwrap();
+        assert_eq!(state.input_tokens, 280);
+        assert_eq!(state.cache_read_tokens, Some(200));
+        assert_eq!(state.cache_write_tokens, Some(30));
+
+        let v: Value = serde_json::from_str(
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}"#,
+        )
+        .unwrap();
+        let events = map_sse_json(&v, &mut state).unwrap();
+        assert_eq!(
+            events,
+            vec![StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: Some(Usage {
+                    input_tokens: 280,
+                    output_tokens: 7,
+                    cache_read_tokens: Some(200),
+                    cache_write_tokens: Some(30),
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn map_sse_json_message_start_without_cache_fields_reports_none() {
+        let mut state = AnthropicSseState::default();
+        let v: Value = serde_json::from_str(
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":42}}}"#,
+        )
+        .unwrap();
+        map_sse_json(&v, &mut state).unwrap();
+        assert_eq!(state.input_tokens, 42);
+        assert_eq!(state.cache_read_tokens, None);
+        assert_eq!(state.cache_write_tokens, None);
     }
 
     // --- auth load / refresh-needed / header selection ----------------------

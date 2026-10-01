@@ -172,8 +172,11 @@ impl ToolRuntime {
             .registry
             .get(name)
             .ok_or_else(|| ToolError::UnknownTool(name.to_string()))?;
-        let output = self.execute(name, args, ctx).await?;
+        let mut output = self.execute(name, args, ctx).await?;
+        // Read the flag from the full result: composite tools encode it in
+        // content that clipping may remove.
         let mutated = tool.output_mutated(&output);
+        output.content = crate::output::clip(&output.content, crate::output::MAX_TOOL_OUTPUT_BYTES);
         Ok((output, mutated))
     }
 }
@@ -338,5 +341,65 @@ mod tests {
             )
             .await;
         assert!(!handler.called.load(Ordering::SeqCst));
+    }
+
+    /// Returns a large result whose mutation flag sits in the middle, where
+    /// clipping removes it.
+    struct BigResult;
+
+    #[async_trait::async_trait]
+    impl Tool for BigResult {
+        fn name(&self) -> &str {
+            "big_result"
+        }
+
+        fn description(&self) -> &str {
+            "test tool"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn required_permission(&self) -> crate::RequiredPermission {
+            crate::RequiredPermission::ReadOnly
+        }
+
+        fn output_mutated(&self, output: &ToolOutput) -> bool {
+            output.content.contains("MUTATED_FLAG")
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolOutput> {
+            Ok(ToolOutput {
+                content: format!(
+                    "{}MUTATED_FLAG\n{}",
+                    "head line\n".repeat(3_000),
+                    "tail line\n".repeat(3_000)
+                ),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_clips_results_after_reading_the_mutation_flag() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(BigResult));
+        let runtime = ToolRuntime::new(registry, PermissionMode::Allow, Arc::new(AutoApprove));
+
+        let (output, mutated) = runtime
+            .execute_with_effect("big_result", serde_json::json!({}), &ctx())
+            .await
+            .unwrap();
+
+        assert!(mutated, "flag must be read from the full output");
+        assert!(output.content.len() <= crate::output::MAX_TOOL_OUTPUT_BYTES);
+        assert!(!output.content.contains("MUTATED_FLAG"));
+        assert!(output.content.starts_with("head line\n"));
+        assert!(output.content.ends_with("tail line\n"));
+        assert!(output.content.contains("omitted"));
     }
 }

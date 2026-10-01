@@ -218,6 +218,7 @@ pub struct CompletionReceipt {
     pub tool_calls: u32,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cached_tokens: Option<u64>,
     pub elapsed_ms: u128,
     pub verify_steps: Vec<(String, StepStatusLite)>,
     pub numstat: Vec<NumstatRow>,
@@ -491,6 +492,10 @@ pub struct AppState {
     pub history: Vec<crate::session::Turn>,
     /// Active session file id; created lazily on first completed task.
     pub session_id: Option<String>,
+    /// Provider prompt-cache key for every task this TUI process runs.
+    pub cache_key: String,
+    /// Backends kept open across the tasks of this TUI process.
+    pub runtime: Arc<crate::session_runtime::SessionRuntime>,
     /// Task text of the in-flight run; consumed when TaskFinished arrives.
     pub pending_task: Option<UserInput>,
     /// Stable receipt for the most recently completed run. Cleared as soon
@@ -615,6 +620,8 @@ impl AppState {
             slash_selected: 0,
             history: Vec::new(),
             session_id: None,
+            cache_key: crate::pipeline::new_cache_key(),
+            runtime: Arc::new(crate::session_runtime::SessionRuntime::new()),
             pending_task: None,
             completion: None,
             last_error: None,

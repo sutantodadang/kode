@@ -12,18 +12,18 @@ use kode_core::config::AgentConfig;
 use kode_core::event::{EventBus, KodeEvent};
 use kode_core::{ImageAttachment, UserInput};
 use kode_model::{
-    Message, Model, ModelError, ModelRequest, ResponseAccumulator, StreamEvent, ToolSpec, Usage,
-    collect_response,
+    Message, Model, ModelError, ModelRequest, ResponseAccumulator, StreamEvent, ToolCall, ToolSpec,
+    Usage, collect_response,
 };
 use kode_tools::registry::ToolRuntime;
-use kode_tools::{ToolContext, ToolError};
+use kode_tools::{RequiredPermission, ToolContext, ToolError, ToolOutput};
 use prompt_budget::PromptBudget;
 use tokio::sync::mpsc;
 
 const MAX_TOOL_LABEL_CHARS: usize = 240;
 const MAX_MODEL_RETRY_DELAY_MS: u64 = 30_000;
 const COMPACTED_CONTEXT_PREFIX: &str = "Compacted work context:";
-const COMPACTION_PROMPT: &str = "You are compacting an active coding-agent conversation so work can continue without re-reading the full transcript. Produce a dense, factual structured summary. Preserve: the user's objective and corrections; decisions and constraints; exact file paths, symbols, commands, edits, and observed results; failed approaches and error text; repository state; current progress; and remaining work. Distinguish completed from pending work. Never invent facts. Omit pleasantries and repeated tool output. The original session remains stored, but this summary must be sufficient to continue correctly.";
+const COMPACTION_PROMPT: &str = "Pause the task. Do not call any tools in this reply. You are compacting an active coding-agent conversation so work can continue without re-reading the full transcript. Produce a dense, factual structured summary. Preserve: the user's objective and corrections; decisions and constraints; exact file paths, symbols, commands, edits, and observed results; failed approaches and error text; repository state; current progress; and remaining work. Distinguish completed from pending work. Never invent facts. Omit pleasantries and repeated tool output. The original session remains stored, but this summary must be sufficient to continue correctly.";
 
 fn display_arg(arg: &str) -> String {
     if !arg.is_empty()
@@ -98,6 +98,8 @@ fn system_prompt() -> String {
 
 Environment: OS is `{os}`. `run_command` spawns the program directly with NO shell: no pipes, redirects, globs or builtins, and Unix tools such as `rg`, `grep`, `find`, `cat`, `ls`, `sed` are NOT guaranteed to exist (they usually do not on Windows). When `code_search` and `file_outline` are offered, use them first for conceptual, symbol, implementation, and call-site discovery because they query the indexed code graph. Use `git grep` through `run_command` only for exact literal matching or when code-intelligence tools are unavailable. To read exact file contents use `read_file`. Do not retry a program that was reported as not found.
 
+Tool output: long results are shortened. `read_file` returns one window and its footer gives the `offset` of the next window; call it again with that offset instead of re-reading from the start. Other tools keep the beginning and the end and mark how much was omitted in between; narrow the request (a path, a filter, a smaller range) to see the omitted part.
+
 Skills: when repository context lists available skills, call `use_skill` before taking task actions if the user names a skill (for example `$review`) or the task clearly matches a skill description. Read `SKILL.md` first, then use `use_skill` with a relative `path` for any referenced resource you need. User instructions override skill instructions.
 
 Memory: when `remember` is offered, use it before the final answer for new, durable engineering facts you verified during the task, including important findings returned by subagents after you verify or integrate them. Do not store progress updates, guesses, transient command output, raw conversation, or facts already present in recalled memory. Never set `team: true` unless the user explicitly asks to share the memory.
@@ -116,6 +118,8 @@ pub struct Agent {
     prompt_budget: PromptBudget,
     auto_compact: bool,
     effort: Option<String>,
+    system_appendix: Option<String>,
+    cache_key: Option<String>,
 }
 
 #[derive(Debug)]
@@ -139,10 +143,16 @@ pub struct HistoryTurn {
     pub response: String,
 }
 
+/// When history no longer fits, this many turns leave at once. Dropping one
+/// turn per task would shift the prompt prefix every task and defeat the
+/// provider's prompt cache.
+pub const HISTORY_DROP_BLOCK: usize = 4;
+
 /// Selects the newest suffix of `turns` whose estimated size (chars/4,
-/// consistent with kode-context) fits `budget_tokens`. Always keeps at
-/// least the newest turn when any exist. Returns the kept slice and
-/// whether anything was dropped.
+/// consistent with kode-context) fits `budget_tokens`, then rounds the start
+/// up to a multiple of [`HISTORY_DROP_BLOCK`]. Always keeps at least the
+/// newest turn when any exist. Returns the kept slice and whether anything
+/// was dropped.
 pub fn select_history(turns: &[HistoryTurn], budget_tokens: usize) -> (&[HistoryTurn], bool) {
     let mut start = turns.len();
     let mut used = 0usize;
@@ -158,7 +168,28 @@ pub fn select_history(turns: &[HistoryTurn], budget_tokens: usize) -> (&[History
             break;
         }
     }
+    if start > 0 {
+        let aligned = start.div_ceil(HISTORY_DROP_BLOCK) * HISTORY_DROP_BLOCK;
+        start = aligned.min(turns.len() - 1);
+    }
     (&turns[start..], start > 0)
+}
+
+/// Index of the last replayed-history message: the one right before the
+/// first volatile message (the context, or the task when there is none).
+/// `None` when that neighbour is not a plain assistant reply, which means
+/// there is no history to anchor on.
+fn cache_anchor(messages: &[Message], task: &Message) -> Option<usize> {
+    let volatile = messages
+        .iter()
+        .position(prompt_budget::is_context_message)
+        .or_else(|| messages.iter().position(|message| message == task))?;
+    let index = volatile.checked_sub(1)?;
+    matches!(
+        &messages[index],
+        Message::Assistant { tool_calls, .. } if tool_calls.is_empty()
+    )
+    .then_some(index)
 }
 
 impl Agent {
@@ -178,6 +209,8 @@ impl Agent {
             prompt_budget: PromptBudget::new(agent_cfg.max_context_tokens),
             auto_compact: agent_cfg.auto_compact,
             effort: None,
+            system_appendix: None,
+            cache_key: None,
         }
     }
 
@@ -213,26 +246,28 @@ impl Agent {
         task: &UserInput,
     ) -> Result<Option<(Usage, usize, usize)>> {
         let before = self.prompt_budget.estimate(messages, tools);
-        let mut compact_request = Vec::with_capacity(messages.len() + 1);
-        compact_request.push(Message::System(COMPACTION_PROMPT.to_string()));
-        compact_request.extend(messages.iter().cloned());
-        if self.prompt_budget.estimate(&compact_request, &[]) > self.prompt_budget.input_budget() {
-            compact_request = self.prompt_budget.prepare(&compact_request, &[])?;
-        }
+        // Same tools and same leading messages as the request before it, with
+        // the instruction appended: the provider reuses the cached prefix
+        // instead of re-reading the whole transcript at full price.
+        let mut compact_request = messages.clone();
+        compact_request.push(Message::User(COMPACTION_PROMPT.to_string()));
+        // Always budget it: `prepare` applies the same per-tool-output cap the
+        // normal requests get, which keeps the prefix byte-identical.
+        let compact_request = self.prompt_budget.prepare(&compact_request, tools)?;
         let compact_output_tokens = self
             .prompt_budget
             .context_window()
-            .saturating_sub(self.prompt_budget.estimate(&compact_request, &[]))
+            .saturating_sub(self.prompt_budget.estimate(&compact_request, tools))
             .clamp(1, 16_384) as u32;
 
         let stream = self
             .model
             .stream(ModelRequest {
                 messages: compact_request,
-                tools: Vec::new(),
+                tools: tools.to_vec(),
                 max_tokens: Some(compact_output_tokens),
-                temperature: None,
-                effort: None,
+                cache_key: self.cache_key.clone(),
+                ..Default::default()
             })
             .await?;
         let response = collect_response(stream).await?;
@@ -254,6 +289,11 @@ impl Agent {
 
         let task_message = Message::user(task.clone());
         let mut exact_indices = Vec::new();
+        // The context used to survive as a system message. It is a user
+        // message now, so it has to be kept explicitly.
+        if let Some(index) = messages.iter().position(prompt_budget::is_context_message) {
+            exact_indices.push(index);
+        }
         if let Some(index) = messages
             .iter()
             .rposition(|message| message == &task_message)
@@ -293,18 +333,79 @@ impl Agent {
         self
     }
 
+    /// Text appended to the base system prompt for every request of this
+    /// agent. It must not change between tasks of one session: it is part of
+    /// the cached prefix.
+    pub fn with_system_appendix(mut self, appendix: Option<String>) -> Self {
+        self.system_appendix = appendix;
+        self
+    }
+
+    /// Enables provider cache hints on every request this agent sends. One
+    /// key per Kode process; `None` (the default) sends no hints.
+    pub fn with_cache_key(mut self, cache_key: Option<String>) -> Self {
+        self.cache_key = cache_key;
+        self
+    }
+
+    /// A batch may run concurrently only when nothing in it can write, ask
+    /// for permission or delegate. Read-only calls cannot conflict; anything
+    /// else keeps the order the model chose.
+    fn can_run_in_parallel(&self, calls: &[ToolCall]) -> bool {
+        calls.len() > 1
+            && calls.iter().all(|call| {
+                call.name != "delegate_task"
+                    && self.tools.required_permission(&call.name)
+                        == Some(RequiredPermission::ReadOnly)
+            })
+    }
+
+    /// Runs one tool call and emits its lifecycle events. Cancellation emits
+    /// no finish event: the run is ending.
+    async fn run_tool_call(
+        &self,
+        call: &ToolCall,
+        ctx: &ToolContext,
+    ) -> kode_tools::Result<(ToolOutput, bool)> {
+        self.events.emit(KodeEvent::ToolRequested {
+            name: call.name.clone(),
+        });
+        self.events.emit(KodeEvent::ToolStarted {
+            name: tool_event_label(&call.name, &call.arguments),
+        });
+
+        let result = self
+            .tools
+            .execute_with_effect(&call.name, call.arguments.clone(), ctx)
+            .await;
+
+        match &result {
+            Ok(_) => self.events.emit(KodeEvent::ToolFinished {
+                name: call.name.clone(),
+                ok: true,
+                error: None,
+            }),
+            Err(ToolError::Cancelled) => {}
+            Err(error) => self.events.emit(KodeEvent::ToolFinished {
+                name: call.name.clone(),
+                ok: false,
+                error: Some(error.to_string()),
+            }),
+        }
+        result
+    }
+
     pub async fn run(&self, task: &str, ctx: &ToolContext) -> Result<AgentOutcome> {
         self.run_with_context(task, None, &[], false, ctx).await
     }
 
     /// Like [`Self::run`], but with an optional pre-compiled context blob
-    /// (e.g. from `kode-context`) injected as a second system message
-    /// between the base system prompt and the user's task, and prior
-    /// conversation `history` replayed as alternating user/assistant
-    /// messages. `history` is an ALREADY-SELECTED slice (see
-    /// [`select_history`]) — the caller is responsible for budgeting; when
-    /// `truncated` is true a System marker is emitted so the model knows
-    /// older turns were dropped.
+    /// (e.g. from `kode-context`) injected as a user message immediately
+    /// before the task, and prior conversation `history` replayed as
+    /// alternating user/assistant messages. `history` is an ALREADY-SELECTED
+    /// slice (see [`select_history`]) — the caller is responsible for
+    /// budgeting; when `truncated` is true a System marker is emitted so the
+    /// model knows older turns were dropped.
     pub async fn run_with_context(
         &self,
         task: &str,
@@ -332,12 +433,12 @@ impl Agent {
     ) -> Result<AgentOutcome> {
         self.events.emit(KodeEvent::AgentStarted);
 
-        let mut messages = vec![Message::System(system_prompt())];
-        if let Some(c) = context {
-            messages.push(Message::System(format!(
-                "Repository and session context:\n\n{c}"
-            )));
+        let mut system = system_prompt();
+        if let Some(appendix) = &self.system_appendix {
+            system.push_str("\n\n");
+            system.push_str(appendix);
         }
+        let mut messages = vec![Message::System(system)];
         if truncated {
             messages.push(Message::System(
                 "(older conversation truncated)".to_string(),
@@ -353,6 +454,14 @@ impl Agent {
                 tool_calls: vec![],
             });
         }
+        // Volatile content goes last so the prefix above stays identical
+        // from task to task.
+        if let Some(c) = context {
+            messages.push(Message::User(format!(
+                "{}\n\n{c}",
+                prompt_budget::CONTEXT_PREFIX
+            )));
+        }
         messages.push(Message::user(task.clone()));
 
         let mut usage = Usage::default();
@@ -360,7 +469,9 @@ impl Agent {
         let mut mutated = false;
         let mut steering_open = steering.is_some();
         let mut compaction_available = self.auto_compact;
+        let mut masking_announced = false;
 
+        let task_message = Message::user(task.clone());
         let mut iteration = 0_u32;
         loop {
             iteration = iteration.saturating_add(1);
@@ -380,6 +491,20 @@ impl Agent {
             }
 
             let tools = self.tools.specs();
+            // Cheapest relief first: stale tool outputs go before any model
+            // call is spent on a summary.
+            if self.prompt_budget.should_mask(&messages, &tools) {
+                let masked = prompt_budget::mask_old_tool_outputs(
+                    &mut messages,
+                    prompt_budget::KEEP_RECENT_TOOL_ROUNDS,
+                );
+                if masked > 0 && !masking_announced {
+                    masking_announced = true;
+                    self.events.emit(KodeEvent::Note {
+                        text: "context trimmed: older tool outputs omitted; the agent re-runs a tool if it needs one again".to_string(),
+                    });
+                }
+            }
             if compaction_available && self.prompt_budget.should_compact(&messages, &tools) {
                 match self.compact_messages(&mut messages, &tools, task).await {
                     Ok(Some((compact_usage, before, after))) => {
@@ -409,14 +534,28 @@ impl Agent {
                 }
             }
 
+            // Last resort, when compaction is off or could not help.
+            let dropped = self.prompt_budget.enforce(&mut messages, &tools);
+            if dropped > 0 {
+                self.events.emit(KodeEvent::Note {
+                    text: format!("context full: dropped the {dropped} oldest tool rounds"),
+                });
+            }
+
             self.events.emit(KodeEvent::ModelStarted);
             let request_messages = self.prompt_budget.prepare(&messages, &tools)?;
+            let anchor = self
+                .cache_key
+                .as_ref()
+                .and_then(|_| cache_anchor(&request_messages, &task_message));
             let mut model_request = ModelRequest {
                 messages: request_messages,
                 tools,
                 max_tokens: Some(self.prompt_budget.output_tokens()),
                 temperature: None,
                 effort: self.effort.clone(),
+                cache_key: self.cache_key.clone(),
+                cache_anchor: anchor,
             };
             let mut steers_after_response = Vec::new();
             let mut retry = 0;
@@ -563,48 +702,54 @@ impl Agent {
                 tool_calls: response.tool_calls.clone(),
             });
 
-            for call in &response.tool_calls {
-                self.events.emit(KodeEvent::ToolRequested {
-                    name: call.name.clone(),
-                });
-                self.events.emit(KodeEvent::ToolStarted {
-                    name: tool_event_label(&call.name, &call.arguments),
-                });
-                total_tool_calls += 1;
+            total_tool_calls += response.tool_calls.len() as u32;
 
-                match self
-                    .tools
-                    .execute_with_effect(&call.name, call.arguments.clone(), ctx)
-                    .await
-                {
+            let results = if self.can_run_in_parallel(&response.tool_calls) {
+                let batch = futures::future::join_all(
+                    response
+                        .tool_calls
+                        .iter()
+                        .map(|call| self.run_tool_call(call, ctx)),
+                );
+                // Read-only tools may not watch the cancel token themselves.
+                // Dropping them is safe: they hold nothing that needs
+                // cleanup. The sequential path below is left alone on
+                // purpose: `run_command` must see the cancellation itself so
+                // it can kill its process tree.
+                tokio::select! {
+                    biased;
+                    _ = ctx.cancel.cancelled() => return Err(AgentError::Cancelled),
+                    results = batch => results,
+                }
+            } else {
+                let mut results = Vec::with_capacity(response.tool_calls.len());
+                for call in &response.tool_calls {
+                    let result = self.run_tool_call(call, ctx).await;
+                    let cancelled = matches!(result, Err(ToolError::Cancelled));
+                    results.push(result);
+                    if cancelled {
+                        break;
+                    }
+                }
+                results
+            };
+
+            // Results go back in the order the model issued the calls, not
+            // the order they finished in.
+            for (call, result) in response.tool_calls.iter().zip(results) {
+                match result {
                     Ok((out, tool_mutated)) => {
-                        if tool_mutated {
-                            mutated = true;
-                        }
-                        self.events.emit(KodeEvent::ToolFinished {
-                            name: call.name.clone(),
-                            ok: true,
-                            error: None,
-                        });
+                        mutated |= tool_mutated;
                         messages.push(Message::Tool {
                             tool_call_id: call.id.clone(),
                             content: out.content,
                         });
                     }
-                    Err(ToolError::Cancelled) => {
-                        return Err(AgentError::Cancelled);
-                    }
-                    Err(e) => {
-                        self.events.emit(KodeEvent::ToolFinished {
-                            name: call.name.clone(),
-                            ok: false,
-                            error: Some(e.to_string()),
-                        });
-                        messages.push(Message::Tool {
-                            tool_call_id: call.id.clone(),
-                            content: format!("error: {e}"),
-                        });
-                    }
+                    Err(ToolError::Cancelled) => return Err(AgentError::Cancelled),
+                    Err(error) => messages.push(Message::Tool {
+                        tool_call_id: call.id.clone(),
+                        content: format!("error: {error}"),
+                    }),
                 }
             }
 
@@ -621,7 +766,9 @@ mod tests {
     use kode_model::{
         FinishReason, MockModel, Model, ModelCapabilities, ModelRequest, ModelStream,
     };
+    use kode_tools::Tool;
     use kode_tools::permission::{AutoApprove, AutoDeny};
+    use kode_tools::registry::ToolRegistry;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -1138,6 +1285,8 @@ mod tests {
             usage: Some(Usage {
                 input_tokens: 10,
                 output_tokens: 5,
+
+                ..Default::default()
             }),
         });
         mock.push_script(script1);
@@ -1148,6 +1297,8 @@ mod tests {
                 usage: Some(Usage {
                     input_tokens: 20,
                     output_tokens: 7,
+
+                    ..Default::default()
                 }),
             },
         ]);
@@ -1171,7 +1322,9 @@ mod tests {
             outcome.usage,
             Usage {
                 input_tokens: 30,
-                output_tokens: 12
+                output_tokens: 12,
+
+                ..Default::default()
             }
         );
 
@@ -1211,73 +1364,184 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn auto_compact_summarizes_before_model_window_is_exhausted() {
-        let dir = temp_dir();
-        std::fs::write(dir.join("large.txt"), "important detail\n".repeat(2_500)).unwrap();
+    fn is_prefix(shorter: &[Message], longer: &[Message]) -> bool {
+        shorter.len() <= longer.len() && shorter == &longer[..shorter.len()]
+    }
 
-        let mock = MockModel::new();
-        let mut tool_call = read_file_call(0, "call_1", "large.txt");
-        tool_call.push(StreamEvent::Finished {
-            reason: FinishReason::ToolCalls,
-            usage: Some(Usage {
-                input_tokens: 10,
-                output_tokens: 5,
-            }),
-        });
-        mock.push_script(tool_call);
-        mock.push_script(vec![
-            StreamEvent::TextDelta(
-                "Objective: inspect large.txt. Observed: important detail repeats. Remaining: report."
-                    .to_string(),
-            ),
-            StreamEvent::Finished {
-                reason: FinishReason::Stop,
-                usage: Some(Usage {
-                    input_tokens: 11_000,
-                    output_tokens: 30,
-                }),
-            },
-        ]);
-        mock.push_script(vec![
-            StreamEvent::TextDelta("done".to_string()),
-            StreamEvent::Finished {
-                reason: FinishReason::Stop,
-                usage: Some(Usage {
-                    input_tokens: 3_000,
-                    output_tokens: 4,
-                }),
-            },
-        ]);
+    enum CompactionReply {
+        Summary,
+        StrayToolCall,
+    }
 
-        let mock = Arc::new(mock);
-        let events = EventBus::new(64);
-        let mut rx = events.subscribe();
+    /// Answers by request content instead of by position, so a test does not
+    /// depend on the exact iteration at which compaction triggers. Issues
+    /// `rounds` `read_file` calls on `f0.txt`, `f1.txt`, ... and then "done".
+    struct ReactiveModel {
+        requests: Mutex<Vec<ModelRequest>>,
+        issued: AtomicUsize,
+        rounds: usize,
+        compaction_reply: CompactionReply,
+    }
+
+    impl ReactiveModel {
+        fn new(rounds: usize, compaction_reply: CompactionReply) -> Self {
+            Self {
+                requests: Mutex::new(Vec::new()),
+                issued: AtomicUsize::new(0),
+                rounds,
+                compaction_reply,
+            }
+        }
+
+        fn requests(&self) -> Vec<ModelRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    fn is_compaction(request: &ModelRequest) -> bool {
+        request.messages.iter().any(|message| {
+            matches!(
+                message,
+                Message::System(text) | Message::User(text)
+                    if text.contains("compacting an active coding-agent conversation")
+            )
+        })
+    }
+
+    #[async_trait::async_trait]
+    impl Model for ReactiveModel {
+        async fn stream(&self, request: ModelRequest) -> kode_model::Result<ModelStream> {
+            let compaction = is_compaction(&request);
+            self.requests.lock().unwrap().push(request);
+
+            let events = if compaction {
+                match self.compaction_reply {
+                    CompactionReply::Summary => vec![
+                        StreamEvent::TextDelta(
+                            "Objective: read the files. Observed: important detail repeats. Remaining: report."
+                                .to_string(),
+                        ),
+                        StreamEvent::Finished {
+                            reason: FinishReason::Stop,
+                            usage: None,
+                        },
+                    ],
+                    CompactionReply::StrayToolCall => {
+                        let mut call = read_file_call(0, "stray", "f0.txt");
+                        call.push(StreamEvent::Finished {
+                            reason: FinishReason::ToolCalls,
+                            usage: None,
+                        });
+                        call
+                    }
+                }
+            } else {
+                let n = self.issued.fetch_add(1, Ordering::SeqCst);
+                if n < self.rounds {
+                    let mut call = read_file_call(0, &format!("call_{n}"), &format!("f{n}.txt"));
+                    call.push(StreamEvent::Finished {
+                        reason: FinishReason::ToolCalls,
+                        usage: None,
+                    });
+                    call
+                } else {
+                    vec![
+                        StreamEvent::TextDelta("done".to_string()),
+                        StreamEvent::Finished {
+                            reason: FinishReason::Stop,
+                            usage: None,
+                        },
+                    ]
+                }
+            };
+            Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+        }
+
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities {
+                id: "reactive".to_string(),
+                supports_tools: true,
+                supports_streaming: true,
+            }
+        }
+    }
+
+    /// 6 KB files: each fits one `read_file` window, about 1,500 tokens.
+    fn write_round_files(dir: &std::path::Path, rounds: usize) {
+        for n in 0..rounds {
+            std::fs::write(
+                dir.join(format!("f{n}.txt")),
+                "important detail\n".repeat(353),
+            )
+            .unwrap();
+        }
+    }
+
+    /// A 9,000-token window leaves a 6,952-token input budget. System prompt
+    /// and tool specs take roughly 1,600, so three rounds cross the 80%
+    /// compaction trigger while still fitting. Kept this small on purpose:
+    /// compaction must be reached within the newest four rounds, which later
+    /// context trimming never masks.
+    fn compacting_agent(model: Arc<ReactiveModel>, events: EventBus) -> Agent {
         let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
         let agent_cfg = AgentConfig {
-            max_context_tokens: 12_000,
+            max_context_tokens: 9_000,
             auto_compact: true,
             ..Default::default()
         };
-        let agent = Agent::new(mock.clone(), tools, events, &agent_cfg);
+        Agent::new(model, tools, events, &agent_cfg)
+    }
 
-        let outcome = agent.run("inspect large.txt", &ctx(dir)).await.unwrap();
+    #[tokio::test]
+    async fn auto_compact_summarizes_before_model_window_is_exhausted() {
+        let dir = temp_dir();
+        write_round_files(&dir, 8);
+        let model = Arc::new(ReactiveModel::new(8, CompactionReply::Summary));
+        let events = EventBus::new(256);
+        let mut rx = events.subscribe();
+        let agent = compacting_agent(model.clone(), events);
+
+        let outcome = agent
+            .run_with_context("read the files", Some("CTX_KEEP"), &[], false, &ctx(dir))
+            .await
+            .unwrap();
         assert_eq!(outcome.final_text, "done");
-        assert_eq!(outcome.usage.input_tokens, 14_010);
+        assert_eq!(outcome.tool_calls, 8);
 
-        let requests = mock.requests();
-        assert_eq!(requests.len(), 3);
-        assert!(requests[1].tools.is_empty());
-        assert!(matches!(
-            &requests[1].messages[0],
-            Message::System(text) if text.contains("compacting an active coding-agent conversation")
+        let requests = model.requests();
+        let at = requests
+            .iter()
+            .position(is_compaction)
+            .expect("the window must fill up and trigger compaction");
+        assert!(at > 0);
+
+        // The compaction request reuses the running prefix: same tools, same
+        // messages, instruction appended at the tail.
+        assert_eq!(requests[at].tools, requests[at - 1].tools);
+        assert!(!requests[at].tools.is_empty());
+        assert!(is_prefix(
+            &requests[at - 1].messages,
+            &requests[at].messages
         ));
-        assert!(requests[2].messages.iter().any(|message| {
+        assert!(matches!(
+            requests[at].messages.last(),
+            Some(Message::User(text)) if text.contains("compacting an active coding-agent conversation")
+        ));
+
+        let after = &requests[at + 1].messages;
+        assert!(after.iter().any(|message| {
             matches!(message, Message::System(text) if text.starts_with(COMPACTED_CONTEXT_PREFIX))
         }));
-        assert!(requests[2].messages.iter().any(|message| {
-            matches!(message, Message::User(text) if text == "inspect large.txt")
+        assert!(
+            after.iter().any(|message| {
+                matches!(message, Message::User(text) if text == "read the files")
+            })
+        );
+        assert!(after.iter().any(|message| {
+            matches!(message, Message::User(text) if text.contains("CTX_KEEP"))
         }));
+        assert!(!is_compaction(&requests[at + 1]));
+
         let mut saw_compaction = false;
         while let Ok(event) = rx.try_recv() {
             saw_compaction |= matches!(
@@ -1286,6 +1550,38 @@ mod tests {
             );
         }
         assert!(saw_compaction);
+    }
+
+    #[tokio::test]
+    async fn compaction_that_calls_a_tool_falls_back_to_truncation() {
+        let dir = temp_dir();
+        write_round_files(&dir, 8);
+        let model = Arc::new(ReactiveModel::new(8, CompactionReply::StrayToolCall));
+        let events = EventBus::new(256);
+        let mut rx = events.subscribe();
+        let agent = compacting_agent(model.clone(), events);
+
+        let outcome = agent.run("read the files", &ctx(dir)).await.unwrap();
+
+        assert_eq!(outcome.final_text, "done");
+        assert_eq!(
+            outcome.tool_calls, 8,
+            "the stray compaction call must not execute"
+        );
+        // Compaction is tried once, fails, and is not tried again.
+        assert_eq!(
+            model.requests().iter().filter(|r| is_compaction(r)).count(),
+            1
+        );
+
+        let mut saw_fallback = false;
+        while let Ok(event) = rx.try_recv() {
+            saw_fallback |= matches!(
+                event,
+                KodeEvent::Note { text } if text.contains("empty summary")
+            );
+        }
+        assert!(saw_fallback);
     }
 
     #[tokio::test]
@@ -1601,7 +1897,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_with_context_injects_system_message() {
+    async fn context_is_a_user_message_right_before_the_task() {
         let dir = temp_dir();
         let mock = MockModel::new();
         mock.push_script(vec![
@@ -1621,20 +1917,30 @@ mod tests {
             &AgentConfig::default(),
         );
 
-        let outcome = agent
-            .run_with_context("do the thing", Some("CTX_MARKER"), &[], false, &ctx(dir))
+        let history = vec![HistoryTurn {
+            task: "t1".into(),
+            images: Vec::new(),
+            response: "r1".into(),
+        }];
+
+        agent
+            .run_with_context("t2", Some("CTX"), &history, false, &ctx(dir))
             .await
             .unwrap();
-        assert_eq!(outcome.final_text, "done");
 
         let requests = mock.requests();
         let first = &requests[0];
+        assert_eq!(first.messages.len(), 5);
+        assert!(matches!(&first.messages[0], Message::System(c) if !c.contains("CTX")));
+        assert!(matches!(&first.messages[1], Message::User(t) if t == "t1"));
         assert!(
-            first
-                .messages
-                .iter()
-                .any(|m| matches!(m, Message::System(content) if content.contains("CTX_MARKER")))
+            matches!(&first.messages[2], Message::Assistant { content, tool_calls } if content == "r1" && tool_calls.is_empty())
         );
+        assert!(matches!(
+            &first.messages[3],
+            Message::User(c) if c == "Repository and session context:\n\nCTX"
+        ));
+        assert!(matches!(&first.messages[4], Message::User(t) if t == "t2"));
     }
 
     #[test]
@@ -1697,8 +2003,43 @@ mod tests {
         assert!(!truncated);
     }
 
+    fn sized_turns(count: usize) -> Vec<HistoryTurn> {
+        // 400 chars per turn = 100 estimated tokens.
+        (0..count)
+            .map(|index| HistoryTurn {
+                task: format!("{index:04}{}", "t".repeat(196)),
+                images: Vec::new(),
+                response: "r".repeat(200),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn select_history_start_moves_in_blocks() {
+        // Budget fits five turns. One-at-a-time dropping would start at
+        // 5, 6, 7, 8; block dropping holds the start at 8 for all four.
+        for count in 10..=13 {
+            let turns = sized_turns(count);
+            let (kept, truncated) = select_history(&turns, 500);
+            assert!(truncated);
+            assert!(kept[0].task.starts_with("0008"), "count {count}");
+        }
+        let turns = sized_turns(14);
+        let (kept, _) = select_history(&turns, 500);
+        assert!(kept[0].task.starts_with("0012"));
+    }
+
+    #[test]
+    fn select_history_keeps_newest_turn_when_block_would_drop_everything() {
+        let turns = sized_turns(2);
+        let (kept, truncated) = select_history(&turns, 100);
+        assert!(truncated);
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].task.starts_with("0001"));
+    }
+
     #[tokio::test]
-    async fn history_turns_replay_between_context_and_task() {
+    async fn system_appendix_extends_the_base_system_message_only() {
         let dir = temp_dir();
         let mock = MockModel::new();
         mock.push_script(vec![
@@ -1716,30 +2057,23 @@ mod tests {
             tools,
             EventBus::new(64),
             &AgentConfig::default(),
-        );
+        )
+        .with_system_appendix(Some("SKILL_CATALOG".to_string()));
 
-        let history = vec![HistoryTurn {
-            task: "t1".into(),
-            images: Vec::new(),
-            response: "r1".into(),
-        }];
-
-        let outcome = agent
-            .run_with_context("t2", Some("CTX"), &history, false, &ctx(dir))
+        agent
+            .run_with_context("task", Some("CTX"), &[], false, &ctx(dir))
             .await
             .unwrap();
-        assert_eq!(outcome.final_text, "done");
 
         let requests = mock.requests();
-        let first = &requests[0];
-        assert_eq!(first.messages.len(), 5);
-        assert!(matches!(&first.messages[0], Message::System(_)));
-        assert!(matches!(&first.messages[1], Message::System(c) if c.contains("CTX")));
-        assert!(matches!(&first.messages[2], Message::User(t) if t == "t1"));
-        assert!(
-            matches!(&first.messages[3], Message::Assistant { content, tool_calls } if content == "r1" && tool_calls.is_empty())
-        );
-        assert!(matches!(&first.messages[4], Message::User(t) if t == "t2"));
+        let messages = &requests[0].messages;
+        assert!(matches!(
+            &messages[0],
+            Message::System(text) if text.starts_with("You are Kode") && text.ends_with("\n\nSKILL_CATALOG")
+        ));
+        assert!(messages[1..].iter().all(|message| {
+            !matches!(message, Message::System(text) | Message::User(text) if text.contains("SKILL_CATALOG"))
+        }));
     }
 
     #[tokio::test]
@@ -1774,5 +2108,512 @@ mod tests {
         assert!(first.messages.iter().any(
             |m| matches!(m, Message::System(c) if c.contains("older conversation truncated"))
         ));
+    }
+
+    fn turn(task: &str, response: &str) -> HistoryTurn {
+        HistoryTurn {
+            task: task.into(),
+            images: Vec::new(),
+            response: response.into(),
+        }
+    }
+
+    async fn first_request(history: &[HistoryTurn], context: &str, task: &str) -> ModelRequest {
+        let mock = MockModel::new();
+        mock.push_script(vec![
+            StreamEvent::TextDelta("done".to_string()),
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: None,
+            },
+        ]);
+        let mock = Arc::new(mock);
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let agent = Agent::new(
+            mock.clone(),
+            tools,
+            EventBus::new(64),
+            &AgentConfig::default(),
+        )
+        .with_cache_key(Some("kode-test".to_string()));
+        agent
+            .run_with_context(task, Some(context), history, false, &ctx(temp_dir()))
+            .await
+            .unwrap();
+        mock.requests().remove(0)
+    }
+
+    #[tokio::test]
+    async fn request_messages_only_grow_within_a_task() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("a.txt"), "hello").unwrap();
+
+        let mock = MockModel::new();
+        let mut call = read_file_call(0, "call_1", "a.txt");
+        call.push(StreamEvent::Finished {
+            reason: FinishReason::ToolCalls,
+            usage: None,
+        });
+        mock.push_script(call);
+        mock.push_script(vec![
+            StreamEvent::TextDelta("done".to_string()),
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: None,
+            },
+        ]);
+
+        let mock = Arc::new(mock);
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let agent = Agent::new(
+            mock.clone(),
+            tools,
+            EventBus::new(64),
+            &AgentConfig::default(),
+        )
+        .with_cache_key(Some("kode-test".to_string()));
+
+        agent
+            .run_with_context("t2", Some("CTX"), &[turn("t1", "r1")], false, &ctx(dir))
+            .await
+            .unwrap();
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(is_prefix(&requests[0].messages, &requests[1].messages));
+        assert_eq!(requests[0].tools, requests[1].tools);
+        for request in &requests {
+            assert_eq!(request.cache_key.as_deref(), Some("kode-test"));
+            // [system, t1, r1, context, t2, ...] -> r1 is index 2.
+            assert_eq!(request.cache_anchor, Some(2));
+        }
+    }
+
+    #[tokio::test]
+    async fn new_task_reuses_system_and_older_history_prefix() {
+        let a = first_request(&[turn("t1", "r1")], "CTX A", "t2").await;
+        let b = first_request(&[turn("t1", "r1"), turn("t2", "r2")], "CTX B", "t3").await;
+
+        // System prompt and the first turn are byte-identical even though the
+        // repository context changed.
+        assert_eq!(a.messages[..3], b.messages[..3]);
+        assert_eq!(a.tools, b.tools);
+        assert_eq!(a.cache_anchor, Some(2));
+        assert_eq!(b.cache_anchor, Some(4));
+    }
+
+    #[tokio::test]
+    async fn cache_anchor_is_none_without_history() {
+        let request = first_request(&[], "CTX", "task").await;
+        assert_eq!(request.cache_anchor, None);
+        assert_eq!(request.cache_key.as_deref(), Some("kode-test"));
+    }
+
+    #[tokio::test]
+    async fn cache_anchor_stays_on_an_assistant_message_when_the_task_repeats() {
+        let request = first_request(
+            &[turn("continue", "r1"), turn("continue", "r2")],
+            "CTX",
+            "continue",
+        )
+        .await;
+        let anchor = request.cache_anchor.expect("history present");
+        assert!(matches!(
+            &request.messages[anchor],
+            Message::Assistant { tool_calls, .. } if tool_calls.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn agent_without_cache_key_sends_no_hints() {
+        let dir = temp_dir();
+        let mock = MockModel::new();
+        mock.push_script(vec![
+            StreamEvent::TextDelta("done".to_string()),
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: None,
+            },
+        ]);
+        let mock = Arc::new(mock);
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let agent = Agent::new(
+            mock.clone(),
+            tools,
+            EventBus::new(64),
+            &AgentConfig::default(),
+        );
+        agent
+            .run_with_context("t2", Some("CTX"), &[turn("t1", "r1")], false, &ctx(dir))
+            .await
+            .unwrap();
+        let requests = mock.requests();
+        assert_eq!(requests[0].cache_key, None);
+        assert_eq!(requests[0].cache_anchor, None);
+    }
+
+    #[test]
+    fn system_prompt_explains_shortened_tool_output() {
+        let prompt = system_prompt();
+        assert!(prompt.contains("gives the `offset` of the next window"));
+        assert!(prompt.contains("keep the beginning and the end"));
+    }
+
+    /// Records how many calls are in flight at once. With a barrier, a call
+    /// blocks until `barrier` parties are inside `execute` together, which
+    /// can only happen when calls run concurrently.
+    struct Probe {
+        name: &'static str,
+        permission: RequiredPermission,
+        barrier: Option<Arc<tokio::sync::Barrier>>,
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for Probe {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "test probe"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {"tag": {"type": "string"}}})
+        }
+
+        fn required_permission(&self) -> RequiredPermission {
+            self.permission
+        }
+
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> kode_tools::Result<ToolOutput> {
+            use std::sync::atomic::Ordering;
+
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            match &self.barrier {
+                Some(barrier) => {
+                    barrier.wait().await;
+                }
+                None => tokio::task::yield_now().await,
+            }
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+
+            let tag = args.get("tag").and_then(|tag| tag.as_str()).unwrap_or("");
+            if tag == "fail" {
+                return Err(ToolError::Failed("probe failed".to_string()));
+            }
+            Ok(ToolOutput {
+                content: format!("result {tag}"),
+            })
+        }
+    }
+
+    struct ProbeSet {
+        runtime: ToolRuntime,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// `look` is read-only, `change` is mutating. `barrier_parties` makes
+    /// every `look` call wait for that many concurrent `look` calls.
+    fn probes(barrier_parties: Option<usize>) -> ProbeSet {
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(Probe {
+            name: "look",
+            permission: RequiredPermission::ReadOnly,
+            barrier: barrier_parties.map(|parties| Arc::new(tokio::sync::Barrier::new(parties))),
+            in_flight: in_flight.clone(),
+            peak: peak.clone(),
+        }));
+        registry.register(Arc::new(Probe {
+            name: "change",
+            permission: RequiredPermission::Mutating,
+            barrier: None,
+            in_flight,
+            peak: peak.clone(),
+        }));
+        ProbeSet {
+            runtime: ToolRuntime::new(registry, PermissionMode::Allow, Arc::new(AutoApprove)),
+            peak,
+        }
+    }
+
+    /// One model response carrying one call per `(name, tag)` pair, with ids
+    /// `call_0`, `call_1`, ...
+    fn batch(calls: &[(&str, &str)]) -> Vec<StreamEvent> {
+        let mut events: Vec<StreamEvent> = calls
+            .iter()
+            .enumerate()
+            .map(|(index, (name, tag))| StreamEvent::ToolCallDelta {
+                index: index as u32,
+                id: Some(format!("call_{index}")),
+                name: Some((*name).to_string()),
+                arguments_delta: serde_json::json!({"tag": tag}).to_string(),
+            })
+            .collect();
+        events.push(StreamEvent::Finished {
+            reason: FinishReason::ToolCalls,
+            usage: None,
+        });
+        events
+    }
+
+    fn done() -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::TextDelta("done".to_string()),
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: None,
+            },
+        ]
+    }
+
+    fn tool_results(request: &ModelRequest) -> Vec<(String, String)> {
+        request
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Tool {
+                    tool_call_id,
+                    content,
+                } => Some((tool_call_id.clone(), content.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn read_only_batch_runs_concurrently_and_keeps_call_order() {
+        let mock = MockModel::new();
+        mock.push_script(batch(&[("look", "a"), ("look", "b"), ("look", "c")]));
+        mock.push_script(done());
+        let mock = Arc::new(mock);
+        let set = probes(Some(3));
+        let events = EventBus::new(64);
+        let mut rx = events.subscribe();
+        let agent = Agent::new(mock.clone(), set.runtime, events, &AgentConfig::default());
+
+        // The barrier needs three concurrent calls. Sequential execution
+        // would block forever on the first one.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            agent.run("look around", &ctx(temp_dir())),
+        )
+        .await
+        .expect("read-only calls must run concurrently")
+        .unwrap();
+
+        assert_eq!(outcome.tool_calls, 3);
+        assert_eq!(set.peak.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(
+            tool_results(&mock.requests()[1]),
+            vec![
+                ("call_0".to_string(), "result a".to_string()),
+                ("call_1".to_string(), "result b".to_string()),
+                ("call_2".to_string(), "result c".to_string()),
+            ]
+        );
+
+        // Every call is announced before any of them finishes.
+        let mut started = 0;
+        let mut started_before_first_finish = 0;
+        let mut finished = 0;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                KodeEvent::ToolStarted { .. } => {
+                    started += 1;
+                    if finished == 0 {
+                        started_before_first_finish += 1;
+                    }
+                }
+                KodeEvent::ToolFinished { .. } => finished += 1,
+                _ => {}
+            }
+        }
+        assert_eq!((started, finished), (3, 3));
+        assert_eq!(started_before_first_finish, 3);
+    }
+
+    #[tokio::test]
+    async fn batch_with_a_mutating_call_stays_sequential() {
+        let mock = MockModel::new();
+        mock.push_script(batch(&[("look", "a"), ("change", "b"), ("look", "c")]));
+        mock.push_script(done());
+        let mock = Arc::new(mock);
+        let set = probes(None);
+        let agent = Agent::new(
+            mock.clone(),
+            set.runtime,
+            EventBus::new(64),
+            &AgentConfig::default(),
+        );
+
+        let outcome = agent.run("edit", &ctx(temp_dir())).await.unwrap();
+
+        assert!(outcome.mutated);
+        assert_eq!(set.peak.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            tool_results(&mock.requests()[1])
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            vec!["call_0", "call_1", "call_2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn single_read_only_call_is_not_treated_as_a_batch() {
+        let mock = MockModel::new();
+        mock.push_script(batch(&[("look", "a")]));
+        mock.push_script(done());
+        let mock = Arc::new(mock);
+        let set = probes(None);
+        let agent = Agent::new(
+            mock.clone(),
+            set.runtime,
+            EventBus::new(64),
+            &AgentConfig::default(),
+        );
+
+        agent.run("look", &ctx(temp_dir())).await.unwrap();
+
+        assert_eq!(
+            tool_results(&mock.requests()[1]),
+            vec![("call_0".to_string(), "result a".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_call_in_a_parallel_batch_is_reported_in_place() {
+        let mock = MockModel::new();
+        mock.push_script(batch(&[("look", "a"), ("look", "fail"), ("look", "c")]));
+        mock.push_script(done());
+        let mock = Arc::new(mock);
+        let set = probes(Some(3));
+        let agent = Agent::new(
+            mock.clone(),
+            set.runtime,
+            EventBus::new(64),
+            &AgentConfig::default(),
+        );
+
+        let outcome = agent.run("look around", &ctx(temp_dir())).await.unwrap();
+
+        assert_eq!(outcome.final_text, "done");
+        let results = tool_results(&mock.requests()[1]);
+        assert_eq!(results[0], ("call_0".to_string(), "result a".to_string()));
+        assert_eq!(results[1].0, "call_1");
+        assert!(results[1].1.starts_with("error: "), "{}", results[1].1);
+        assert_eq!(results[2], ("call_2".to_string(), "result c".to_string()));
+    }
+
+    #[tokio::test]
+    async fn cancel_during_a_parallel_batch_ends_the_run() {
+        let mock = MockModel::new();
+        mock.push_script(batch(&[("look", "a"), ("look", "b")]));
+        let mock = Arc::new(mock);
+        // Three parties but only two calls: the batch can never complete.
+        let set = probes(Some(3));
+        let agent = Agent::new(
+            mock.clone(),
+            set.runtime,
+            EventBus::new(64),
+            &AgentConfig::default(),
+        );
+        let tool_ctx = ctx(temp_dir());
+        let cancel = tool_ctx.cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            cancel.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            agent.run("look around", &tool_ctx),
+        )
+        .await
+        .expect("cancellation must interrupt a running batch");
+
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        assert_eq!(mock.requests().len(), 1);
+    }
+
+    fn masked_outputs(request: &ModelRequest) -> usize {
+        request
+            .messages
+            .iter()
+            .filter(|message| {
+                matches!(message, Message::Tool { content, .. } if content == prompt_budget::TOOL_OUTPUT_MASKED)
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn stale_tool_outputs_are_masked_instead_of_summarised() {
+        let dir = temp_dir();
+        write_round_files(&dir, 18);
+        let model = Arc::new(ReactiveModel::new(18, CompactionReply::Summary));
+        let events = EventBus::new(512);
+        let mut rx = events.subscribe();
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        // 35,000-token input budget: 60% is reached after about 13 rounds of
+        // 1,500 tokens; 80% is never reached once old outputs are masked.
+        let agent_cfg = AgentConfig {
+            max_context_tokens: 40_000,
+            auto_compact: true,
+            ..Default::default()
+        };
+        let agent = Agent::new(model.clone(), tools, events, &agent_cfg);
+
+        let outcome = agent.run("read the files", &ctx(dir)).await.unwrap();
+
+        assert_eq!(outcome.final_text, "done");
+        assert_eq!(outcome.tool_calls, 18);
+
+        let requests = model.requests();
+        assert!(
+            !requests.iter().any(is_compaction),
+            "masking must make the LLM summary unnecessary"
+        );
+
+        let last = requests.last().unwrap();
+        assert!(masked_outputs(last) >= 8, "{}", masked_outputs(last));
+        assert_eq!(masked_outputs(&requests[1]), 0);
+        // The four newest results are intact.
+        let recent: Vec<&str> = last
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Tool { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .rev()
+            .take(prompt_budget::KEEP_RECENT_TOOL_ROUNDS)
+            .collect();
+        assert!(
+            recent
+                .iter()
+                .all(|content| content.contains("important detail"))
+        );
+
+        let mut mask_notes = 0;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(&event, KodeEvent::Note { text } if text.contains("older tool outputs omitted"))
+            {
+                mask_notes += 1;
+            }
+        }
+        assert_eq!(
+            mask_notes, 1,
+            "announce masking once per run, not per request"
+        );
     }
 }

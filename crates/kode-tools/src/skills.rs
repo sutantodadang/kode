@@ -364,4 +364,31 @@ mod tests {
         let error = catalog.read("same", Some("../outside.md")).unwrap_err();
         assert!(error.to_string().contains("must stay inside"));
     }
+
+    #[test]
+    fn prompt_summary_is_sorted_and_repeatable() {
+        let root = temp_dir("sorted");
+        // Created in reverse alphabetical order on purpose.
+        for name in ["zeta", "alpha"] {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {name} skill\n---\nbody\n"),
+            )
+            .unwrap();
+        }
+
+        let first = SkillCatalog::discover_roots([(root.clone(), "test")])
+            .prompt_summary()
+            .unwrap();
+        let second = SkillCatalog::discover_roots([(root, "test")])
+            .prompt_summary()
+            .unwrap();
+
+        // The summary is part of the cached system prefix: it must be
+        // byte-identical for an unchanged skill set.
+        assert_eq!(first, second);
+        assert!(first.find("- alpha:").unwrap() < first.find("- zeta:").unwrap());
+    }
 }

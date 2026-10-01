@@ -56,7 +56,8 @@ impl OpenAiModel {
 #[async_trait::async_trait]
 impl Model for OpenAiModel {
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
-        let body = build_body(&self.opts.model, &request);
+        let mut body = build_body(&self.opts.model, &request);
+        apply_cache_key(&mut body, &self.opts.base_url, &request);
         let url = format!(
             "{}/chat/completions",
             self.opts.base_url.trim_end_matches('/')
@@ -199,6 +200,11 @@ fn map_chunk(chunk: ChunkWire) -> MappedChunk {
     let usage = chunk.usage.map(|u| Usage {
         input_tokens: u.prompt_tokens,
         output_tokens: u.completion_tokens,
+        cache_read_tokens: u
+            .prompt_tokens_details
+            .and_then(|details| details.cached_tokens)
+            .or(u.prompt_cache_hit_tokens),
+        cache_write_tokens: None,
     });
     MappedChunk {
         events,
@@ -272,6 +278,34 @@ struct FunctionDeltaWire {
 struct UsageWire {
     prompt_tokens: u64,
     completion_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetailsWire>,
+    /// DeepSeek's spelling of the cached share of `prompt_tokens`.
+    #[serde(default)]
+    prompt_cache_hit_tokens: Option<u64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PromptTokensDetailsWire {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+}
+
+fn is_official_openai(base_url: &str) -> bool {
+    base_url
+        .strip_prefix("https://")
+        .is_some_and(|rest| rest == "api.openai.com" || rest.starts_with("api.openai.com/"))
+}
+
+/// `prompt_cache_key` is an OpenAI extension. Compatible gateways may reject
+/// unknown fields, so it goes only to the official host; everyone else still
+/// benefits from the stable prefix.
+fn apply_cache_key(body: &mut serde_json::Value, base_url: &str, request: &ModelRequest) {
+    if is_official_openai(base_url)
+        && let Some(key) = &request.cache_key
+    {
+        body["prompt_cache_key"] = serde_json::json!(key);
+    }
 }
 
 fn build_body(model: &str, request: &ModelRequest) -> serde_json::Value {
@@ -402,6 +436,8 @@ mod tests {
             max_tokens: Some(16),
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
         let _stream = model.stream(request).await.unwrap();
         let wire = server.await.unwrap();
@@ -427,6 +463,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
         let body = build_body("gpt-4o", &request);
         assert_eq!(body["messages"][0]["content"][0]["text"], "describe this");
@@ -464,6 +502,8 @@ mod tests {
             max_tokens: Some(100),
             temperature: Some(0.5),
             effort: None,
+
+            ..Default::default()
         };
 
         let body = build_body("gpt-4o-mini", &request);
@@ -509,6 +549,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
 
         let body = build_body("gpt-4o-mini", &request);
@@ -526,6 +568,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: Some("low".to_string()),
+
+            ..Default::default()
         };
 
         let body = build_body("gpt-5", &request);
@@ -540,6 +584,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
 
         let body = build_body("gpt-5", &request);
@@ -554,6 +600,8 @@ mod tests {
             max_tokens: Some(16_384),
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
 
         for model in ["gpt-5.6-sol", "GPT-5", "o3", "o4-mini-high"] {
@@ -620,8 +668,88 @@ mod tests {
             mapped.usage,
             Some(Usage {
                 input_tokens: 5,
-                output_tokens: 7
+                output_tokens: 7,
+
+                ..Default::default()
             })
         );
+    }
+
+    fn keyed_request() -> ModelRequest {
+        ModelRequest {
+            messages: vec![Message::User("hi".into())],
+            cache_key: Some("kode-1".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cache_key_is_sent_only_to_the_official_host() {
+        let request = keyed_request();
+
+        for base_url in ["https://api.openai.com/v1", "https://api.openai.com"] {
+            let mut body = build_body("gpt-5", &request);
+            apply_cache_key(&mut body, base_url, &request);
+            assert_eq!(
+                body["prompt_cache_key"],
+                serde_json::json!("kode-1"),
+                "{base_url}"
+            );
+        }
+
+        for base_url in [
+            "https://opencode.ai/zen/go/v1",
+            "http://127.0.0.1:1234/v1",
+            "https://api.openai.com.evil.test/v1",
+        ] {
+            let mut body = build_body("gpt-5", &request);
+            apply_cache_key(&mut body, base_url, &request);
+            assert!(body.get("prompt_cache_key").is_none(), "{base_url}");
+        }
+    }
+
+    #[test]
+    fn cache_key_absent_sends_nothing() {
+        let request = ModelRequest {
+            messages: vec![Message::User("hi".into())],
+            ..Default::default()
+        };
+        let mut body = build_body("gpt-5", &request);
+        apply_cache_key(&mut body, "https://api.openai.com/v1", &request);
+        assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    fn usage_of(json: &str) -> Usage {
+        let wire: ChunkWire = serde_json::from_str(json).unwrap();
+        map_chunk(wire).usage.unwrap()
+    }
+
+    #[test]
+    fn map_chunk_reads_openai_cached_tokens() {
+        let usage = usage_of(
+            r#"{"choices":[],"usage":{"prompt_tokens":2006,"completion_tokens":300,"prompt_tokens_details":{"cached_tokens":1920}}}"#,
+        );
+        assert_eq!(usage.input_tokens, 2006);
+        assert_eq!(usage.cache_read_tokens, Some(1920));
+        assert_eq!(usage.cache_write_tokens, None);
+    }
+
+    #[test]
+    fn map_chunk_reads_deepseek_cache_hit_tokens() {
+        let usage = usage_of(
+            r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_cache_hit_tokens":64,"prompt_cache_miss_tokens":36}}"#,
+        );
+        assert_eq!(usage.cache_read_tokens, Some(64));
+    }
+
+    #[test]
+    fn map_chunk_without_cache_fields_reports_none() {
+        for json in [
+            r#"{"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":7}}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":7,"prompt_tokens_details":null}}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":7,"prompt_tokens_details":{}}}"#,
+        ] {
+            assert_eq!(usage_of(json).cache_read_tokens, None, "{json}");
+        }
     }
 }
