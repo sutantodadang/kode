@@ -140,10 +140,16 @@ pub struct HistoryTurn {
     pub response: String,
 }
 
+/// When history no longer fits, this many turns leave at once. Dropping one
+/// turn per task would shift the prompt prefix every task and defeat the
+/// provider's prompt cache.
+pub const HISTORY_DROP_BLOCK: usize = 4;
+
 /// Selects the newest suffix of `turns` whose estimated size (chars/4,
-/// consistent with kode-context) fits `budget_tokens`. Always keeps at
-/// least the newest turn when any exist. Returns the kept slice and
-/// whether anything was dropped.
+/// consistent with kode-context) fits `budget_tokens`, then rounds the start
+/// up to a multiple of [`HISTORY_DROP_BLOCK`]. Always keeps at least the
+/// newest turn when any exist. Returns the kept slice and whether anything
+/// was dropped.
 pub fn select_history(turns: &[HistoryTurn], budget_tokens: usize) -> (&[HistoryTurn], bool) {
     let mut start = turns.len();
     let mut used = 0usize;
@@ -158,6 +164,10 @@ pub fn select_history(turns: &[HistoryTurn], budget_tokens: usize) -> (&[History
         if used > budget_tokens {
             break;
         }
+    }
+    if start > 0 {
+        let aligned = start.div_ceil(HISTORY_DROP_BLOCK) * HISTORY_DROP_BLOCK;
+        start = aligned.min(turns.len() - 1);
     }
     (&turns[start..], start > 0)
 }
@@ -1738,6 +1748,41 @@ mod tests {
         let (kept, truncated) = select_history(&[], 100);
         assert!(kept.is_empty());
         assert!(!truncated);
+    }
+
+    fn sized_turns(count: usize) -> Vec<HistoryTurn> {
+        // 400 chars per turn = 100 estimated tokens.
+        (0..count)
+            .map(|index| HistoryTurn {
+                task: format!("{index:04}{}", "t".repeat(196)),
+                images: Vec::new(),
+                response: "r".repeat(200),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn select_history_start_moves_in_blocks() {
+        // Budget fits five turns. One-at-a-time dropping would start at
+        // 5, 6, 7, 8; block dropping holds the start at 8 for all four.
+        for count in 10..=13 {
+            let turns = sized_turns(count);
+            let (kept, truncated) = select_history(&turns, 500);
+            assert!(truncated);
+            assert!(kept[0].task.starts_with("0008"), "count {count}");
+        }
+        let turns = sized_turns(14);
+        let (kept, _) = select_history(&turns, 500);
+        assert!(kept[0].task.starts_with("0012"));
+    }
+
+    #[test]
+    fn select_history_keeps_newest_turn_when_block_would_drop_everything() {
+        let turns = sized_turns(2);
+        let (kept, truncated) = select_history(&turns, 100);
+        assert!(truncated);
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].task.starts_with("0001"));
     }
 
     #[tokio::test]
