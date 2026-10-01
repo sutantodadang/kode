@@ -219,6 +219,7 @@ pub async fn run(
         &history_turns,
         plan_mode,
         None,
+        Some(pipeline::new_cache_key()),
     )
     .await;
 

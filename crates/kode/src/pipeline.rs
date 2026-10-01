@@ -39,6 +39,16 @@ fn format_token_count(tokens: u32) -> String {
     }
 }
 
+/// One cache key per Kode process. Providers use it to route every request
+/// of this process to the same warm prompt cache.
+pub(crate) fn new_cache_key() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("kode-{}-{nanos}", std::process::id())
+}
+
 fn should_report_context_budget(provider: &str, model: &str, window: u32) -> bool {
     REPORTED_CONTEXT_BUDGETS
         .get_or_init(|| Mutex::new(HashSet::new()))
@@ -267,6 +277,7 @@ pub async fn run_task(
         history,
         plan_mode,
         steering,
+        None,
     )
     .await
 }
@@ -282,6 +293,7 @@ pub async fn run_task_with_input(
     history: &[kode_agent::HistoryTurn],
     plan_mode: bool,
     steering: Option<mpsc::UnboundedReceiver<UserInput>>,
+    cache_key: Option<String>,
 ) -> anyhow::Result<TaskOutcome> {
     let routed = crate::routing::route_task(input, cwd, config, plan_mode, &events, &cancel).await;
     let result = execute_task(
@@ -296,6 +308,7 @@ pub async fn run_task_with_input(
         steering,
         config,
         routed.reranker,
+        cache_key,
     )
     .await;
     if let Some(decision) = &routed.decision
@@ -358,6 +371,7 @@ async fn execute_task(
     mut steering: Option<mpsc::UnboundedReceiver<UserInput>>,
     fallback_config: &KodeConfig,
     reranker: Option<Arc<dyn kode_context::ContextReranker>>,
+    cache_key: Option<String>,
 ) -> anyhow::Result<TaskOutcome> {
     let model = match ModelFactory::create(config) {
         Ok(model) => model,
@@ -475,6 +489,10 @@ async fn execute_task(
         });
     }
 
+    // Part of the cached system prefix: identical for every task while the
+    // skill set is unchanged.
+    let skill_summary = skills.prompt_summary();
+
     let effort = if config.model.effort.is_empty() {
         None
     } else {
@@ -538,7 +556,9 @@ async fn execute_task(
                 events.clone(),
                 agent_config.subagents.max_result_chars,
             )
-            .with_model_tiers(tiers),
+            .with_model_tiers(tiers)
+            .with_system_appendix(skill_summary.clone())
+            .with_cache_key(cache_key.clone()),
         ));
     }
 
@@ -562,8 +582,10 @@ async fn execute_task(
     };
 
     let tools = ToolRuntime::new(registry, config.permissions.default_mode, handler.clone());
-    let agent =
-        Agent::new(model.clone(), tools, events.clone(), &agent_config).with_effort(effort.clone());
+    let agent = Agent::new(model.clone(), tools, events.clone(), &agent_config)
+        .with_effort(effort.clone())
+        .with_system_appendix(skill_summary.clone())
+        .with_cache_key(cache_key.clone());
 
     events.emit(KodeEvent::ContextCompilationStarted);
     let mut compiler =
@@ -602,8 +624,7 @@ async fn execute_task(
         done: true,
     });
 
-    let skill_summary = skills.prompt_summary();
-    let initial_context = merge_agent_context(compiled.render(), skill_summary.as_deref());
+    let initial_context = compiled.render();
 
     let (kept_history, history_truncated) =
         kode_agent::select_history(history, agent_config.history_budget_tokens as usize);
@@ -631,6 +652,8 @@ async fn execute_task(
             &ctx,
             steering.as_mut(),
             Some(skills.clone()),
+            skill_summary.clone(),
+            cache_key.clone(),
         )
         .await?;
 
@@ -744,8 +767,7 @@ async fn execute_task(
                 token_estimate: repair_context.token_estimate(),
                 sections: repair_context.sections.len(),
             });
-            let repair_agent_context =
-                merge_agent_context(repair_context.render(), skill_summary.as_deref());
+            let repair_agent_context = repair_context.render();
 
             let retry_outcome = agent
                 .run_with_context_and_steering(
@@ -854,15 +876,6 @@ fn close_and_defer_steering(
     }
 }
 
-fn merge_agent_context(repository: Option<String>, skills: Option<&str>) -> Option<String> {
-    match (repository, skills) {
-        (Some(repository), Some(skills)) => Some(format!("{repository}\n\n{skills}")),
-        (Some(repository), None) => Some(repository),
-        (None, Some(skills)) => Some(skills.to_string()),
-        (None, None) => None,
-    }
-}
-
 /// Outcome of [`run_plan_phase`]: the human's approve/reject answer to
 /// "execute this plan?", carrying the plan turn's own `AgentOutcome` either
 /// way — `run_task` reports it as the `TaskFinished` counters when the plan
@@ -900,6 +913,8 @@ async fn run_plan_phase(
     ctx: &ToolContext,
     steering: Option<&mut mpsc::UnboundedReceiver<UserInput>>,
     skills: Option<Arc<SkillCatalog>>,
+    system_appendix: Option<String>,
+    cache_key: Option<String>,
 ) -> anyhow::Result<PlanOutcome> {
     // No implementation tools are offered on this turn. `Deny` still permits
     // the optional read-only `use_skill` tool.
@@ -908,7 +923,10 @@ async fn run_plan_phase(
         registry.register(Arc::new(UseSkill::new(skills)));
     }
     let tools = ToolRuntime::new(registry, PermissionMode::Deny, handler.clone());
-    let plan_agent = Agent::new(model, tools, events.clone(), agent_cfg).with_effort(effort);
+    let plan_agent = Agent::new(model, tools, events.clone(), agent_cfg)
+        .with_effort(effort)
+        .with_system_appendix(system_appendix)
+        .with_cache_key(cache_key);
 
     let plan_prompt = UserInput {
         text: format!("{}\n\n{PLAN_INSTRUCTION}", task.text),
@@ -1183,15 +1201,44 @@ mod plan_phase_tests {
     use kode_tools::permission::{AutoApprove, AutoDeny};
 
     #[test]
-    fn skill_catalog_is_appended_to_repository_context() {
-        assert_eq!(
-            merge_agent_context(Some("repo".to_string()), Some("skills")),
-            Some("repo\n\nskills".to_string())
-        );
-        assert_eq!(
-            merge_agent_context(None, Some("skills")),
-            Some("skills".to_string())
-        );
+    fn cache_keys_are_process_scoped_and_distinct() {
+        let a = new_cache_key();
+        let b = new_cache_key();
+        assert!(a.starts_with(&format!("kode-{}-", std::process::id())));
+        assert_ne!(a, b);
+    }
+
+    #[tokio::test]
+    async fn plan_phase_forwards_appendix_and_cache_key() {
+        let dir = temp_dir("hints");
+        let mock = Arc::new(MockModel::new());
+        mock.push_script(plan_script("1. do the thing"));
+
+        run_plan_phase(
+            mock.clone(),
+            &EventBus::new(64),
+            Arc::new(AutoApprove),
+            &AgentConfig::default(),
+            None,
+            &UserInput::text("add a widget"),
+            Some("CTX"),
+            &[],
+            false,
+            &ctx(dir),
+            None,
+            None,
+            Some("SKILL_CATALOG".to_string()),
+            Some("kode-plan".to_string()),
+        )
+        .await
+        .unwrap();
+
+        let requests = mock.requests();
+        assert_eq!(requests[0].cache_key.as_deref(), Some("kode-plan"));
+        assert!(matches!(
+            &requests[0].messages[0],
+            Message::System(text) if text.ends_with("\n\nSKILL_CATALOG")
+        ));
     }
 
     #[test]
@@ -1261,6 +1308,8 @@ mod plan_phase_tests {
             &ctx(dir),
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1310,6 +1359,8 @@ mod plan_phase_tests {
             &[],
             false,
             &ctx(dir),
+            None,
+            None,
             None,
             None,
         )

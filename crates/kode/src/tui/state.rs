@@ -491,6 +491,8 @@ pub struct AppState {
     pub history: Vec<crate::session::Turn>,
     /// Active session file id; created lazily on first completed task.
     pub session_id: Option<String>,
+    /// Provider prompt-cache key for every task this TUI process runs.
+    pub cache_key: String,
     /// Task text of the in-flight run; consumed when TaskFinished arrives.
     pub pending_task: Option<UserInput>,
     /// Stable receipt for the most recently completed run. Cleared as soon
@@ -615,6 +617,7 @@ impl AppState {
             slash_selected: 0,
             history: Vec::new(),
             session_id: None,
+            cache_key: crate::pipeline::new_cache_key(),
             pending_task: None,
             completion: None,
             last_error: None,
