@@ -605,11 +605,12 @@ async fn execute_task(
             Duration::from_millis(config.router.rerank_timeout_ms),
         );
     }
+    let working_set = working_set_from(kode_context::git::repo_state(cwd).await);
     let compiled = compiler
         .compile(
             &ContextRequest {
                 task: input.text.clone(),
-                working_set: vec![],
+                working_set,
             },
             cwd,
         )
@@ -764,11 +765,12 @@ async fn execute_task(
                 }
             }
             events.emit(KodeEvent::ContextCompilationStarted);
+            let repair_working_set = working_set_from(kode_context::git::repo_state(cwd).await);
             let repair_context = compiler
                 .compile(
                     &ContextRequest {
                         task: retry_task.text.clone(),
-                        working_set: vec![],
+                        working_set: repair_working_set,
                     },
                     cwd,
                 )
@@ -1010,6 +1012,24 @@ fn combine_outcomes(
         usage,
         a.mutated || b.mutated,
     )
+}
+
+const WORKING_SET_MAX: usize = 20;
+
+/// Files with uncommitted changes: the best available signal for what the
+/// user is working on. Code retrieval ranks toward them. Empty outside a
+/// git repository.
+fn working_set_from(state: Option<kode_context::git::RepoState>) -> Vec<String> {
+    state
+        .map(|state| {
+            state
+                .numstat
+                .into_iter()
+                .take(WORKING_SET_MAX)
+                .map(|row| row.path)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Builds a `KodeEvent::Knowledge` digest from a compiled context. Pure —
@@ -1452,6 +1472,53 @@ mod verification_tests {
         let (.., usage, mutated) = combine_outcomes(&a, &b);
         assert!(!mutated);
         assert_eq!(usage.cache_read_tokens, None);
+    }
+
+    fn row(path: &str) -> kode_context::git::NumstatRow {
+        kode_context::git::NumstatRow {
+            path: path.to_string(),
+            added: 1,
+            deleted: 0,
+        }
+    }
+
+    #[test]
+    fn working_set_is_empty_outside_a_repository() {
+        assert!(working_set_from(None).is_empty());
+    }
+
+    #[test]
+    fn working_set_lists_changed_files_in_git_order() {
+        let state = kode_context::git::RepoState {
+            dirty: true,
+            numstat: vec![row("src/b.rs"), row("src/a.rs")],
+        };
+        assert_eq!(working_set_from(Some(state)), vec!["src/b.rs", "src/a.rs"]);
+    }
+
+    #[test]
+    fn working_set_is_capped() {
+        let state = kode_context::git::RepoState {
+            dirty: true,
+            numstat: (0..50).map(|n| row(&format!("src/f{n}.rs"))).collect(),
+        };
+        let set = working_set_from(Some(state));
+        assert_eq!(set.len(), WORKING_SET_MAX);
+        assert_eq!(set[0], "src/f0.rs");
+    }
+
+    #[tokio::test]
+    async fn working_set_of_a_non_repository_directory_is_empty() {
+        let dir = std::env::temp_dir().join(format!(
+            "kode-working-set-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(working_set_from(kode_context::git::repo_state(&dir).await).is_empty());
     }
 }
 
