@@ -331,7 +331,7 @@ pub(crate) fn gutter_spans(gutter: Gutter, edit: bool, wide: bool) -> Vec<Span<'
         bold
     };
     match (gutter, wide) {
-        (Gutter::None | Gutter::User | Gutter::ThreadHead, _) => Vec::new(),
+        (Gutter::None | Gutter::User | Gutter::Reply | Gutter::ThreadHead, _) => Vec::new(),
         (Gutter::Zindeks, true) => vec![span("●", knot(theme::Z)), span("─┼─┼─ ", run(theme::Z))],
         (Gutter::Ingat, true) => vec![
             span("│ ", dim),
@@ -550,9 +550,6 @@ fn route_text_spans(text: &str, elapsed_ms: u128, reduced_motion: bool) -> Vec<S
 /// given transcript `width` (which picks the wide or narrow gutter).
 /// Markdown-rendered Prose lines (`md_kind`/`spans` both `Some`) render their
 /// styled spans; everything else falls back to the legacy plain-text span.
-///
-/// ponytail: wrapped continuation rows keep ratatui's plain wrap and carry no
-/// gutter; gutter-aligned continuation needs a custom wrapper.
 pub(crate) fn transcript_line_to_ratatui(line: &TranscriptLine, width: u16) -> Line<'static> {
     transcript_line_at(line, width, Instant::now(), false, false)
 }
@@ -583,6 +580,12 @@ pub(crate) fn transcript_line_at(
                 Span::raw("  "),
                 Span::styled(line.text.clone(), bold),
             ]);
+        }
+        Gutter::Reply => {
+            return Line::from(Span::styled(
+                "KODE",
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
         }
         _ => {}
     }
@@ -979,6 +982,122 @@ pub(crate) fn hit_test_row(rows: &[(u16, Option<usize>)], content_row: u16) -> O
     None
 }
 
+/// Reading measure for model prose, in text columns after the gutter.
+pub(crate) const PROSE_MAX_COLS: usize = 100;
+
+/// Spans that open every wrapped row after the first: the idle thread gutter
+/// (verification keeps its dotted threads), plus a hanging indent under a
+/// bullet's text or after `YOU  `.
+fn continuation_spans(line: &TranscriptLine, wide: bool) -> Vec<Span<'static>> {
+    let dim = Style::default().fg(theme::DIM);
+    let mut spans = match line.gutter {
+        Gutter::User => return vec![Span::raw("     ")],
+        Gutter::None | Gutter::Reply | Gutter::ThreadHead => return Vec::new(),
+        Gutter::Verify | Gutter::VerifyFail | Gutter::VerifySkip if wide => {
+            vec![Span::styled("┆ ┆ ┆  ", dim)]
+        }
+        _ if wide => vec![Span::styled("│ │ │  ", dim)],
+        _ => vec![Span::styled("   ", dim)],
+    };
+    if line.md_kind == Some(markdown::MdKind::Bullet)
+        && let Some(marker) = line.spans.as_ref().and_then(|s| s.first())
+    {
+        spans.push(Span::raw(
+            " ".repeat(UnicodeWidthStr::width(marker.0.as_str())),
+        ));
+    }
+    spans
+}
+
+/// Renders `line` and splits it into rows no wider than `width`, word by
+/// word, starting every row after the first with `continuation_spans`. Prose
+/// (paragraph, bullet, heading, streaming text) is additionally capped at
+/// `PROSE_MAX_COLS` text columns. Words longer than a row are cut on
+/// character boundaries. Ratatui's own wrap would start continuation rows at
+/// column 0 and lose the gutter.
+pub(crate) fn wrap_transcript_line(
+    line: &TranscriptLine,
+    rendered: Line<'static>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let wide = is_wide(width.saturating_add(1));
+    let width = usize::from(width.max(1));
+    let base_w = if wide { 7 } else { 3 };
+    let mut limit = width;
+    if line.gutter == Gutter::Prose
+        && !matches!(
+            line.md_kind,
+            Some(markdown::MdKind::Code | markdown::MdKind::CodeFence)
+        )
+    {
+        limit = limit.min(base_w + PROSE_MAX_COLS);
+    }
+    let has_newline = rendered.spans.iter().any(|s| s.content.contains('\n'));
+    if !has_newline && spans_width(&rendered.spans) <= limit {
+        return vec![rendered];
+    }
+    let cont = continuation_spans(line, wide);
+    let cont_w = spans_width(&cont);
+    let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut cur_w = 0usize;
+    let mut fresh = false;
+    for span in &rendered.spans {
+        let style = span.style;
+        let mut pieces: Vec<(String, bool)> = Vec::new();
+        for ch in span.content.chars() {
+            let ws = ch.is_whitespace();
+            match pieces.last_mut() {
+                Some((p, w)) if *w == ws && ch != '\n' && p != "\n" => p.push(ch),
+                _ => pieces.push((ch.to_string(), ws)),
+            }
+        }
+        for (piece, ws) in pieces {
+            if piece == "\n" {
+                rows.push(cont.clone());
+                cur_w = cont_w;
+                fresh = true;
+                continue;
+            }
+            let pw = UnicodeWidthStr::width(piece.as_str());
+            if ws {
+                if !fresh && cur_w + pw <= limit {
+                    rows.last_mut().unwrap().push(Span::styled(piece, style));
+                    cur_w += pw;
+                }
+                continue;
+            }
+            if cur_w + pw > limit && !fresh {
+                rows.push(cont.clone());
+                cur_w = cont_w;
+            }
+            if cur_w + pw <= limit {
+                rows.last_mut().unwrap().push(Span::styled(piece, style));
+                cur_w += pw;
+                fresh = false;
+                continue;
+            }
+            let mut chunk = String::new();
+            for ch in piece.chars() {
+                let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                if cur_w + cw > limit && !chunk.is_empty() {
+                    rows.last_mut()
+                        .unwrap()
+                        .push(Span::styled(std::mem::take(&mut chunk), style));
+                    rows.push(cont.clone());
+                    cur_w = cont_w;
+                }
+                chunk.push(ch);
+                cur_w += cw;
+            }
+            if !chunk.is_empty() {
+                rows.last_mut().unwrap().push(Span::styled(chunk, style));
+            }
+            fresh = false;
+        }
+    }
+    rows.into_iter().map(Line::from).collect()
+}
+
 /// Exact rendered row count for one logical `line` at `width` columns —
 /// ratatui's own `Paragraph::line_count` (the `unstable-rendered-line-info`
 /// feature, enabled in `crates/kode/Cargo.toml`), run through the identical
@@ -1053,20 +1172,33 @@ impl TranscriptCache {
             }
             let header = !source.tool_children.is_empty();
             let trace_bold = ctx.trace_from.is_some_and(|start| index >= start);
-            let mut entries = vec![(
-                transcript_line_at(source, width, ctx.now, ctx.reduced_motion, trace_bold),
-                header.then_some(index),
-            )];
+            let wrap_width = width.saturating_sub(1);
+            let main = transcript_line_at(source, width, ctx.now, ctx.reduced_motion, trace_bold);
+            let mut entries: Vec<(Line<'static>, Option<usize>)> =
+                wrap_transcript_line(source, main, wrap_width)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, row)| {
+                        (
+                            row,
+                            if i == 0 {
+                                header.then_some(index)
+                            } else {
+                                None
+                            },
+                        )
+                    })
+                    .collect();
             if header && source.expanded {
-                entries.extend(source.tool_children.iter().map(|child| {
-                    (
-                        transcript_line_to_ratatui(
-                            &TranscriptLine::new(Gutter::Tool, format!("  {child}")),
-                            width,
-                        ),
-                        None,
-                    )
-                }));
+                for child in &source.tool_children {
+                    let child_line = TranscriptLine::new(Gutter::Tool, format!("  {child}"));
+                    let rendered = transcript_line_to_ratatui(&child_line, width);
+                    entries.extend(
+                        wrap_transcript_line(&child_line, rendered, wrap_width)
+                            .into_iter()
+                            .map(|row| (row, None)),
+                    );
+                }
             }
             let cached = CachedTranscriptLine {
                 source: source.clone(),
@@ -1777,10 +1909,19 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
         }
         let empty_len = extra.len();
         if !state.current_stream.is_empty() {
-            extra.push(transcript_line_to_ratatui(
-                &TranscriptLine::new(Gutter::Prose, state.current_stream.clone()),
-                transcript_area.width,
-            ));
+            for part in state.current_stream.split('\n') {
+                if part.is_empty() {
+                    extra.push(Line::default());
+                    continue;
+                }
+                let tl = TranscriptLine::new(Gutter::Prose, part);
+                let rendered = transcript_line_to_ratatui(&tl, transcript_area.width);
+                extra.extend(wrap_transcript_line(
+                    &tl,
+                    rendered,
+                    transcript_area.width.saturating_sub(1),
+                ));
+            }
         }
         let mut text_lines = Vec::new();
         let mut indices = Vec::new();

@@ -91,7 +91,7 @@ Approved 30 September 2026. Interactive preview: `C:/Users/sutan/.gstack/project
  │ ●─┼─ "30s timeout was tried, then reverted" · 12 Aug              memory
  │ │ ●─ 3 files co-change with catalog.rs                               git
  ╰─┴─┴▶ route sonnet · effort high   ■■■■■■■□□□ 0.71
- │ │ │
+ KODE
  │ │ │  fetch_catalog has 4 callers and fails when the catalog is slow...
  ●═╪═╪═ edit catalog.rs  +14 −3
  ┆ ┆ ┆  VERIFY  fmt ✓ 0.4s   clippy ✓ 1.6s   test ◐ 2.1s   lint ·
@@ -104,8 +104,9 @@ Five regions persist, top to bottom: scope row, step rail, thread ledger, now-li
 
 - **Scope row.** Repo and branch with dirty marker, then `PLAN` and `AUTO` as independent authority labels (both stay visible when both are active), then the model, then a context meter on the right. The model is dropped before either authority label. The meter is 8 cells plus `used/budget`; below 80 columns it is numbers only. Before the first context compilation it reads `ctx —`, never `0`.
 - **Step rail.** The steps are exactly the `TaskStep` values: `UNDERSTAND`, `DECIDE`, `CHANGE`, `VERIFY`, with `PLAN` prepended only in plan mode. A finished step shows `✓`, the active step is bold with the running glyph, a future step shows `·`. The connector between two steps turns from `──` to `━━` only when the earlier step is actually done. The token pulse sits between the rail and the elapsed clock. Below 80 columns the rail collapses to `3/4 CHANGE ◐` and the pulse takes the remaining width.
-- **Thread ledger.** A chronological transcript with a permanent left gutter. At 80 columns or more the gutter is three threads, `g` (graph), `m` (memory), `t` (git), in seven cells. A sourced fact is a knot `●` on its own thread with a run `─` drawn to the text, and the source name right-aligned. A routing decision gathers the threads into `╰─┴─┴▶`. An edit is `●═╪═╪═`. Rows without a single source continue the threads as `│ │ │`; verification rows use `┆ ┆ ┆` because no source is being consulted. Below 80 columns the gutter is three cells: the source letter plus `●` for facts, `▶` for the route, `●═` for edits. The letter carries the meaning when color is unavailable.
+- **Thread ledger.** A chronological transcript with a permanent left gutter. At 80 columns or more the gutter is three threads, `g` (graph), `m` (memory), `t` (git), in seven cells. A sourced fact is a knot `●` on its own thread with a run `─` drawn to the text, and the source name right-aligned. A routing decision gathers the threads into `╰─┴─┴▶`. An edit is `●═╪═╪═`. Rows without a single source continue the threads as `│ │ │`; verification rows use `┆ ┆ ┆` because no source is being consulted. Below 80 columns the gutter is three cells: the source letter plus `●` for facts, `▶` for the route, `●═` for edits. The letter carries the meaning when color is unavailable. A line wider than the ledger wraps word by word and every wrapped row continues the threads (`│ │ │`, or `┆ ┆ ┆` for verification); bullets and the `YOU` row get a hanging indent. Model prose is capped at a 100-column reading measure.
 - **Model prose stays at full brightness.** Only facts with exactly one source get a knot. Prose is never dimmed for being unsourced, and nothing is given a knot unless the pipeline attributed it.
+- **`KODE` opens the reply.** Once per task, a bold `KODE` row precedes the model's first prose line, mirroring `YOU`. Later prose in the same task (after tools) has no second label.
 - **Now-line.** One row that always answers three questions: what is happening, for how long, and what the next key does. The left side names one of five states: `model thinking`, `model writing`, `tool: <name>`, `waiting for you`, or the terminal state (`done · verified`, `stopped · verification failed`, `ready`). The right side states what Enter and Esc do in this exact state.
 - **Composer.** One to six wrapped rows, then it scrolls around the cursor. Attachments show the newest two and an overflow count.
 - **Small terminals.** At 60×20 the scope row, step rail, at least three ledger rows, the now-line, and the composer remain visible. Overlays scroll rather than hide their selected action.
@@ -135,8 +136,8 @@ Git moved from green to rose. In the previous palette git and verified-success b
 
 Font and size belong to the terminal. Hierarchy uses cell position, weight, and case.
 
-- **Bold:** `YOU`, the active step name, knots, the item being decided, check result glyphs.
-- **Uppercase:** step names, `PLAN`, `AUTO`, and the block labels `VERIFY`, `RECEIPT`, `PERMISSION`, `FAILED`. Nothing else.
+- **Bold:** `YOU`, `KODE`, the active step name, knots, the item being decided, check result glyphs.
+- **Uppercase:** step names, `PLAN`, `AUTO`, `KODE`, and the block labels `VERIFY`, `RECEIPT`, `PERMISSION`, `FAILED`. Nothing else.
 - **Never:** italics, or color as the only signal.
 
 | Glyph | Meaning |
@@ -232,3 +233,5 @@ The three threads show engine state instead of a logo: graph (symbols indexed, a
 | 2026-09-30 | Model prose not dimmed | The outside design voice proposed dimming unsourced prose; rejected because readability was the first request. |
 | 2026-09-30 | Symbol map deferred | Needs a pipeline event that does not exist yet. |
 | 2026-09-30 | Input, picker, permission, resume contracts kept | Implemented and tested two days ago; the redesign is about information and identity. |
+| 2026-10-01 | KODE reply label | Owner asked for the reply to stand out; a label mirrors YOU and keeps the no-box rule. |
+| 2026-10-01 | Wrapped rows keep the gutter; prose measure 100 columns | Ratatui wrap dropped continuation rows to column 0, and 200-column prose lines were hard to read. |

@@ -358,11 +358,12 @@ fn tool_started_flushes_current_stream_and_pushes_line() {
             name: "read_file".into(),
         },
     );
-    assert_eq!(s.transcript.len(), 2);
-    assert_eq!(s.transcript[0].gutter, Gutter::Prose);
-    assert_eq!(s.transcript[0].text, "thinking...");
+    assert_eq!(s.transcript.len(), 4);
+    assert_eq!(s.transcript[1].gutter, Gutter::Reply);
+    assert_eq!(s.transcript[2].gutter, Gutter::Prose);
+    assert_eq!(s.transcript[2].text, "thinking...");
     assert_eq!(
-        s.transcript[1],
+        s.transcript[3],
         TranscriptLine::new(Gutter::Tool, "read_file")
     );
     assert!(s.current_stream.is_empty());
@@ -3532,13 +3533,14 @@ fn flushed_heading_line_gets_markdown_spans_and_leading_spacer() {
             name: "read_file".into(),
         },
     );
-    // spacer blank line, then the heading, then the tool line.
-    assert_eq!(s.transcript.len(), 3);
+    // spacer blank line, the KODE label, the heading, then the tool line.
+    assert_eq!(s.transcript.len(), 4);
     assert_eq!(s.transcript[0].gutter, Gutter::None);
-    assert_eq!(s.transcript[1].gutter, Gutter::Prose);
-    assert_eq!(s.transcript[1].md_kind, Some(markdown::MdKind::Heading));
+    assert_eq!(s.transcript[1].gutter, Gutter::Reply);
+    assert_eq!(s.transcript[2].gutter, Gutter::Prose);
+    assert_eq!(s.transcript[2].md_kind, Some(markdown::MdKind::Heading));
     assert_eq!(
-        s.transcript[1].spans,
+        s.transcript[2].spans,
         Some(vec![("Plan".to_string(), markdown::MdStyle::Bold)])
     );
 }
@@ -3936,10 +3938,11 @@ fn steering_line_follows_any_text_already_streamed_by_agent() {
 
     route_running_input(&mut s, Some(&tx), &mut queued, "user steer".to_string());
 
-    assert_eq!(s.transcript[0].gutter, Gutter::Prose);
-    assert_eq!(s.transcript[0].text, "agent before steer");
-    assert_eq!(s.transcript[1].gutter, Gutter::User);
-    assert_eq!(s.transcript[1].text, "user steer");
+    assert_eq!(s.transcript[1].gutter, Gutter::Reply);
+    assert_eq!(s.transcript[2].gutter, Gutter::Prose);
+    assert_eq!(s.transcript[2].text, "agent before steer");
+    assert_eq!(s.transcript[3].gutter, Gutter::User);
+    assert_eq!(s.transcript[3].text, "user steer");
 }
 
 #[test]
@@ -4463,4 +4466,184 @@ fn receipt_never_shows_unreported_cache_as_zero() {
         "{receipt}"
     );
     assert!(!receipt.contains("0 cached"), "{receipt}");
+}
+
+// -- wrapped rows keep the gutter / KODE reply label -------------------
+
+fn row_width(line: &Line) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    line.spans.iter().map(|s| s.content.width()).sum()
+}
+
+fn long_words(n: usize) -> String {
+    (0..n)
+        .map(|i| format!("word{i}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn wrap_at(tl: &TranscriptLine, width: u16) -> Vec<Line<'static>> {
+    use crate::tui::draw::{transcript_line_to_ratatui, wrap_transcript_line};
+    wrap_transcript_line(tl, transcript_line_to_ratatui(tl, width), width - 1)
+}
+
+#[test]
+fn wrapped_prose_rows_keep_the_thread_gutter() {
+    let tl = TranscriptLine::new(Gutter::Prose, long_words(60));
+    let rows = wrap_at(&tl, 80);
+    assert!(rows.len() > 1);
+    for row in &rows {
+        assert!(line_text(row).starts_with("│ │ │  "), "{}", line_text(row));
+        assert!(row_width(row) <= 79);
+    }
+}
+
+#[test]
+fn prose_is_capped_at_the_reading_measure() {
+    let tl = TranscriptLine::new(Gutter::Prose, long_words(80));
+    let rows = wrap_at(&tl, 225);
+    assert!(rows.len() > 1);
+    for row in &rows {
+        assert!(row_width(row) <= 7 + crate::tui::draw::PROSE_MAX_COLS);
+    }
+}
+
+#[test]
+fn bullet_continuation_hangs_under_the_text() {
+    let rendered = crate::tui::markdown::render_line(&format!("- {}", long_words(60)), &mut false);
+    let tl = TranscriptLine::markdown(Gutter::Prose, "- x", rendered.kind, rendered.spans);
+    let rows = wrap_at(&tl, 80);
+    assert!(rows.len() > 1);
+    for row in &rows[1..] {
+        let text = line_text(row);
+        assert!(text.starts_with("│ │ │    "), "{text}");
+        assert!(!text.starts_with("│ │ │     "), "{text}");
+    }
+}
+
+#[test]
+fn user_row_continuation_aligns_after_you() {
+    let tl = TranscriptLine::new(Gutter::User, long_words(40));
+    let rows = wrap_at(&tl, 60);
+    assert!(rows.len() > 1);
+    for row in &rows[1..] {
+        assert!(line_text(row).starts_with("     "));
+        assert!(row_width(row) <= 59);
+    }
+}
+
+#[test]
+fn narrow_width_uses_three_cell_continuation() {
+    let tl = TranscriptLine::new(Gutter::Prose, long_words(60));
+    let rows = wrap_at(&tl, 60);
+    assert!(rows.len() > 1);
+    for row in &rows[1..] {
+        let text = line_text(row);
+        assert!(text.starts_with("   "));
+        assert!(!text.starts_with('│'));
+    }
+}
+
+#[test]
+fn overlong_word_and_multibyte_text_do_not_panic() {
+    for text in ["x".repeat(300), "é".repeat(300)] {
+        let tl = TranscriptLine::new(Gutter::Prose, text);
+        let rows = wrap_at(&tl, 80);
+        assert!(rows.len() > 1);
+        for row in &rows {
+            assert!(row_width(row) <= 79);
+        }
+    }
+}
+
+#[test]
+fn code_lines_are_not_capped_by_the_prose_measure() {
+    let mut tl = TranscriptLine::new(Gutter::Prose, "c".repeat(180));
+    tl.md_kind = Some(crate::tui::markdown::MdKind::Code);
+    assert_eq!(wrap_at(&tl, 225).len(), 1);
+}
+
+fn reply_count(s: &AppState) -> usize {
+    s.transcript
+        .iter()
+        .filter(|l| l.gutter == Gutter::Reply)
+        .count()
+}
+
+#[test]
+fn kode_label_opens_the_reply_once_per_task() {
+    let mut s = state();
+    s.start_new_task("q", false);
+    apply_event(
+        &mut s,
+        KodeEvent::ModelToken {
+            text: "first line\n".into(),
+        },
+    );
+    apply_event(
+        &mut s,
+        KodeEvent::ToolStarted {
+            name: "read_file".into(),
+        },
+    );
+    apply_event(
+        &mut s,
+        KodeEvent::ModelToken {
+            text: "second".into(),
+        },
+    );
+    apply_event(&mut s, KodeEvent::AgentFinished);
+    assert_eq!(reply_count(&s), 1);
+    let at = s
+        .transcript
+        .iter()
+        .position(|l| l.gutter == Gutter::Reply)
+        .unwrap();
+    let prose = s
+        .transcript
+        .iter()
+        .position(|l| l.gutter == Gutter::Prose)
+        .unwrap();
+    assert!(at < prose);
+    assert_eq!(s.transcript[at - 1], TranscriptLine::new(Gutter::None, ""));
+}
+
+#[test]
+fn no_label_without_prose() {
+    let mut s = state();
+    s.start_new_task("q", false);
+    apply_event(
+        &mut s,
+        KodeEvent::ToolStarted {
+            name: "read_file".into(),
+        },
+    );
+    apply_event(&mut s, KodeEvent::AgentFinished);
+    assert_eq!(reply_count(&s), 0);
+}
+
+#[test]
+fn next_task_gets_its_own_label() {
+    let mut s = state();
+    for _ in 0..2 {
+        s.start_new_task("q", false);
+        apply_event(
+            &mut s,
+            KodeEvent::ModelToken {
+                text: "hello".into(),
+            },
+        );
+        apply_event(&mut s, KodeEvent::AgentFinished);
+    }
+    assert_eq!(reply_count(&s), 2);
+}
+
+#[test]
+fn kode_label_renders_bold_without_gutter() {
+    let row = crate::tui::draw::transcript_line_to_ratatui(
+        &TranscriptLine::new(Gutter::Reply, "KODE"),
+        80,
+    );
+    assert_eq!(line_text(&row), "KODE");
+    assert!(row.spans[0].style.add_modifier.contains(Modifier::BOLD));
 }
