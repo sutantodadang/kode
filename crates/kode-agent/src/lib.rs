@@ -12,11 +12,11 @@ use kode_core::config::AgentConfig;
 use kode_core::event::{EventBus, KodeEvent};
 use kode_core::{ImageAttachment, UserInput};
 use kode_model::{
-    Message, Model, ModelError, ModelRequest, ResponseAccumulator, StreamEvent, ToolSpec, Usage,
-    collect_response,
+    Message, Model, ModelError, ModelRequest, ResponseAccumulator, StreamEvent, ToolCall, ToolSpec,
+    Usage, collect_response,
 };
 use kode_tools::registry::ToolRuntime;
-use kode_tools::{ToolContext, ToolError};
+use kode_tools::{RequiredPermission, ToolContext, ToolError, ToolOutput};
 use prompt_budget::PromptBudget;
 use tokio::sync::mpsc;
 
@@ -348,6 +348,53 @@ impl Agent {
         self
     }
 
+    /// A batch may run concurrently only when nothing in it can write, ask
+    /// for permission or delegate. Read-only calls cannot conflict; anything
+    /// else keeps the order the model chose.
+    fn can_run_in_parallel(&self, calls: &[ToolCall]) -> bool {
+        calls.len() > 1
+            && calls.iter().all(|call| {
+                call.name != "delegate_task"
+                    && self.tools.required_permission(&call.name)
+                        == Some(RequiredPermission::ReadOnly)
+            })
+    }
+
+    /// Runs one tool call and emits its lifecycle events. Cancellation emits
+    /// no finish event: the run is ending.
+    async fn run_tool_call(
+        &self,
+        call: &ToolCall,
+        ctx: &ToolContext,
+    ) -> kode_tools::Result<(ToolOutput, bool)> {
+        self.events.emit(KodeEvent::ToolRequested {
+            name: call.name.clone(),
+        });
+        self.events.emit(KodeEvent::ToolStarted {
+            name: tool_event_label(&call.name, &call.arguments),
+        });
+
+        let result = self
+            .tools
+            .execute_with_effect(&call.name, call.arguments.clone(), ctx)
+            .await;
+
+        match &result {
+            Ok(_) => self.events.emit(KodeEvent::ToolFinished {
+                name: call.name.clone(),
+                ok: true,
+                error: None,
+            }),
+            Err(ToolError::Cancelled) => {}
+            Err(error) => self.events.emit(KodeEvent::ToolFinished {
+                name: call.name.clone(),
+                ok: false,
+                error: Some(error.to_string()),
+            }),
+        }
+        result
+    }
+
     pub async fn run(&self, task: &str, ctx: &ToolContext) -> Result<AgentOutcome> {
         self.run_with_context(task, None, &[], false, ctx).await
     }
@@ -632,48 +679,54 @@ impl Agent {
                 tool_calls: response.tool_calls.clone(),
             });
 
-            for call in &response.tool_calls {
-                self.events.emit(KodeEvent::ToolRequested {
-                    name: call.name.clone(),
-                });
-                self.events.emit(KodeEvent::ToolStarted {
-                    name: tool_event_label(&call.name, &call.arguments),
-                });
-                total_tool_calls += 1;
+            total_tool_calls += response.tool_calls.len() as u32;
 
-                match self
-                    .tools
-                    .execute_with_effect(&call.name, call.arguments.clone(), ctx)
-                    .await
-                {
+            let results = if self.can_run_in_parallel(&response.tool_calls) {
+                let batch = futures::future::join_all(
+                    response
+                        .tool_calls
+                        .iter()
+                        .map(|call| self.run_tool_call(call, ctx)),
+                );
+                // Read-only tools may not watch the cancel token themselves.
+                // Dropping them is safe: they hold nothing that needs
+                // cleanup. The sequential path below is left alone on
+                // purpose: `run_command` must see the cancellation itself so
+                // it can kill its process tree.
+                tokio::select! {
+                    biased;
+                    _ = ctx.cancel.cancelled() => return Err(AgentError::Cancelled),
+                    results = batch => results,
+                }
+            } else {
+                let mut results = Vec::with_capacity(response.tool_calls.len());
+                for call in &response.tool_calls {
+                    let result = self.run_tool_call(call, ctx).await;
+                    let cancelled = matches!(result, Err(ToolError::Cancelled));
+                    results.push(result);
+                    if cancelled {
+                        break;
+                    }
+                }
+                results
+            };
+
+            // Results go back in the order the model issued the calls, not
+            // the order they finished in.
+            for (call, result) in response.tool_calls.iter().zip(results) {
+                match result {
                     Ok((out, tool_mutated)) => {
-                        if tool_mutated {
-                            mutated = true;
-                        }
-                        self.events.emit(KodeEvent::ToolFinished {
-                            name: call.name.clone(),
-                            ok: true,
-                            error: None,
-                        });
+                        mutated |= tool_mutated;
                         messages.push(Message::Tool {
                             tool_call_id: call.id.clone(),
                             content: out.content,
                         });
                     }
-                    Err(ToolError::Cancelled) => {
-                        return Err(AgentError::Cancelled);
-                    }
-                    Err(e) => {
-                        self.events.emit(KodeEvent::ToolFinished {
-                            name: call.name.clone(),
-                            ok: false,
-                            error: Some(e.to_string()),
-                        });
-                        messages.push(Message::Tool {
-                            tool_call_id: call.id.clone(),
-                            content: format!("error: {e}"),
-                        });
-                    }
+                    Err(ToolError::Cancelled) => return Err(AgentError::Cancelled),
+                    Err(error) => messages.push(Message::Tool {
+                        tool_call_id: call.id.clone(),
+                        content: format!("error: {error}"),
+                    }),
                 }
             }
 
@@ -690,7 +743,9 @@ mod tests {
     use kode_model::{
         FinishReason, MockModel, Model, ModelCapabilities, ModelRequest, ModelStream,
     };
+    use kode_tools::Tool;
     use kode_tools::permission::{AutoApprove, AutoDeny};
+    use kode_tools::registry::ToolRegistry;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -2179,5 +2234,292 @@ mod tests {
         let prompt = system_prompt();
         assert!(prompt.contains("gives the `offset` of the next window"));
         assert!(prompt.contains("keep the beginning and the end"));
+    }
+
+    /// Records how many calls are in flight at once. With a barrier, a call
+    /// blocks until `barrier` parties are inside `execute` together, which
+    /// can only happen when calls run concurrently.
+    struct Probe {
+        name: &'static str,
+        permission: RequiredPermission,
+        barrier: Option<Arc<tokio::sync::Barrier>>,
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for Probe {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "test probe"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {"tag": {"type": "string"}}})
+        }
+
+        fn required_permission(&self) -> RequiredPermission {
+            self.permission
+        }
+
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> kode_tools::Result<ToolOutput> {
+            use std::sync::atomic::Ordering;
+
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            match &self.barrier {
+                Some(barrier) => {
+                    barrier.wait().await;
+                }
+                None => tokio::task::yield_now().await,
+            }
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+
+            let tag = args.get("tag").and_then(|tag| tag.as_str()).unwrap_or("");
+            if tag == "fail" {
+                return Err(ToolError::Failed("probe failed".to_string()));
+            }
+            Ok(ToolOutput {
+                content: format!("result {tag}"),
+            })
+        }
+    }
+
+    struct ProbeSet {
+        runtime: ToolRuntime,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// `look` is read-only, `change` is mutating. `barrier_parties` makes
+    /// every `look` call wait for that many concurrent `look` calls.
+    fn probes(barrier_parties: Option<usize>) -> ProbeSet {
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(Probe {
+            name: "look",
+            permission: RequiredPermission::ReadOnly,
+            barrier: barrier_parties.map(|parties| Arc::new(tokio::sync::Barrier::new(parties))),
+            in_flight: in_flight.clone(),
+            peak: peak.clone(),
+        }));
+        registry.register(Arc::new(Probe {
+            name: "change",
+            permission: RequiredPermission::Mutating,
+            barrier: None,
+            in_flight,
+            peak: peak.clone(),
+        }));
+        ProbeSet {
+            runtime: ToolRuntime::new(registry, PermissionMode::Allow, Arc::new(AutoApprove)),
+            peak,
+        }
+    }
+
+    /// One model response carrying one call per `(name, tag)` pair, with ids
+    /// `call_0`, `call_1`, ...
+    fn batch(calls: &[(&str, &str)]) -> Vec<StreamEvent> {
+        let mut events: Vec<StreamEvent> = calls
+            .iter()
+            .enumerate()
+            .map(|(index, (name, tag))| StreamEvent::ToolCallDelta {
+                index: index as u32,
+                id: Some(format!("call_{index}")),
+                name: Some((*name).to_string()),
+                arguments_delta: serde_json::json!({"tag": tag}).to_string(),
+            })
+            .collect();
+        events.push(StreamEvent::Finished {
+            reason: FinishReason::ToolCalls,
+            usage: None,
+        });
+        events
+    }
+
+    fn done() -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::TextDelta("done".to_string()),
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: None,
+            },
+        ]
+    }
+
+    fn tool_results(request: &ModelRequest) -> Vec<(String, String)> {
+        request
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Tool {
+                    tool_call_id,
+                    content,
+                } => Some((tool_call_id.clone(), content.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn read_only_batch_runs_concurrently_and_keeps_call_order() {
+        let mock = MockModel::new();
+        mock.push_script(batch(&[("look", "a"), ("look", "b"), ("look", "c")]));
+        mock.push_script(done());
+        let mock = Arc::new(mock);
+        let set = probes(Some(3));
+        let events = EventBus::new(64);
+        let mut rx = events.subscribe();
+        let agent = Agent::new(mock.clone(), set.runtime, events, &AgentConfig::default());
+
+        // The barrier needs three concurrent calls. Sequential execution
+        // would block forever on the first one.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            agent.run("look around", &ctx(temp_dir())),
+        )
+        .await
+        .expect("read-only calls must run concurrently")
+        .unwrap();
+
+        assert_eq!(outcome.tool_calls, 3);
+        assert_eq!(set.peak.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(
+            tool_results(&mock.requests()[1]),
+            vec![
+                ("call_0".to_string(), "result a".to_string()),
+                ("call_1".to_string(), "result b".to_string()),
+                ("call_2".to_string(), "result c".to_string()),
+            ]
+        );
+
+        // Every call is announced before any of them finishes.
+        let mut started = 0;
+        let mut started_before_first_finish = 0;
+        let mut finished = 0;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                KodeEvent::ToolStarted { .. } => {
+                    started += 1;
+                    if finished == 0 {
+                        started_before_first_finish += 1;
+                    }
+                }
+                KodeEvent::ToolFinished { .. } => finished += 1,
+                _ => {}
+            }
+        }
+        assert_eq!((started, finished), (3, 3));
+        assert_eq!(started_before_first_finish, 3);
+    }
+
+    #[tokio::test]
+    async fn batch_with_a_mutating_call_stays_sequential() {
+        let mock = MockModel::new();
+        mock.push_script(batch(&[("look", "a"), ("change", "b"), ("look", "c")]));
+        mock.push_script(done());
+        let mock = Arc::new(mock);
+        let set = probes(None);
+        let agent = Agent::new(
+            mock.clone(),
+            set.runtime,
+            EventBus::new(64),
+            &AgentConfig::default(),
+        );
+
+        let outcome = agent.run("edit", &ctx(temp_dir())).await.unwrap();
+
+        assert!(outcome.mutated);
+        assert_eq!(set.peak.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            tool_results(&mock.requests()[1])
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            vec!["call_0", "call_1", "call_2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn single_read_only_call_is_not_treated_as_a_batch() {
+        let mock = MockModel::new();
+        mock.push_script(batch(&[("look", "a")]));
+        mock.push_script(done());
+        let mock = Arc::new(mock);
+        let set = probes(None);
+        let agent = Agent::new(
+            mock.clone(),
+            set.runtime,
+            EventBus::new(64),
+            &AgentConfig::default(),
+        );
+
+        agent.run("look", &ctx(temp_dir())).await.unwrap();
+
+        assert_eq!(
+            tool_results(&mock.requests()[1]),
+            vec![("call_0".to_string(), "result a".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_call_in_a_parallel_batch_is_reported_in_place() {
+        let mock = MockModel::new();
+        mock.push_script(batch(&[("look", "a"), ("look", "fail"), ("look", "c")]));
+        mock.push_script(done());
+        let mock = Arc::new(mock);
+        let set = probes(Some(3));
+        let agent = Agent::new(
+            mock.clone(),
+            set.runtime,
+            EventBus::new(64),
+            &AgentConfig::default(),
+        );
+
+        let outcome = agent.run("look around", &ctx(temp_dir())).await.unwrap();
+
+        assert_eq!(outcome.final_text, "done");
+        let results = tool_results(&mock.requests()[1]);
+        assert_eq!(results[0], ("call_0".to_string(), "result a".to_string()));
+        assert_eq!(results[1].0, "call_1");
+        assert!(results[1].1.starts_with("error: "), "{}", results[1].1);
+        assert_eq!(results[2], ("call_2".to_string(), "result c".to_string()));
+    }
+
+    #[tokio::test]
+    async fn cancel_during_a_parallel_batch_ends_the_run() {
+        let mock = MockModel::new();
+        mock.push_script(batch(&[("look", "a"), ("look", "b")]));
+        let mock = Arc::new(mock);
+        // Three parties but only two calls: the batch can never complete.
+        let set = probes(Some(3));
+        let agent = Agent::new(
+            mock.clone(),
+            set.runtime,
+            EventBus::new(64),
+            &AgentConfig::default(),
+        );
+        let tool_ctx = ctx(temp_dir());
+        let cancel = tool_ctx.cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            cancel.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            agent.run("look around", &tool_ctx),
+        )
+        .await
+        .expect("cancellation must interrupt a running batch");
+
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        assert_eq!(mock.requests().len(), 1);
     }
 }
