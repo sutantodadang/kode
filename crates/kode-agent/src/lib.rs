@@ -116,6 +116,7 @@ pub struct Agent {
     prompt_budget: PromptBudget,
     auto_compact: bool,
     effort: Option<String>,
+    system_appendix: Option<String>,
 }
 
 #[derive(Debug)]
@@ -178,6 +179,7 @@ impl Agent {
             prompt_budget: PromptBudget::new(agent_cfg.max_context_tokens),
             auto_compact: agent_cfg.auto_compact,
             effort: None,
+            system_appendix: None,
         }
     }
 
@@ -295,18 +297,25 @@ impl Agent {
         self
     }
 
+    /// Text appended to the base system prompt for every request of this
+    /// agent. It must not change between tasks of one session: it is part of
+    /// the cached prefix.
+    pub fn with_system_appendix(mut self, appendix: Option<String>) -> Self {
+        self.system_appendix = appendix;
+        self
+    }
+
     pub async fn run(&self, task: &str, ctx: &ToolContext) -> Result<AgentOutcome> {
         self.run_with_context(task, None, &[], false, ctx).await
     }
 
     /// Like [`Self::run`], but with an optional pre-compiled context blob
-    /// (e.g. from `kode-context`) injected as a second system message
-    /// between the base system prompt and the user's task, and prior
-    /// conversation `history` replayed as alternating user/assistant
-    /// messages. `history` is an ALREADY-SELECTED slice (see
-    /// [`select_history`]) — the caller is responsible for budgeting; when
-    /// `truncated` is true a System marker is emitted so the model knows
-    /// older turns were dropped.
+    /// (e.g. from `kode-context`) injected as a user message immediately
+    /// before the task, and prior conversation `history` replayed as
+    /// alternating user/assistant messages. `history` is an ALREADY-SELECTED
+    /// slice (see [`select_history`]) — the caller is responsible for
+    /// budgeting; when `truncated` is true a System marker is emitted so the
+    /// model knows older turns were dropped.
     pub async fn run_with_context(
         &self,
         task: &str,
@@ -334,12 +343,12 @@ impl Agent {
     ) -> Result<AgentOutcome> {
         self.events.emit(KodeEvent::AgentStarted);
 
-        let mut messages = vec![Message::System(system_prompt())];
-        if let Some(c) = context {
-            messages.push(Message::System(format!(
-                "Repository and session context:\n\n{c}"
-            )));
+        let mut system = system_prompt();
+        if let Some(appendix) = &self.system_appendix {
+            system.push_str("\n\n");
+            system.push_str(appendix);
         }
+        let mut messages = vec![Message::System(system)];
         if truncated {
             messages.push(Message::System(
                 "(older conversation truncated)".to_string(),
@@ -354,6 +363,14 @@ impl Agent {
                 content: turn.response.clone(),
                 tool_calls: vec![],
             });
+        }
+        // Volatile content goes last so the prefix above stays identical
+        // from task to task.
+        if let Some(c) = context {
+            messages.push(Message::User(format!(
+                "{}\n\n{c}",
+                prompt_budget::CONTEXT_PREFIX
+            )));
         }
         messages.push(Message::user(task.clone()));
 
@@ -1617,7 +1634,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_with_context_injects_system_message() {
+    async fn context_is_a_user_message_right_before_the_task() {
         let dir = temp_dir();
         let mock = MockModel::new();
         mock.push_script(vec![
@@ -1637,20 +1654,30 @@ mod tests {
             &AgentConfig::default(),
         );
 
-        let outcome = agent
-            .run_with_context("do the thing", Some("CTX_MARKER"), &[], false, &ctx(dir))
+        let history = vec![HistoryTurn {
+            task: "t1".into(),
+            images: Vec::new(),
+            response: "r1".into(),
+        }];
+
+        agent
+            .run_with_context("t2", Some("CTX"), &history, false, &ctx(dir))
             .await
             .unwrap();
-        assert_eq!(outcome.final_text, "done");
 
         let requests = mock.requests();
         let first = &requests[0];
+        assert_eq!(first.messages.len(), 5);
+        assert!(matches!(&first.messages[0], Message::System(c) if !c.contains("CTX")));
+        assert!(matches!(&first.messages[1], Message::User(t) if t == "t1"));
         assert!(
-            first
-                .messages
-                .iter()
-                .any(|m| matches!(m, Message::System(content) if content.contains("CTX_MARKER")))
+            matches!(&first.messages[2], Message::Assistant { content, tool_calls } if content == "r1" && tool_calls.is_empty())
         );
+        assert!(matches!(
+            &first.messages[3],
+            Message::User(c) if c == "Repository and session context:\n\nCTX"
+        ));
+        assert!(matches!(&first.messages[4], Message::User(t) if t == "t2"));
     }
 
     #[test]
@@ -1714,7 +1741,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_turns_replay_between_context_and_task() {
+    async fn system_appendix_extends_the_base_system_message_only() {
         let dir = temp_dir();
         let mock = MockModel::new();
         mock.push_script(vec![
@@ -1732,30 +1759,23 @@ mod tests {
             tools,
             EventBus::new(64),
             &AgentConfig::default(),
-        );
+        )
+        .with_system_appendix(Some("SKILL_CATALOG".to_string()));
 
-        let history = vec![HistoryTurn {
-            task: "t1".into(),
-            images: Vec::new(),
-            response: "r1".into(),
-        }];
-
-        let outcome = agent
-            .run_with_context("t2", Some("CTX"), &history, false, &ctx(dir))
+        agent
+            .run_with_context("task", Some("CTX"), &[], false, &ctx(dir))
             .await
             .unwrap();
-        assert_eq!(outcome.final_text, "done");
 
         let requests = mock.requests();
-        let first = &requests[0];
-        assert_eq!(first.messages.len(), 5);
-        assert!(matches!(&first.messages[0], Message::System(_)));
-        assert!(matches!(&first.messages[1], Message::System(c) if c.contains("CTX")));
-        assert!(matches!(&first.messages[2], Message::User(t) if t == "t1"));
-        assert!(
-            matches!(&first.messages[3], Message::Assistant { content, tool_calls } if content == "r1" && tool_calls.is_empty())
-        );
-        assert!(matches!(&first.messages[4], Message::User(t) if t == "t2"));
+        let messages = &requests[0].messages;
+        assert!(matches!(
+            &messages[0],
+            Message::System(text) if text.starts_with("You are Kode") && text.ends_with("\n\nSKILL_CATALOG")
+        ));
+        assert!(messages[1..].iter().all(|message| {
+            !matches!(message, Message::System(text) | Message::User(text) if text.contains("SKILL_CATALOG"))
+        }));
     }
 
     #[tokio::test]

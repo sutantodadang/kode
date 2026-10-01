@@ -11,6 +11,16 @@ const TOOL_ROUNDS_DROPPED: &str = "(older agent tool interactions dropped to fit
 const IMAGE_TOKEN_ESTIMATE: usize = 1600;
 const AUTO_COMPACT_TRIGGER_PERCENT: usize = 80;
 
+/// Opens the message that carries the compiled repository context.
+pub(crate) const CONTEXT_PREFIX: &str = "Repository and session context:";
+
+/// The compiled repository context travels as a user message next to the
+/// task, so the system prefix stays identical from task to task.
+pub(crate) fn is_context_message(message: &Message) -> bool {
+    matches!(message, Message::User(text)
+        if text.starts_with(CONTEXT_PREFIX) || text.ends_with(CONTEXT_TRUNCATED))
+}
+
 /// Applies a conservative, provider-independent context-window budget.
 ///
 /// Exact tokenization differs by provider, so Kode uses the same four-byte
@@ -111,7 +121,7 @@ impl PromptBudget {
             &mut prepared,
             tools,
             input_budget,
-            |message| matches!(message, Message::System(text) if text.starts_with("Repository and session context:")),
+            is_context_message,
             CONTEXT_TRUNCATED,
         );
 
@@ -148,7 +158,10 @@ impl PromptBudget {
             &mut prepared,
             tools,
             input_budget,
-            |message| matches!(message, Message::User(_) | Message::UserWithImages { .. }),
+            |message| {
+                matches!(message, Message::User(_) | Message::UserWithImages { .. })
+                    && !is_context_message(message)
+            },
             TASK_TRUNCATED,
         );
 
@@ -349,18 +362,35 @@ mod tests {
         let budget = PromptBudget::new(1_000);
         let messages = vec![
             Message::System("system".into()),
-            Message::System(format!(
-                "Repository and session context:\n\n{}",
-                "x".repeat(8_000)
-            )),
+            Message::User(format!("{CONTEXT_PREFIX}\n\n{}", "x".repeat(8_000))),
             Message::User("task".into()),
         ];
         let prepared = budget.prepare(&messages, &[]).unwrap();
 
         assert!(estimate_request(&prepared, &[]) <= budget.input_budget());
-        assert!(prepared.iter().any(|message| {
-            matches!(message, Message::System(text) if text.contains(CONTEXT_TRUNCATED))
-        }));
+        assert!(matches!(
+            &prepared[1],
+            Message::User(text) if text.starts_with(CONTEXT_PREFIX) && text.ends_with(CONTEXT_TRUNCATED)
+        ));
+        assert_eq!(prepared[2], Message::User("task".into()));
+    }
+
+    #[test]
+    fn task_truncation_never_targets_the_context_message() {
+        let budget = PromptBudget::new(600);
+        let messages = vec![
+            Message::System("system".into()),
+            Message::User(format!("{CONTEXT_PREFIX}\n\nshort")),
+            Message::User("t".repeat(8_000)),
+        ];
+        let prepared = budget.prepare(&messages, &[]).unwrap();
+
+        assert!(estimate_request(&prepared, &[]) <= budget.input_budget());
+        assert!(matches!(
+            &prepared[2],
+            Message::User(text) if text.ends_with(TASK_TRUNCATED)
+        ));
+        assert!(is_context_message(&prepared[1]));
     }
 
     #[test]
