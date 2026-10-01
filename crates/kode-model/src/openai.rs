@@ -199,6 +199,8 @@ fn map_chunk(chunk: ChunkWire) -> MappedChunk {
     let usage = chunk.usage.map(|u| Usage {
         input_tokens: u.prompt_tokens,
         output_tokens: u.completion_tokens,
+
+        ..Default::default()
     });
     MappedChunk {
         events,
@@ -402,6 +404,8 @@ mod tests {
             max_tokens: Some(16),
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
         let _stream = model.stream(request).await.unwrap();
         let wire = server.await.unwrap();
@@ -427,6 +431,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
         let body = build_body("gpt-4o", &request);
         assert_eq!(body["messages"][0]["content"][0]["text"], "describe this");
@@ -464,6 +470,8 @@ mod tests {
             max_tokens: Some(100),
             temperature: Some(0.5),
             effort: None,
+
+            ..Default::default()
         };
 
         let body = build_body("gpt-4o-mini", &request);
@@ -509,6 +517,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
 
         let body = build_body("gpt-4o-mini", &request);
@@ -526,6 +536,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: Some("low".to_string()),
+
+            ..Default::default()
         };
 
         let body = build_body("gpt-5", &request);
@@ -540,6 +552,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
 
         let body = build_body("gpt-5", &request);
@@ -554,6 +568,8 @@ mod tests {
             max_tokens: Some(16_384),
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
 
         for model in ["gpt-5.6-sol", "GPT-5", "o3", "o4-mini-high"] {
@@ -620,7 +636,9 @@ mod tests {
             mapped.usage,
             Some(Usage {
                 input_tokens: 5,
-                output_tokens: 7
+                output_tokens: 7,
+
+                ..Default::default()
             })
         );
     }

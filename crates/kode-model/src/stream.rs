@@ -152,6 +152,8 @@ mod tests {
                 usage: Some(Usage {
                     input_tokens: 10,
                     output_tokens: 2,
+
+                    ..Default::default()
                 }),
             },
         ];
@@ -163,7 +165,9 @@ mod tests {
             resp.usage,
             Some(Usage {
                 input_tokens: 10,
-                output_tokens: 2
+                output_tokens: 2,
+
+                ..Default::default()
             })
         );
     }

@@ -233,6 +233,8 @@ impl Agent {
                 max_tokens: Some(compact_output_tokens),
                 temperature: None,
                 effort: None,
+
+                ..Default::default()
             })
             .await?;
         let response = collect_response(stream).await?;
@@ -417,6 +419,8 @@ impl Agent {
                 max_tokens: Some(self.prompt_budget.output_tokens()),
                 temperature: None,
                 effort: self.effort.clone(),
+
+                ..Default::default()
             };
             let mut steers_after_response = Vec::new();
             let mut retry = 0;
@@ -1138,6 +1142,8 @@ mod tests {
             usage: Some(Usage {
                 input_tokens: 10,
                 output_tokens: 5,
+
+                ..Default::default()
             }),
         });
         mock.push_script(script1);
@@ -1148,6 +1154,8 @@ mod tests {
                 usage: Some(Usage {
                     input_tokens: 20,
                     output_tokens: 7,
+
+                    ..Default::default()
                 }),
             },
         ]);
@@ -1171,7 +1179,9 @@ mod tests {
             outcome.usage,
             Usage {
                 input_tokens: 30,
-                output_tokens: 12
+                output_tokens: 12,
+
+                ..Default::default()
             }
         );
 
@@ -1223,6 +1233,8 @@ mod tests {
             usage: Some(Usage {
                 input_tokens: 10,
                 output_tokens: 5,
+
+                ..Default::default()
             }),
         });
         mock.push_script(tool_call);
@@ -1236,6 +1248,8 @@ mod tests {
                 usage: Some(Usage {
                     input_tokens: 11_000,
                     output_tokens: 30,
+
+                ..Default::default()
                 }),
             },
         ]);
@@ -1246,6 +1260,8 @@ mod tests {
                 usage: Some(Usage {
                     input_tokens: 3_000,
                     output_tokens: 4,
+
+                    ..Default::default()
                 }),
             },
         ]);

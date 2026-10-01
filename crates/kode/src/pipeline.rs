@@ -829,6 +829,8 @@ async fn execute_task(
         usage: Usage {
             input_tokens,
             output_tokens,
+
+            ..Default::default()
         },
     })
 }
@@ -1344,6 +1346,8 @@ mod verification_tests {
             usage: Usage {
                 input_tokens: input,
                 output_tokens: output,
+
+                ..Default::default()
             },
             mutated,
         }

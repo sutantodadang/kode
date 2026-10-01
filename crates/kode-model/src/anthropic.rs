@@ -544,6 +544,8 @@ fn map_sse_json(v: &Value, state: &mut AnthropicSseState) -> Result<Vec<StreamEv
             let usage = Usage {
                 input_tokens: state.input_tokens,
                 output_tokens,
+
+                ..Default::default()
             };
             state.finished = true;
             Ok(vec![StreamEvent::Finished {
@@ -694,6 +696,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
         let body = build_body("claude-sonnet-5", &request);
         let image = &body["messages"][0]["content"][0];
@@ -734,6 +738,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
 
         let body = build_body("claude-sonnet-5", &request);
@@ -754,6 +760,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
         let body = build_body("claude-sonnet-5", &request);
         assert!(body.get("system").is_none());
@@ -767,6 +775,8 @@ mod tests {
             max_tokens: Some(256),
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
         let body = build_body("claude-sonnet-5", &request);
         assert_eq!(body["max_tokens"], serde_json::json!(256));
@@ -780,6 +790,8 @@ mod tests {
             max_tokens: Some(32_768), // e.g. an escalated retry budget
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
 
         // Claude 3.5-generation models cap at 8,192; a larger budget would
@@ -829,6 +841,8 @@ mod tests {
             max_tokens: Some(100),
             temperature: Some(0.5),
             effort: None,
+
+            ..Default::default()
         };
 
         let body = build_body("claude-sonnet-5", &request);
@@ -867,6 +881,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
         let body = build_body("claude-sonnet-5", &request);
         assert!(body.get("tools").is_none());
@@ -960,6 +976,8 @@ mod tests {
                 usage: Some(Usage {
                     input_tokens: 42,
                     output_tokens: 7,
+
+                    ..Default::default()
                 }),
             }]
         );
@@ -981,6 +999,8 @@ mod tests {
                 usage: Some(Usage {
                     input_tokens: 0,
                     output_tokens: 3,
+
+                    ..Default::default()
                 }),
             }]
         );
@@ -1000,7 +1020,9 @@ mod tests {
                 reason: FinishReason::Length,
                 usage: Some(Usage {
                     input_tokens: 0,
-                    output_tokens: 10
+                    output_tokens: 10,
+
+                    ..Default::default()
                 }),
             }
         );

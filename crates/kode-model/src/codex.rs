@@ -473,6 +473,8 @@ fn map_sse_json(v: &Value, state: &mut CodexSseState) -> Result<Vec<StreamEvent>
                 .map(|u| Usage {
                     input_tokens: u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
                     output_tokens: u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+
+                    ..Default::default()
                 });
             let reason = if state.saw_fn {
                 FinishReason::ToolCalls
@@ -732,6 +734,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
         let body = build_body("gpt-5-codex", &request);
         assert_eq!(body["input"][0]["content"][0]["type"], "input_image");
@@ -786,6 +790,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
 
         let body = build_body("gpt-5-codex", &request);
@@ -830,6 +836,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
 
         let body = build_body("gpt-5-codex", &request);
@@ -849,6 +857,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: Some("high".to_string()),
+
+            ..Default::default()
         };
 
         let body = build_body("gpt-5-codex", &request);
@@ -863,6 +873,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
 
         let body = build_body("gpt-5-codex", &request);
@@ -926,7 +938,9 @@ mod tests {
                 reason: FinishReason::Stop,
                 usage: Some(Usage {
                     input_tokens: 5,
-                    output_tokens: 7
+                    output_tokens: 7,
+
+                    ..Default::default()
                 }),
             }]
         );

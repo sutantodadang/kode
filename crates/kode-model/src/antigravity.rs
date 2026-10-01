@@ -592,6 +592,8 @@ fn read_usage(resp: &Value, state: &mut SseState) {
         state.usage = Some(Usage {
             input_tokens: get("promptTokenCount"),
             output_tokens: get("candidatesTokenCount"),
+
+            ..Default::default()
         });
     }
 }
@@ -798,6 +800,8 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: None,
+
+            ..Default::default()
         };
         let body = build_body("gemini-3-flash", &request, "proj");
         let parts = &body["request"]["contents"][0]["parts"];
@@ -896,6 +900,8 @@ mod tests {
             max_tokens: Some(10),
             temperature: None,
             effort: Some("high".into()),
+
+            ..Default::default()
         };
         let body = build_body("gemini-3-flash", &request, "proj");
         assert_eq!(body["project"], "proj");
@@ -1001,7 +1007,9 @@ mod tests {
                 reason: FinishReason::ToolCalls,
                 usage: Some(Usage {
                     input_tokens: 3,
-                    output_tokens: 4
+                    output_tokens: 4,
+
+                    ..Default::default()
                 }),
             }
         );
