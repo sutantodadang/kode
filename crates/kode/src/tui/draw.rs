@@ -1066,7 +1066,9 @@ pub(crate) fn wrap_transcript_line(
                 }
                 continue;
             }
-            if cur_w + pw > limit && !fresh {
+            // An empty first row (no gutter, overlong first word) is filled
+            // by the char split below instead of being left blank.
+            if cur_w + pw > limit && !fresh && cur_w > 0 {
                 rows.push(cont.clone());
                 cur_w = cont_w;
             }

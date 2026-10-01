@@ -4557,6 +4557,17 @@ fn overlong_word_and_multibyte_text_do_not_panic() {
 }
 
 #[test]
+fn overlong_first_word_without_gutter_leaves_no_blank_row() {
+    let tl = TranscriptLine::new(Gutter::None, "u".repeat(200));
+    let rows = wrap_at(&tl, 80);
+    assert!(rows.len() > 1);
+    for row in &rows {
+        assert!(row_width(row) > 0, "blank wrapped row");
+        assert!(row_width(row) <= 79);
+    }
+}
+
+#[test]
 fn code_lines_are_not_capped_by_the_prose_measure() {
     let mut tl = TranscriptLine::new(Gutter::Prose, "c".repeat(180));
     tl.md_kind = Some(crate::tui::markdown::MdKind::Code);
