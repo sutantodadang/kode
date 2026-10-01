@@ -117,6 +117,7 @@ pub struct Agent {
     auto_compact: bool,
     effort: Option<String>,
     system_appendix: Option<String>,
+    cache_key: Option<String>,
 }
 
 #[derive(Debug)]
@@ -172,6 +173,23 @@ pub fn select_history(turns: &[HistoryTurn], budget_tokens: usize) -> (&[History
     (&turns[start..], start > 0)
 }
 
+/// Index of the last replayed-history message: the one right before the
+/// first volatile message (the context, or the task when there is none).
+/// `None` when that neighbour is not a plain assistant reply, which means
+/// there is no history to anchor on.
+fn cache_anchor(messages: &[Message], task: &Message) -> Option<usize> {
+    let volatile = messages
+        .iter()
+        .position(prompt_budget::is_context_message)
+        .or_else(|| messages.iter().position(|message| message == task))?;
+    let index = volatile.checked_sub(1)?;
+    matches!(
+        &messages[index],
+        Message::Assistant { tool_calls, .. } if tool_calls.is_empty()
+    )
+    .then_some(index)
+}
+
 impl Agent {
     pub fn new(
         model: Arc<dyn Model>,
@@ -190,6 +208,7 @@ impl Agent {
             auto_compact: agent_cfg.auto_compact,
             effort: None,
             system_appendix: None,
+            cache_key: None,
         }
     }
 
@@ -245,6 +264,7 @@ impl Agent {
                 messages: compact_request,
                 tools: tools.to_vec(),
                 max_tokens: Some(compact_output_tokens),
+                cache_key: self.cache_key.clone(),
                 ..Default::default()
             })
             .await?;
@@ -316,6 +336,13 @@ impl Agent {
     /// the cached prefix.
     pub fn with_system_appendix(mut self, appendix: Option<String>) -> Self {
         self.system_appendix = appendix;
+        self
+    }
+
+    /// Enables provider cache hints on every request this agent sends. One
+    /// key per Kode process; `None` (the default) sends no hints.
+    pub fn with_cache_key(mut self, cache_key: Option<String>) -> Self {
+        self.cache_key = cache_key;
         self
     }
 
@@ -394,6 +421,7 @@ impl Agent {
         let mut steering_open = steering.is_some();
         let mut compaction_available = self.auto_compact;
 
+        let task_message = Message::user(task.clone());
         let mut iteration = 0_u32;
         loop {
             iteration = iteration.saturating_add(1);
@@ -444,14 +472,18 @@ impl Agent {
 
             self.events.emit(KodeEvent::ModelStarted);
             let request_messages = self.prompt_budget.prepare(&messages, &tools)?;
+            let anchor = self
+                .cache_key
+                .as_ref()
+                .and_then(|_| cache_anchor(&request_messages, &task_message));
             let mut model_request = ModelRequest {
                 messages: request_messages,
                 tools,
                 max_tokens: Some(self.prompt_budget.output_tokens()),
                 temperature: None,
                 effort: self.effort.clone(),
-
-                ..Default::default()
+                cache_key: self.cache_key.clone(),
+                cache_anchor: anchor,
             };
             let mut steers_after_response = Vec::new();
             let mut retry = 0;
@@ -1935,5 +1967,147 @@ mod tests {
         assert!(first.messages.iter().any(
             |m| matches!(m, Message::System(c) if c.contains("older conversation truncated"))
         ));
+    }
+
+    fn turn(task: &str, response: &str) -> HistoryTurn {
+        HistoryTurn {
+            task: task.into(),
+            images: Vec::new(),
+            response: response.into(),
+        }
+    }
+
+    async fn first_request(history: &[HistoryTurn], context: &str, task: &str) -> ModelRequest {
+        let mock = MockModel::new();
+        mock.push_script(vec![
+            StreamEvent::TextDelta("done".to_string()),
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: None,
+            },
+        ]);
+        let mock = Arc::new(mock);
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let agent = Agent::new(
+            mock.clone(),
+            tools,
+            EventBus::new(64),
+            &AgentConfig::default(),
+        )
+        .with_cache_key(Some("kode-test".to_string()));
+        agent
+            .run_with_context(task, Some(context), history, false, &ctx(temp_dir()))
+            .await
+            .unwrap();
+        mock.requests().remove(0)
+    }
+
+    #[tokio::test]
+    async fn request_messages_only_grow_within_a_task() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("a.txt"), "hello").unwrap();
+
+        let mock = MockModel::new();
+        let mut call = read_file_call(0, "call_1", "a.txt");
+        call.push(StreamEvent::Finished {
+            reason: FinishReason::ToolCalls,
+            usage: None,
+        });
+        mock.push_script(call);
+        mock.push_script(vec![
+            StreamEvent::TextDelta("done".to_string()),
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: None,
+            },
+        ]);
+
+        let mock = Arc::new(mock);
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let agent = Agent::new(
+            mock.clone(),
+            tools,
+            EventBus::new(64),
+            &AgentConfig::default(),
+        )
+        .with_cache_key(Some("kode-test".to_string()));
+
+        agent
+            .run_with_context("t2", Some("CTX"), &[turn("t1", "r1")], false, &ctx(dir))
+            .await
+            .unwrap();
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(is_prefix(&requests[0].messages, &requests[1].messages));
+        assert_eq!(requests[0].tools, requests[1].tools);
+        for request in &requests {
+            assert_eq!(request.cache_key.as_deref(), Some("kode-test"));
+            // [system, t1, r1, context, t2, ...] -> r1 is index 2.
+            assert_eq!(request.cache_anchor, Some(2));
+        }
+    }
+
+    #[tokio::test]
+    async fn new_task_reuses_system_and_older_history_prefix() {
+        let a = first_request(&[turn("t1", "r1")], "CTX A", "t2").await;
+        let b = first_request(&[turn("t1", "r1"), turn("t2", "r2")], "CTX B", "t3").await;
+
+        // System prompt and the first turn are byte-identical even though the
+        // repository context changed.
+        assert_eq!(a.messages[..3], b.messages[..3]);
+        assert_eq!(a.tools, b.tools);
+        assert_eq!(a.cache_anchor, Some(2));
+        assert_eq!(b.cache_anchor, Some(4));
+    }
+
+    #[tokio::test]
+    async fn cache_anchor_is_none_without_history() {
+        let request = first_request(&[], "CTX", "task").await;
+        assert_eq!(request.cache_anchor, None);
+        assert_eq!(request.cache_key.as_deref(), Some("kode-test"));
+    }
+
+    #[tokio::test]
+    async fn cache_anchor_stays_on_an_assistant_message_when_the_task_repeats() {
+        let request = first_request(
+            &[turn("continue", "r1"), turn("continue", "r2")],
+            "CTX",
+            "continue",
+        )
+        .await;
+        let anchor = request.cache_anchor.expect("history present");
+        assert!(matches!(
+            &request.messages[anchor],
+            Message::Assistant { tool_calls, .. } if tool_calls.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn agent_without_cache_key_sends_no_hints() {
+        let dir = temp_dir();
+        let mock = MockModel::new();
+        mock.push_script(vec![
+            StreamEvent::TextDelta("done".to_string()),
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: None,
+            },
+        ]);
+        let mock = Arc::new(mock);
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let agent = Agent::new(
+            mock.clone(),
+            tools,
+            EventBus::new(64),
+            &AgentConfig::default(),
+        );
+        agent
+            .run_with_context("t2", Some("CTX"), &[turn("t1", "r1")], false, &ctx(dir))
+            .await
+            .unwrap();
+        let requests = mock.requests();
+        assert_eq!(requests[0].cache_key, None);
+        assert_eq!(requests[0].cache_anchor, None);
     }
 }
