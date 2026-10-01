@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 const MAX_TOOL_LABEL_CHARS: usize = 240;
 const MAX_MODEL_RETRY_DELAY_MS: u64 = 30_000;
 const COMPACTED_CONTEXT_PREFIX: &str = "Compacted work context:";
-const COMPACTION_PROMPT: &str = "You are compacting an active coding-agent conversation so work can continue without re-reading the full transcript. Produce a dense, factual structured summary. Preserve: the user's objective and corrections; decisions and constraints; exact file paths, symbols, commands, edits, and observed results; failed approaches and error text; repository state; current progress; and remaining work. Distinguish completed from pending work. Never invent facts. Omit pleasantries and repeated tool output. The original session remains stored, but this summary must be sufficient to continue correctly.";
+const COMPACTION_PROMPT: &str = "Pause the task. Do not call any tools in this reply. You are compacting an active coding-agent conversation so work can continue without re-reading the full transcript. Produce a dense, factual structured summary. Preserve: the user's objective and corrections; decisions and constraints; exact file paths, symbols, commands, edits, and observed results; failed approaches and error text; repository state; current progress; and remaining work. Distinguish completed from pending work. Never invent facts. Omit pleasantries and repeated tool output. The original session remains stored, but this summary must be sufficient to continue correctly.";
 
 fn display_arg(arg: &str) -> String {
     if !arg.is_empty()
@@ -225,27 +225,26 @@ impl Agent {
         task: &UserInput,
     ) -> Result<Option<(Usage, usize, usize)>> {
         let before = self.prompt_budget.estimate(messages, tools);
-        let mut compact_request = Vec::with_capacity(messages.len() + 1);
-        compact_request.push(Message::System(COMPACTION_PROMPT.to_string()));
-        compact_request.extend(messages.iter().cloned());
-        if self.prompt_budget.estimate(&compact_request, &[]) > self.prompt_budget.input_budget() {
-            compact_request = self.prompt_budget.prepare(&compact_request, &[])?;
-        }
+        // Same tools and same leading messages as the request before it, with
+        // the instruction appended: the provider reuses the cached prefix
+        // instead of re-reading the whole transcript at full price.
+        let mut compact_request = messages.clone();
+        compact_request.push(Message::User(COMPACTION_PROMPT.to_string()));
+        // Always budget it: `prepare` applies the same per-tool-output cap the
+        // normal requests get, which keeps the prefix byte-identical.
+        let compact_request = self.prompt_budget.prepare(&compact_request, tools)?;
         let compact_output_tokens = self
             .prompt_budget
             .context_window()
-            .saturating_sub(self.prompt_budget.estimate(&compact_request, &[]))
+            .saturating_sub(self.prompt_budget.estimate(&compact_request, tools))
             .clamp(1, 16_384) as u32;
 
         let stream = self
             .model
             .stream(ModelRequest {
                 messages: compact_request,
-                tools: Vec::new(),
+                tools: tools.to_vec(),
                 max_tokens: Some(compact_output_tokens),
-                temperature: None,
-                effort: None,
-
                 ..Default::default()
             })
             .await?;
@@ -268,6 +267,11 @@ impl Agent {
 
         let task_message = Message::user(task.clone());
         let mut exact_indices = Vec::new();
+        // The context used to survive as a system message. It is a user
+        // message now, so it has to be kept explicitly.
+        if let Some(index) = messages.iter().position(prompt_budget::is_context_message) {
+            exact_indices.push(index);
+        }
         if let Some(index) = messages
             .iter()
             .rposition(|message| message == &task_message)
@@ -1248,6 +1252,10 @@ mod tests {
         );
     }
 
+    fn is_prefix(shorter: &[Message], longer: &[Message]) -> bool {
+        shorter.len() <= longer.len() && shorter == &longer[..shorter.len()]
+    }
+
     #[tokio::test]
     async fn auto_compact_summarizes_before_model_window_is_exhausted() {
         let dir = temp_dir();
@@ -1304,22 +1312,39 @@ mod tests {
         };
         let agent = Agent::new(mock.clone(), tools, events, &agent_cfg);
 
-        let outcome = agent.run("inspect large.txt", &ctx(dir)).await.unwrap();
+        let outcome = agent
+            .run_with_context("inspect large.txt", Some("CTX_KEEP"), &[], false, &ctx(dir))
+            .await
+            .unwrap();
         assert_eq!(outcome.final_text, "done");
         assert_eq!(outcome.usage.input_tokens, 14_010);
 
         let requests = mock.requests();
         assert_eq!(requests.len(), 3);
-        assert!(requests[1].tools.is_empty());
+        // The compaction request reuses the running prefix: same tools, same
+        // messages, instruction appended at the tail.
+        assert_eq!(requests[1].tools, requests[0].tools);
+        assert!(!requests[1].tools.is_empty());
+        assert!(is_prefix(&requests[0].messages, &requests[1].messages));
         assert!(matches!(
-            &requests[1].messages[0],
-            Message::System(text) if text.contains("compacting an active coding-agent conversation")
+            requests[1].messages.last(),
+            Some(Message::User(text)) if text.contains("compacting an active coding-agent conversation")
         ));
+        assert!(
+            matches!(&requests[1].messages[0], Message::System(text) if text.starts_with("You are Kode"))
+        );
+
         assert!(requests[2].messages.iter().any(|message| {
             matches!(message, Message::System(text) if text.starts_with(COMPACTED_CONTEXT_PREFIX))
         }));
         assert!(requests[2].messages.iter().any(|message| {
             matches!(message, Message::User(text) if text == "inspect large.txt")
+        }));
+        assert!(requests[2].messages.iter().any(|message| {
+            matches!(message, Message::User(text) if text.contains("CTX_KEEP"))
+        }));
+        assert!(!requests[2].messages.iter().any(|message| {
+            matches!(message, Message::User(text) if text.contains("compacting an active"))
         }));
         let mut saw_compaction = false;
         while let Ok(event) = rx.try_recv() {
@@ -1329,6 +1354,61 @@ mod tests {
             );
         }
         assert!(saw_compaction);
+    }
+
+    #[tokio::test]
+    async fn compaction_that_calls_a_tool_falls_back_to_truncation() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("large.txt"), "important detail\n".repeat(2_500)).unwrap();
+
+        let mock = MockModel::new();
+        let mut tool_call = read_file_call(0, "call_1", "large.txt");
+        tool_call.push(StreamEvent::Finished {
+            reason: FinishReason::ToolCalls,
+            usage: None,
+        });
+        mock.push_script(tool_call);
+        // Compaction turn: the model ignores the instruction and calls a tool.
+        let mut stray = read_file_call(0, "call_2", "large.txt");
+        stray.push(StreamEvent::Finished {
+            reason: FinishReason::ToolCalls,
+            usage: None,
+        });
+        mock.push_script(stray);
+        mock.push_script(vec![
+            StreamEvent::TextDelta("done".to_string()),
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: None,
+            },
+        ]);
+
+        let mock = Arc::new(mock);
+        let events = EventBus::new(64);
+        let mut rx = events.subscribe();
+        let tools = ToolRuntime::builtin_runtime(PermissionMode::Allow, Arc::new(AutoApprove));
+        let agent_cfg = AgentConfig {
+            max_context_tokens: 12_000,
+            auto_compact: true,
+            ..Default::default()
+        };
+        let agent = Agent::new(mock.clone(), tools, events, &agent_cfg);
+
+        let outcome = agent.run("inspect large.txt", &ctx(dir)).await.unwrap();
+
+        assert_eq!(outcome.final_text, "done");
+        assert_eq!(
+            outcome.tool_calls, 1,
+            "the stray compaction call must not execute"
+        );
+        let mut saw_fallback = false;
+        while let Ok(event) = rx.try_recv() {
+            saw_fallback |= matches!(
+                event,
+                KodeEvent::Note { text } if text.contains("empty summary")
+            );
+        }
+        assert!(saw_fallback);
     }
 
     #[tokio::test]
