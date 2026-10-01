@@ -42,7 +42,7 @@ fn head_boundary(content: &str, budget: usize) -> usize {
         end -= 1;
     }
     match content[..end].rfind('\n') {
-        Some(newline) if newline + 1 >= end / 2 => newline + 1,
+        Some(newline) if newline.saturating_add(1) >= end / 2 => newline + 1,
         _ => end,
     }
 }
@@ -56,7 +56,7 @@ fn tail_boundary(content: &str, from: usize) -> usize {
     }
     let tail = &content[start..];
     match tail.find('\n') {
-        Some(newline) if newline + 1 <= tail.len() / 2 => start + newline + 1,
+        Some(newline) if newline < tail.len() / 2 => start + newline + 1,
         _ => start,
     }
 }
