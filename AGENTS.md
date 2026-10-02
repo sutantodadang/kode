@@ -1,3 +1,8 @@
+# Agent instructions
+
+Project conventions, build/test commands, and the engine architecture are in
+[`CLAUDE.md`](CLAUDE.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md). Read them first.
+
 ## Design System
 
 Always read `DESIGN.md` before making any visual or UI decisions.

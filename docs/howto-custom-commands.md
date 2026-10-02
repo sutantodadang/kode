@@ -17,7 +17,7 @@ The command name is the file's stem, matched case-insensitively against `[a-z0-9
 
 ## Precedence
 
-Builtin commands (`/model`, `/effort`, `/provider`, `/copy`, `/resume`, `/help`) are never shadowed — a custom command with one of those names is simply ignored. Otherwise, a repo-local command wins over a user-global one with the same name.
+Builtin commands (`/model`, `/effort`, `/provider`, `/copy`, `/resume`, `/status`, `/exit`, `/image`, `/plan`, `/router`, `/help`) are never shadowed — a custom command with one of those names is simply ignored. Otherwise, a repo-local command wins over a user-global one with the same name.
 
 ## Frontmatter
 

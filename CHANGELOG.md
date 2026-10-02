@@ -2,7 +2,77 @@
 
 All notable changes to this project are documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project follows [Semantic Versioning](https://semver.org/) (pre-1.0:
+minor versions may contain breaking changes).
+
+## [0.5.0 – 0.5.6] - 2026-09-27 to 2026-10-01
+
+### Added
+
+- **Embedded engines.** zindeks and Ingat now run inside the Kode process:
+  Kode loads a pinned, checksum-verified zindeks shared library and links
+  Ingat's headless core. No child process, service, or port to manage.
+  `kode setup` downloads the library; `kode doctor` reports a missing or
+  mismatched engine. The old HTTP/stdio engine transports are gone; config
+  keys written for them are ignored.
+- `kode index`: build or refresh the code index for the current repo.
+- `kode memory import --from <file>`: import a legacy `ingat_export` JSONL
+  file into the native memory store (idempotent, resumable).
+- **Local router.** Before each task, Laya (a multilingual decision model on
+  ONNX Runtime) picks the model tier, reasoning effort, and whether to plan
+  first, with a calibrated confidence and an honest static fallback. Qwen3-
+  Reranker-0.6B reorders Ingat memories and zindeks hits before the context
+  budget is applied. Configure with `[router]` and `[router.tiers]`; install
+  the models with `kode setup` (~4 GB, optional).
+- **Router training for teams.** `[router.training]` collects
+  hindsight-labeled records; `kode router status|correct|calibrate|train|publish`
+  and `/router` let a team calibrate and fine-tune its own router, gated
+  against the current model on a held-out split. See
+  [howto-router-training.md](./docs/howto-router-training.md).
+- **Prompt caching across providers.** Anthropic cache breakpoints, OpenAI
+  and Codex `prompt_cache_key`, and Antigravity cached-content usage. The
+  system prefix stays stable between turns, so repeated turns cost less and
+  start faster. Cached input tokens show in the TUI receipt and the `exec`
+  summary.
+- Long-run context hygiene: stale tool outputs are masked, every tool result
+  is clipped head-and-tail at the runtime, `read_file` returns bounded
+  windows with a next offset, and the budget is enforced before each request.
+- Read-only tool batches run concurrently.
+- Backends (engines, MCP servers) are reused across tasks in one session.
+- Uncommitted files are passed to retrieval as the working set, so context
+  favors what you are editing.
+- `[ui] theme = "light"` for light terminal backgrounds, with automatic
+  256-color fallback.
+- Linux arm64 (`aarch64-unknown-linux-gnu`) release binaries and CI.
+- zindeks engine pinned to v0.10.3.
+
+### Fixed
+
+- The first rerank no longer times out: the reranker warms up in the
+  background.
+- TUI: wrapped rows keep the thread gutter, prose is capped at 100 columns,
+  and an overlong first word no longer leaves a blank row.
+- Distinct cache keys for tasks started within one clock tick.
+
+## [0.2.0 – 0.4.12] - 2026-08-19 to 2026-09-01 (not recorded at release)
+
+### Added
+
+- `antigravity` provider (EXPERIMENTAL): Google OAuth to Cloud Code Assist
+  (Gemini models).
+- `web_search` and `fetch_url` agent tools; tool failure reasons shown in
+  the TUI.
+- Progressively loaded skills (`SKILL.md` packages). See
+  [howto-skills.md](./docs/howto-skills.md).
+- Image attachments: `kode exec --image` and `/image` in the TUI (PNG,
+  JPEG, GIF, WebP), plus bracketed paste with compact attachments.
+- Bounded sub-agent delegation through the native `delegate_task` tool.
+
+The `[Unreleased]` section below was written during the 0.2.0 to 0.4.12
+releases and has shipped. It is kept as written. The Ingat service and its
+`[ingat] autostart` key it mentions were superseded by the embedded engine
+in 0.5.0.
 
 ## [Unreleased]
 

@@ -1,6 +1,6 @@
 # Getting started with Kode
 
-This tutorial takes you from a clean machine to your first agentic task in Kode. You will install the CLI, log in to a model provider, install Kode's engines, and run a real task in a repo. By step 2 you will see a live model list, and by step 4 you will watch Kode work.
+This tutorial takes you from a clean machine to your first agentic task in Kode. You will install the CLI, log in to a model provider, install Kode's engines, and run a real task in a repo. By step 2 you will see a live model list, and by step 5 you will watch Kode work.
 
 ## What you need
 
@@ -26,7 +26,7 @@ Verify the install:
 kode --version
 ```
 
-You should see a version string like `kode 0.1.0`. If the command is not found, see [howto-install.md](./howto-install.md) for PATH troubleshooting.
+You should see a version string like `kode 0.5.6`. If the command is not found, see [howto-install.md](./howto-install.md) for PATH troubleshooting.
 
 ## Step 2: Log in to a provider
 
@@ -67,9 +67,21 @@ kode doctor
 
 `doctor` checks config, LLM auth, zindeks, Ingat, git, and environment, and reports each check as pass, fail, or skipped. A skipped check is never reported as passed: if the zindeks library isn't installed yet, you will see it called out honestly, not silently green.
 
-## Step 4: Run the TUI on a real task
+`kode setup` also offers the optional local router models (about 4 GB). You can decline: Kode then routes statically and says so.
 
-From inside a git repo, launch the interactive TUI:
+## Step 4: Index your repo
+
+From inside the git repo you want to work in, build the code graph once:
+
+```
+kode index
+```
+
+Kode prints the number of files, symbols, and edges it indexed. Starting a task never creates the first index for you, so run this once per repository. After that, the engine's background watcher keeps the index current as files change.
+
+## Step 5: Run the TUI on a real task
+
+From inside the same repo, launch the interactive TUI:
 
 ```
 kode
@@ -81,7 +93,7 @@ When Kode gathers context, the work surface shows a compact `CONTEXT` receipt. P
 
 After the agent finishes, a verification stage runs (tests, lint, whatever the project defines) and reports results honestly: passed, failed, or skipped.
 
-## Step 5: Run a task without the TUI
+## Step 6: Run a task without the TUI
 
 For scripted or CI use, run a task directly from the shell:
 
@@ -95,7 +107,7 @@ To include a screenshot, use `kode exec --image screenshot.png "explain this err
 
 ## What you built
 
-You installed Kode, authenticated against a real provider, installed its engines, confirmed health with `doctor`, and ran a task both interactively and headlessly. Kode now has a working credential store, a working code graph, and a working memory service behind it.
+You installed Kode, authenticated against a real provider, installed its engines, confirmed health with `doctor`, indexed a repo, and ran a task both interactively and headlessly. Kode now has a working credential store, a working code graph, and a working memory store behind it, all running in-process on your machine.
 
 ## Related
 

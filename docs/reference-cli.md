@@ -117,6 +117,14 @@ Detect the current project's type and run its verification pipeline (tests, lint
 kode verify
 ```
 
+## `kode index`
+
+Build or refresh the code-intelligence index for the repository in the current directory, using the embedded zindeks engine, then print file, symbol, and edge counts. Run it once per repository: starting a task never creates a first index on its own. After that, the engine's watcher (`[zindeks] watch = true`) keeps the index current. Fails with a clear error if `[zindeks] enabled = false`.
+
+```
+kode index
+```
+
 ## `kode doctor`
 
 Run diagnostic checks across config, LLM auth, zindeks, Ingat, git, and environment. Useful right after install or when something feels wrong.
@@ -198,6 +206,14 @@ Show the git-backed team-memory file's entry count and how many lines failed to 
 kode memory status
 ```
 
+## `kode memory import --from <PATH>`
+
+Import a legacy `ingat_export` JSONL file (from the standalone Ingat service used before Kode 0.5) into Kode's native memory store. Idempotent by record id, so an interrupted import can be rerun to resume.
+
+```
+kode memory import --from ingat-export.jsonl
+```
+
 ## TUI slash commands
 
 Available inside the interactive `kode` TUI, with a live hint menu as you type `/`:
@@ -209,8 +225,12 @@ Available inside the interactive `kode` TUI, with a live hint menu as you type `
 | `/provider` | Switch the active provider. |
 | `/copy` | Copy the last response or selection. |
 | `/resume` | Open a picker over sessions in `.kode/sessions/` and resume one. |
+| `/status` | Show the model, authority mode, and available context. |
+| `/plan` | Toggle plan mode: the next task produces a plan first and waits for your approval. Session-only. |
 | `/image <path>` | Attach a PNG, JPEG, GIF, or WebP image to the next message. You can also paste or drag an image path into the composer. |
-| `/help` | Show available commands. |
+| `/router [key=value…]` | Show the last local-router decision, or correct it (`/router tier=heavy`). See [howto-router-training.md](./howto-router-training.md). |
+| `/help` | Show available commands and shortcuts. |
+| `/exit` | Exit Kode. |
 | `/name [args]` | Custom command — expands the `.kode/commands/name.md` or `~/.kode/commands/name.md` template and submits it as a task. See [howto-custom-commands.md](./howto-custom-commands.md). |
 
 The scope rail at the top of the TUI shows the repo, branch, dirty state, authority mode (`BUILD`, `PLAN`, or `AUTO`), and model. Provider, effort, and token-budget detail remain available through status/config commands instead of occupying permanent chrome.
