@@ -12,10 +12,13 @@ A missing file is not an error: Kode falls back to defaults. An unreadable or ma
 
 Related paths, for context:
 
-- `~/.kode/auth/`: credential store (`codex.json`, `opencode.json`, etc.), `0600` on Unix. `USERPROFILE` on Windows, `HOME` elsewhere.
-- `~/.kode/bin/` (Unix) or `%LOCALAPPDATA%\kode\bin` (Windows): managed engine binaries installed by `kode setup`.
+- `~/.kode/auth/`: credential store (`codex.json`, `anthropic.json`, `opencode.json`, etc.), `0600` on Unix. `~` is `USERPROFILE` on Windows, `HOME` elsewhere.
+- `~/.kode/runtime/zindeks/<revision>/`: the pinned zindeks engine library installed by `kode setup`. Override for development builds with the `KODE_ZINDEKS_DYLIB` environment variable.
+- `~/.kode/zindeks/` and `~/.kode/ingat/memory.sqlite3`: the code index and memory store (see `[zindeks]` and `[ingat]` below).
+- `~/.kode/commands/` and `~/.kode/skills/`: user-global custom commands and skills.
+- `~/.kode/bin/` (Unix) or `%LOCALAPPDATA%\kode\bin` (Windows): the `kode` binary itself, when installed with the one-line installer.
 
-Both are outside the project and never checked into a repo; `.kode/config.toml` and `.kode/sessions/` are per-project and usually belong in `.gitignore` unless you intend to share config with your team.
+These are outside the project and never checked into a repo. Inside the project, `.kode/sessions/` and `.kode/router-log.jsonl` are personal and belong in `.gitignore`. `.kode/config.toml`, `.kode/commands/`, `.kode/skills/`, `.kode/memory/team.jsonl`, and `.kode/router/` are meant to be committed when you want to share them with your team.
 
 ## `[model]`
 

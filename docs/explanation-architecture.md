@@ -6,12 +6,12 @@ Most coding agents work by grepping around a repo, dumping whatever files look r
 
 ## Kode's approach
 
-Kode treats code intelligence as infrastructure, not something the agent has to reconstruct by reading files. Two external engines carry that weight:
+Kode treats code intelligence as infrastructure, not something the agent has to reconstruct by reading files. Two separately developed engines carry that weight:
 
-- **zindeks**: a local code knowledge graph. Symbols, call graphs, imports, BM25 and semantic search, kept current by a background file watcher.
-- **Ingat**: an engineering memory service. Project rules, architecture decisions, conventions, known issues, and other durable knowledge, recalled by relevance rather than re-explained every time.
+- **[zindeks](https://github.com/sutantodadang/zindeks)**: a local code knowledge graph. Symbols, call graphs, imports, BM25 and semantic search, kept current by a background file watcher.
+- **[Ingat](https://github.com/sutantodadang/Ingat)**: engineering memory. Project rules, architecture decisions, conventions, known issues, and other durable knowledge, recalled by relevance rather than re-explained every time.
 
-Kode never reimplements either. It spawns and talks to them as first-class adapters. A context compiler pulls from both, plus current git state, and assembles a token-budgeted context for the model. When zindeks is healthy, the same adapter also registers `code_search` and `file_outline` as read-only agent tools; indexed symbol/concept discovery comes first, while `git grep` remains the exact-literal or unavailable-engine fallback. When Ingat is healthy, Kode registers read-only `memory_search` for targeted recall during a run and mutating `remember` for durable verified knowledge.
+Kode never reimplements either. Both run inside the Kode process behind first-class adapters (see [Data flow](#data-flow)). A context compiler pulls from both, plus current git state, and assembles a token-budgeted context for the model. When zindeks is healthy, the same adapter also registers `code_search` and `file_outline` as read-only agent tools; indexed symbol/concept discovery comes first, while `git grep` remains the exact-literal or unavailable-engine fallback. When Ingat is healthy, Kode registers read-only `memory_search` for targeted recall during a run and mutating `remember` for durable verified knowledge.
 
 By default Kode resolves the selected model's live context-window metadata, allocates proportional budgets for repository evidence and recent raw history, and auto-compacts an active run at 80% into a structured continuation summary. System rules, repository context, and the newest task remain verbatim; the latest tool protocol stays attached with oversized output bounded. Raw session turns remain on disk. Explicit non-zero `[agent]` budgets override the automatic values. See [reference-config.md](./reference-config.md) for the exact keys.
 
@@ -50,33 +50,37 @@ The task pipeline (`crates/kode/src/pipeline.rs`) communicates with the rest of 
 ## Data flow
 
 ```
-                         ┌────────────────────┐
-  user ──task──▶ TUI or  │   task pipeline     │
+                         ┌─────────────────────┐
+  user ──task──▶ TUI or  │    task pipeline    │
                  exec ──▶│  (KodeEvent only)   │
-                         └─────────┬───────────┘
-                                   │
-                    ┌──────────────┼──────────────┐
-                    ▼              ▼               ▼
-             ┌───────────┐  ┌────────────┐  ┌────────────┐
-             │  context  │  │   agent    │  │  git state │
-             │ compiler  │◀▶│    loop    │  │  (local)   │
-             └─────┬─────┘  └─────┬──────┘  └────────────┘
-                    │              │
-        ┌───────────┼───────┐     ▼
-        ▼           ▼       │  model provider
-   ┌─────────┐ ┌──────────┐ │  (codex / opencode-*)
-   │ zindeks │ │  Ingat   │ │
-   │ (graph) │ │ (memory) │ │
-   └─────────┘ └──────────┘ │
-                              ▼
-                        tool sandbox
-                       (reads/edits/shell)
-                              │
-                              ▼
-                     verification pipeline
-                    (tests/lint/build, honest
-                     pass/fail/skipped)
+                         └──────────┬──────────┘
+                                    │
+                                    ▼
+                         ┌─────────────────────┐
+                         │    local router     │  tier / effort / plan
+                         │ (Laya + reranker,   │  static fallback when
+                         │  ONNX, optional)    │  models are absent
+                         └──────────┬──────────┘
+                                    │
+                         ┌──────────┴──────────┐
+                         ▼                     ▼
+                  ┌────────────┐        ┌────────────┐
+                  │  context   │◀──────▶│   agent    │──────▶ model provider
+                  │  compiler  │        │    loop    │        (codex / anthropic /
+                  └─────┬──────┘        └─────┬──────┘         antigravity / openai /
+                        │                     │                opencode-family)
+         ┌──────────────┼──────────────┐      ▼
+         ▼              ▼              ▼    tool sandbox
+   ┌───────────┐  ┌───────────┐  ┌──────────┐ (reads/edits/shell,
+   │  zindeks  │  │   Ingat   │  │ git state│  MCP, sub-agents)
+   │  (graph)  │  │ (memory)  │  │ (local)  │ │
+   └───────────┘  └───────────┘  └──────────┘ ▼
+      in-process engines           verification pipeline
+                                  (tests/lint/build, honest
+                                   pass/fail/skipped)
 ```
+
+Each box maps to a workspace crate; the crate table in [CONTRIBUTING.md](../CONTRIBUTING.md#workspace-layout) lists them.
 
 Both engines run in-process: Kode loads a pinned zindeks shared library and links Ingat's headless core, so there is no spawned child, service, or port. With `watch = true` the code engine's own watcher refreshes the index on a background poll instead of Kode issuing an explicit post-task refresh. Both are optional per `[zindeks].enabled` / `[ingat].enabled`: the context compiler simply omits a source it can't reach, their native tools are not registered, and the TUI's knowledge band hides that source rather than showing empty or fake data.
 

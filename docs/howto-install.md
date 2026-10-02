@@ -25,11 +25,11 @@ What the script does:
 Install a specific version instead of latest:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/sutantodadang/kode/main/scripts/install.sh | sh -s -- v0.1.0
+curl -fsSL https://raw.githubusercontent.com/sutantodadang/kode/main/scripts/install.sh | sh -s -- v0.5.6
 ```
 
 ```
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/sutantodadang/kode/main/scripts/install.ps1))) -Version v0.1.0
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/sutantodadang/kode/main/scripts/install.ps1))) -Version v0.5.6
 ```
 
 Override the install directory with the `KODE_INSTALL_DIR` environment variable before running the script. Defaults (matches Kode's own managed-binary convention):
@@ -64,7 +64,7 @@ Steps:
 
 ## Build from source
 
-Requires a Rust toolchain (`cargo`).
+Requires a stable Rust toolchain, 1.85 or newer (the workspace uses edition 2024), and git.
 
 ```
 git clone https://github.com/sutantodadang/kode.git
@@ -82,6 +82,16 @@ kode doctor
 ```
 
 `kode --version` confirms the binary runs and reports its version. `kode doctor` runs a fuller diagnostic across config, LLM auth, zindeks, Ingat, git, and environment: useful right after install to catch a missing engine or a PATH issue before you hit it mid-task.
+
+The binary alone does not include the zindeks engine library. Run `kode setup` next to download it (checksum-verified, consent-gated), then `kode index` inside each repository you want Kode to understand.
+
+## Updating
+
+```
+kode update
+```
+
+Downloads the latest release, verifies its checksum, and replaces the binary after asking. Re-running the install script works too.
 
 ## Troubleshooting
 

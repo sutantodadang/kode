@@ -35,7 +35,7 @@ Terms and pricing are negotiated directly: see procurement contact below.
 - **Local-first.** Kode runs on your machine; it does not phone home your code or prompts as part of its normal operation.
 - **Credential isolation.** All provider credentials live only in `~/.kode/auth/`, one file per provider, `0600` permissions on Unix. Kode never reads another tool's stored credentials and never logs token values.
 - **No telemetry.** Kode does not collect or transmit usage analytics.
-- **Consent-gated downloads.** `kode setup` prompts before installing the zindeks and Ingat engine binaries; nothing is fetched silently.
+- **Consent-gated downloads.** `kode setup` prompts before downloading the zindeks engine library and the optional local router models, and verifies every file against a pinned sha256 checksum; nothing is fetched silently. Ingat's core is compiled into the binary, and both engines run in-process with no listening port.
 - **Honest verification.** The verification pipeline reports tests/lint/build results accurately: a skipped check is reported as Skipped, never as Passed. This matters for compliance workflows that trust Kode's pass/fail signal.
 
 For the full policy, see [SECURITY.md](../SECURITY.md).
