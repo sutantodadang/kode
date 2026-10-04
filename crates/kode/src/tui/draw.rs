@@ -1633,6 +1633,16 @@ pub(crate) fn now_line(state: &AppState, width: u16) -> Line<'static> {
             }
             .to_string(),
         );
+    } else if state.graph_offer.is_some()
+        && state.completion.is_some()
+        && !state.composer_has_content()
+    {
+        left.push(glyph_bold("✓ ".to_string(), theme::OK));
+        left.push(Span::styled(
+            "done · graph answer",
+            Style::default().fg(theme::OK),
+        ));
+        right = Some("Enter ask model anyway · Esc done".to_string());
     } else if let Some(error) = &state.last_error {
         let prefix = "✗ stopped · ";
         let room = w.saturating_sub(1 + prefix.chars().count());

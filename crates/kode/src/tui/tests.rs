@@ -4729,6 +4729,87 @@ fn lmstudio_counts_as_logged_in() {
 }
 
 #[test]
+fn graph_answered_shows_receipt_and_offers_model() {
+    let mut s = state();
+    s.start_new_task("who calls append_turn", false);
+    apply_event(
+        &mut s,
+        KodeEvent::GraphAnswered {
+            query: "callers".into(),
+            symbol: "append_turn".into(),
+            latency_ms: 12,
+            text: "Callers of append_turn:\n- record".into(),
+        },
+    );
+    assert!(
+        s.transcript
+            .iter()
+            .any(|l| l.text == "╰▶ graph · callers · 0 tokens · 12ms")
+    );
+    assert_eq!(
+        s.graph_offer.as_ref().unwrap().text,
+        "who calls append_turn"
+    );
+    apply_event(
+        &mut s,
+        KodeEvent::TaskFinished {
+            iterations: 0,
+            tool_calls: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: Some(0),
+        },
+    );
+    assert_eq!(s.last_response, "Callers of append_turn:\n- record");
+}
+
+#[test]
+fn typing_clears_graph_answer_offer() {
+    let mut s = state();
+    s.graph_offer = Some(kode_core::UserInput::text("q"));
+    s.insert_input("x");
+    assert!(s.graph_offer.is_none());
+}
+
+#[test]
+fn ask_model_anyway_appends_graph_answer_as_context() {
+    let input = ask_model_anyway_input(
+        &kode_core::UserInput::text("who calls x"),
+        "Callers of x:\n- y",
+    );
+    assert!(input.text.starts_with("who calls x\n\n"));
+    assert!(
+        input
+            .text
+            .contains("The code graph answered this without a model:")
+    );
+    assert!(input.text.contains("- y"));
+}
+
+#[test]
+fn now_line_offers_model_after_graph_answer() {
+    let mut s = state();
+    s.graph_offer = Some(kode_core::UserInput::text("q"));
+    s.completion = Some(CompletionReceipt {
+        iterations: 0,
+        tool_calls: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_tokens: Some(0),
+        elapsed_ms: 12,
+        verify_steps: vec![],
+        numstat: vec![],
+    });
+    let text: String = now_line(&s, 100)
+        .spans
+        .iter()
+        .map(|sp| sp.content.to_string())
+        .collect();
+    assert!(text.contains("done · graph answer"));
+    assert!(text.contains("Enter ask model anyway · Esc done"));
+}
+
+#[test]
 fn completed_turn_carries_the_recorded_ledger() {
     let mut s = state();
     s.start_new_task("do it", false);

@@ -448,7 +448,21 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             }
             state.transcript_cache = Default::default();
         }
-        KodeEvent::GraphAnswered { .. } => {}
+        KodeEvent::GraphAnswered {
+            query,
+            latency_ms,
+            text,
+            ..
+        } => {
+            let mut line = TranscriptLine::new(
+                Gutter::Zindeks,
+                format!("╰▶ graph · {query} · 0 tokens · {latency_ms}ms"),
+            );
+            line.born = Some(Instant::now());
+            state.transcript.push(line);
+            state.response_buf = text;
+            state.graph_offer = state.pending_task.clone();
+        }
     }
 }
 

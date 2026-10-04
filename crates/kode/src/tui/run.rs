@@ -601,7 +601,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn submit_task(
+pub(crate) fn submit_task_with(
     state: &mut AppState,
     cwd: &Path,
     config: &KodeConfig,
@@ -610,6 +610,7 @@ pub(crate) fn submit_task(
     handler: &Arc<dyn PermissionHandler>,
     task: UserInput,
     echo_user: bool,
+    allow_graph_answer: bool,
 ) -> SubmittedTask {
     let plan_mode = state.plan_mode;
     state.start_new_task(task.clone(), plan_mode);
@@ -656,7 +657,7 @@ pub(crate) fn submit_task(
             Some(steering_rx),
             Some(task_cache_key),
             &task_runtime,
-            true,
+            allow_graph_answer,
         ))
         .await
         {
@@ -667,6 +668,23 @@ pub(crate) fn submit_task(
         cancel: child,
         steering: steering_tx,
     }
+}
+
+/// Submits a task with graph answers allowed (the common path).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn submit_task(
+    state: &mut AppState,
+    cwd: &Path,
+    config: &KodeConfig,
+    cancel: &CancellationToken,
+    events: &EventBus,
+    handler: &Arc<dyn PermissionHandler>,
+    task: UserInput,
+    echo_user: bool,
+) -> SubmittedTask {
+    submit_task_with(
+        state, cwd, config, cancel, events, handler, task, echo_user, true,
+    )
 }
 
 fn record_failed_turn(
@@ -975,6 +993,45 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                 PickerOutcome::Continue => {}
                             }
                         } else {
+                            if !state.running
+                                && state.graph_offer.is_some()
+                                && !state.composer_has_content()
+                            {
+                                if key.code == KeyCode::Esc {
+                                    state.graph_offer = None;
+                                    continue 'outer;
+                                }
+                                if key.code == KeyCode::Enter {
+                                    let original = state.graph_offer.take().unwrap();
+                                    let input =
+                                        ask_model_anyway_input(&original, &state.last_response);
+                                    if config.router.training.enabled {
+                                        let note = crate::router_cmd::correct(
+                                            cwd,
+                                            "last",
+                                            &["answer=model".to_string()],
+                                        )
+                                        .unwrap_or_else(|e| e);
+                                        state
+                                            .transcript
+                                            .push(TranscriptLine::new(Gutter::Note, note));
+                                    }
+                                    let submitted = submit_task_with(
+                                        &mut state,
+                                        cwd,
+                                        &config,
+                                        &cancel,
+                                        &events,
+                                        &handler,
+                                        input,
+                                        true,
+                                        false,
+                                    );
+                                    current_cancel = Some(submitted.cancel);
+                                    current_steering = Some(submitted.steering);
+                                    continue 'outer;
+                                }
+                            }
                             if handle_key(&mut state, cwd, key.code, key.modifiers, &current_cancel) {
                                 break 'outer;
                             }

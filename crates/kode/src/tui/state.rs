@@ -519,6 +519,8 @@ pub struct AppState {
     /// Stable receipt for the most recently completed run. Cleared as soon
     /// as the user begins composing the next instruction.
     pub completion: Option<CompletionReceipt>,
+    /// Set after a graph answer; Enter on an empty composer re-asks the model.
+    pub(crate) graph_offer: Option<UserInput>,
     /// Last terminal agent error, rendered as a recovery surface until the
     /// user begins composing again.
     pub last_error: Option<String>,
@@ -649,6 +651,7 @@ impl AppState {
             repo_indexed: None,
             setup_card: None,
             completion: None,
+            graph_offer: None,
             last_error: None,
             shortcuts_open: false,
             attachments_open: false,
@@ -731,6 +734,7 @@ impl AppState {
         self.pending_task = Some(task);
         self.ledger_recorder.begin();
         self.completion = None;
+        self.graph_offer = None;
         self.last_error = None;
         self.shortcuts_open = false;
         self.attachments_open = false;
@@ -764,6 +768,7 @@ impl AppState {
     }
 
     pub(crate) fn insert_input(&mut self, text: &str) {
+        self.graph_offer = None;
         self.begin_composing();
         let at = self.cursor_byte();
         self.input.insert_str(at, text);
@@ -1126,6 +1131,17 @@ pub(crate) fn push_graph_warming_note(state: &mut AppState) {
             Gutter::Note,
             "graph warming — this task runs without code-graph facts",
         ));
+    }
+}
+
+/// The original prompt plus the graph's answer, for "ask model anyway".
+pub(crate) fn ask_model_anyway_input(original: &UserInput, answer_text: &str) -> UserInput {
+    UserInput {
+        text: format!(
+            "{}\n\nThe code graph answered this without a model:\n{answer_text}\n\nVerify it, extend it, or correct it.",
+            original.text
+        ),
+        images: original.images.clone(),
     }
 }
 
