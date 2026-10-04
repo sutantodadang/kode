@@ -998,9 +998,16 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
         });
     }
 
+    // Compared at the top of every iteration (not after the select) so a
+    // picker closed by a handler that `continue 'outer`s still marks the
+    // setup facts dirty.
+    let mut picker_was_open = state.picker.open;
     'outer: loop {
+        if picker_was_open && !state.picker.open {
+            state.setup_dirty = true;
+        }
+        picker_was_open = state.picker.open;
         let animating = motion_active(&state, Instant::now());
-        let picker_was_open = state.picker.open;
         tokio::select! {
             biased;
 
@@ -1534,10 +1541,6 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
             _ = motion_tick.tick(), if animating => {
                 motion_tick_update(&mut state, Instant::now());
             }
-        }
-
-        if picker_was_open && !state.picker.open {
-            state.setup_dirty = true;
         }
 
         // Sync real terminal mouse capture to `state.select_mode` (Ctrl+T)

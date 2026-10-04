@@ -139,11 +139,14 @@ pub fn parse_draft(raw: &str) -> Option<String> {
         .trim_matches(|c| c == '"' || c == '\'' || c == '`')
         .trim();
     // `NONE`, `None.`, `NONE - nothing durable` all mean no proposal;
-    // `NONEXISTENT config ...` is a real sentence.
+    // `NONEXISTENT config ...` and `None of the tests may ...` are real sentences.
     let upper = line.to_ascii_uppercase();
-    let is_none = upper
-        .strip_prefix("NONE")
-        .is_some_and(|rest| rest.chars().next().is_none_or(|c| !c.is_alphanumeric()));
+    let is_none = upper.strip_prefix("NONE").is_some_and(|rest| {
+        rest.trim_start()
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric())
+    });
     if is_none || line.is_empty() || line.chars().count() > REJECT_OVER_CHARS {
         return None;
     }
@@ -362,6 +365,10 @@ mod tests {
         assert_eq!(
             parse_draft("NONEXISTENT config breaks builds"),
             Some("NONEXISTENT config breaks builds".into())
+        );
+        assert_eq!(
+            parse_draft("None of the integration tests may run in parallel."),
+            Some("None of the integration tests may run in parallel.".into())
         );
         assert_eq!(
             parse_draft("\"Run tests serially on Windows.\"\nextra"),
