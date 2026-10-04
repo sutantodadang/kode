@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/) (pre-1.0:
 minor versions may contain breaking changes).
 
+## [Unreleased]
+
+### Added
+
+- First-run setup cards: launching `kode` with missing setup walks through
+  provider, login, engine download and indexing; Esc skips any card.
+- Background indexing (`/index`) with an honest "graph warming" note for
+  tasks submitted while it runs.
+- `/map`: a zero-token repo map (totals, core orchestrators, hot symbols)
+  from the code graph, also shown after the first index.
+- Sessions store a per-turn ledger of facts, routing, changed files,
+  verification and token usage.
+
+### Changed
+
+- `kode exec` always saves its turn to `.kode/sessions/` (previously only
+  with `--continue`).
+
 ## [0.5.0 – 0.5.6] - 2026-09-27 to 2026-10-01
 
 ### Added

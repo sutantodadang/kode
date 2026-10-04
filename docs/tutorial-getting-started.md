@@ -2,6 +2,8 @@
 
 This tutorial takes you from a clean machine to your first agentic task in Kode. You will install the CLI, log in to a model provider, install Kode's engines, and run a real task in a repo. By step 2 you will see a live model list, and by step 5 you will watch Kode work.
 
+The fast path is to skip steps 2–4: run `kode` in your repo and let the setup cards walk you through provider, login, engine download, and indexing. Press `Esc` to skip any card. The CLI commands below remain the scripted alternative.
+
 ## What you need
 
 A terminal, a git repo you can experiment in, and network access for the install and OAuth login.
