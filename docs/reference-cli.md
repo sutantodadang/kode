@@ -132,6 +132,38 @@ Build or refresh the code-intelligence index for the repository in the current d
 kode index
 ```
 
+## `kode receipt`
+
+Print a shareable receipt built only from persisted session data (never file contents, diffs, or tool output). Defaults to the latest session and all its turns.
+
+| Flag | Description |
+|---|---|
+| `--session <ID>` | Session id (default: latest). |
+| `--turn <N>` | 1-based turn number (default: all turns). |
+| `--pr` | Add the markdown as a comment on the current branch's pull request via `gh`. Never edits the PR body; if `gh` is missing, unauthenticated, or no PR exists, the markdown is printed with the reason and the command still exits 0. |
+| `--trailer` | Print git trailers instead of markdown, ready for `git commit --trailer` (Kode never commits). |
+| `--include-personal` | Include personal (non-team) memories; team memories are included by default. |
+
+```
+kode receipt
+kode receipt --turn 2
+kode receipt --pr
+kode receipt --trailer
+```
+
+## `kode onboard`
+
+Zero-token tour for someone new to the repo: the code map (entry points, hot symbols), `start here` rows, and team memories grouped as decisions, conventions, known issues, and rejected approaches. Without an index it shows the `/index` hint and memory only; without team memory it shows the map only.
+
+| Flag | Description |
+|---|---|
+| `--explain` | Also ask the model to narrate the tour (costs tokens; the output is labeled model-written and its token cost is shown). |
+
+```
+kode onboard
+kode onboard --explain
+```
+
 ## `kode doctor`
 
 Run diagnostic checks across config, LLM auth, zindeks, Ingat, git, and environment. Useful right after install or when something feels wrong.
@@ -240,6 +272,8 @@ Available inside the interactive `kode` TUI, with a live hint menu as you type `
 | `/index` | Build or refresh the code index in the background; tasks submitted while it runs say `graph warming`. |
 | `/why [N]` | Show where a turn's answer came from (route, graph/memory/git facts, changes, checks, cost) from its persisted ledger. Defaults to the last turn. |
 | `/remember [--team] <text>` | Save an engineering memory directly; `--team` shares it via `.kode/memory/team.jsonl`. |
+| `/receipt [all]` | Copy a shareable receipt for the last turn (or the whole session) to the clipboard. |
+| `/onboard` | Zero-token tour of this repo: code map, team decisions, start points. |
 | `/help` | Show available commands and shortcuts. |
 | `/exit` | Exit Kode. |
 | `/name [args]` | Custom command — expands the `.kode/commands/name.md` or `~/.kode/commands/name.md` template and submits it as a task. See [howto-custom-commands.md](./howto-custom-commands.md). |

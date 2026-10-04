@@ -59,6 +59,10 @@ kode memory status
 
 prints the entry count and how many lines failed to parse (corrupt lines are skipped, never fatal — a corrupt entry from a bad merge doesn't block the rest of the import).
 
+## Tour a repo with team memory
+
+`kode onboard` (or `/onboard` in the TUI) gives a newcomer a zero-token tour: the code map, `start here` entry points, and team memories grouped as decisions, conventions, known issues, and rejected approaches. Corrupt lines are reported as a count, never hidden. `--explain` opts into one model-written narration.
+
 ## Privacy warning
 
 `.kode/memory/team.jsonl` is a normal file in your repo — everyone with read access to the repository can see everything in it, including anyone browsing it on GitHub/GitLab/etc. Only use `--team` for things you're fine with the whole team (and anyone else with repo access) reading. The policy gate blocks obvious secrets (API keys, passwords, tokens) on agent-initiated writes, but it is not a substitute for judgment — nothing stops a human from typing a secret into `kode remember --team` directly.

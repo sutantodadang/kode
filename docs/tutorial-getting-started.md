@@ -111,6 +111,18 @@ To include a screenshot, use `kode exec --image screenshot.png "explain this err
 
 You installed Kode, authenticated against a real provider, installed its engines, confirmed health with `doctor`, indexed a repo, and ran a task both interactively and headlessly. Kode now has a working credential store, a working code graph, and a working memory store behind it, all running in-process on your machine.
 
+## Step 7: Share what Kode did
+
+Every task leaves a ledger of what Kode consulted, changed, and verified. Turn it into a receipt for a PR or a commit:
+
+```
+kode receipt            # markdown for the last session
+kode receipt --pr       # add it as a comment on the current branch's PR
+kode receipt --trailer  # git trailers for a commit message
+```
+
+For someone new to the repo, `kode onboard` gives a zero-token tour — the code map, where to start reading, and the team's decisions and known issues.
+
 ## Related
 
 - [reference-cli.md](./reference-cli.md): every command and flag

@@ -18,6 +18,7 @@ Kode is a terminal coding agent written in Rust. Instead of grepping a repo and 
 - **Local router.** An optional on-device model picks the model tier, reasoning effort, and whether to plan first, and reranks context before it reaches the model. Teams can fine-tune it on their own work.
 - **Cheaper long sessions.** Prompt caching on Anthropic, OpenAI, Codex, and Antigravity, automatic compaction at 80% of the window, and bounded tool output.
 - **Resumable sessions.** Every turn persists to `.kode/sessions/`. Pick up with `kode --continue` or `/resume`.
+- **Shareable receipts.** Every task leaves a ledger of what Kode consulted, changed and verified — paste it into a PR or commit trailers.
 - **Extensible.** Project or user `SKILL.md` skills, custom `/name` slash commands, external MCP servers, and bounded sub-agent delegation with per-tier models.
 
 ## Supported providers
@@ -78,6 +79,8 @@ New to Kode? Follow the [getting started tutorial](docs/tutorial-getting-started
 | `kode verify` | Run the project's verification pipeline |
 | `kode remember <TEXT>` | Save an engineering memory (`--team` to share it via git) |
 | `kode memory status\|import` | Inspect team memory, import a legacy Ingat export |
+| `kode receipt` | Print a shareable receipt for a session (`--pr` comments it on the PR, `--trailer` prints git trailers) |
+| `kode onboard` | Zero-token tour of the repo: code map, team decisions, where to start (`--explain` narrates with the model) |
 | `kode router ...` | Inspect, correct, calibrate, train, and publish the local router |
 | `kode update` | Self-update from the latest GitHub release (consent-gated) |
 

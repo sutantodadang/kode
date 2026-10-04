@@ -37,6 +37,13 @@ minor versions may contain breaking changes).
   under `MEMORY` in `/why`. `[memory] propose` (default `true`) controls it;
   `kode exec` gains `--propose-memory` and `--save-memory`.
 - `/remember [--team] <text>`: save an engineering memory from the TUI.
+- Receipts: `kode receipt` prints a shareable markdown receipt (or `--trailer`
+  git trailers) built only from the session ledger; `--pr` adds it as a PR
+  comment via `gh` (never edits the PR body). `/receipt [all]` copies it in
+  the TUI.
+- Onboarding: `kode onboard` and `/onboard` give a zero-token tour of the
+  repo (code map, start points, team memory grouped by kind); `--explain`
+  opts into one labeled model narration.
 
 ### Changed
 
