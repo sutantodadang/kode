@@ -77,6 +77,10 @@ fn default_router_min_confidence() -> f32 {
     0.6
 }
 
+fn default_router_graph_threshold() -> f32 {
+    0.8
+}
+
 fn default_router_device() -> String {
     "auto".to_string()
 }
@@ -367,6 +371,10 @@ pub struct RouterConfig {
     /// Per-question minimum Laya confidence; below it the static value wins.
     #[serde(default = "default_router_min_confidence")]
     pub min_confidence: f32,
+    /// Minimum Laya confidence on `answer=graph` before Kode answers from
+    /// the code graph without calling the model.
+    #[serde(default = "default_router_graph_threshold")]
+    pub graph_threshold: f32,
     /// One of [`VALID_ROUTER_DEVICES`].
     #[serde(default = "default_router_device")]
     pub device: String,
@@ -393,6 +401,7 @@ impl Default for RouterConfig {
         Self {
             enabled: true,
             min_confidence: default_router_min_confidence(),
+            graph_threshold: default_router_graph_threshold(),
             device: default_router_device(),
             rerank: true,
             rerank_on_cpu: false,
@@ -999,6 +1008,13 @@ effort = "high"
         assert_eq!(cfg.router.rerank_timeout_ms, 2_000);
         assert!(!cfg.router.log_text);
         assert!(cfg.router.tiers.is_empty());
+    }
+
+    #[test]
+    fn router_graph_threshold_defaults_to_point_eight() {
+        assert_eq!(RouterConfig::default().graph_threshold, 0.8);
+        let cfg: KodeConfig = toml::from_str("[router]\ngraph_threshold = 0.9\n").unwrap();
+        assert_eq!(cfg.router.graph_threshold, 0.9);
     }
 
     #[test]

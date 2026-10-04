@@ -218,6 +218,13 @@ pub async fn run(
                             eprintln!("◆ index failed: {e}")
                         }
                         KodeEvent::IndexFinished { .. } => eprintln!("◆ indexed"),
+                        KodeEvent::GraphAnswered {
+                            text, latency_ms, ..
+                        } => {
+                            println!("{text}");
+                            eprintln!("— graph answer · 0 tokens · {latency_ms}ms");
+                            response_buf.push_str(&text);
+                        }
                         _ => {}
                     }
                 }

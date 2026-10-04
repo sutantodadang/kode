@@ -448,6 +448,7 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             }
             state.transcript_cache = Default::default();
         }
+        KodeEvent::GraphAnswered { .. } => {}
     }
 }
 

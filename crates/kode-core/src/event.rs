@@ -198,6 +198,24 @@ pub enum KodeEvent {
     ChangeSet {
         files: Vec<FileChange>,
     },
+    /// Background indexing started (TUI first run or `/index`). The engine
+    /// reports no per-file progress, so only start and finish exist.
+    IndexStarted,
+    /// Background indexing ended. `files` is the indexed document count
+    /// when the health check answered; `error` is set on failure.
+    IndexFinished {
+        files: Option<u64>,
+        error: Option<String>,
+        elapsed_ms: u64,
+    },
+    /// The task was answered from the code graph with zero model tokens.
+    /// `text` is the plain-text answer (stored as the turn's response).
+    GraphAnswered {
+        query: String,
+        symbol: String,
+        latency_ms: u64,
+        text: String,
+    },
 }
 
 /// Broadcast bus for `KodeEvent`s.
