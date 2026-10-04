@@ -35,7 +35,7 @@ use crate::ffi::{self, Symbols, ZindeksBuffer, ZindeksHandle};
 use crate::mapping;
 use crate::types::{
     ArchitectureSummary, CodeContext, CodeContextRequest, CodeSearchResult, FileOutline,
-    IntelHealth,
+    GraphSymbol, IntelHealth, TraceDirection, TraceNode,
 };
 
 /// Stack size for the embedded engine thread. The Zig indexer/parser recurses
@@ -281,6 +281,33 @@ impl CodeIntelligence for EmbeddedZindeks {
         Ok(mapping::architecture_from_value(&mapping::parse_tool_json(
             &text,
         )?))
+    }
+
+    async fn symbols(&self, name_pattern: &str, limit: u32) -> Result<Vec<GraphSymbol>> {
+        let text = self
+            .tool_call_text(
+                "search_graph",
+                json!({"name_pattern": name_pattern, "limit": limit}),
+            )
+            .await?;
+        Ok(mapping::symbols_from_value(&mapping::parse_tool_json(
+            &text,
+        )?))
+    }
+
+    async fn trace(
+        &self,
+        symbol: &str,
+        direction: TraceDirection,
+        depth: u32,
+    ) -> Result<Vec<TraceNode>> {
+        let text = self
+            .tool_call_text(
+                "trace_call_path",
+                json!({"name": symbol, "direction": direction.as_str(), "max_depth": depth}),
+            )
+            .await?;
+        Ok(mapping::trace_from_value(&mapping::parse_tool_json(&text)?))
     }
 
     async fn ensure_bound(&self) -> Result<()> {

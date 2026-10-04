@@ -60,6 +60,42 @@ pub struct ArchitectureSummary {
     pub high_fan_in: Vec<ArchSymbol>,
 }
 
+/// A symbol row from zindeks `search_graph`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphSymbol {
+    pub name: String,
+    pub kind: String,
+    /// Repo-relative, forward slashes.
+    pub path: String,
+    pub line: u32,
+    /// `in_degree + out_degree`; used to pick among same-named symbols.
+    pub degree: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceDirection {
+    Inbound,
+    Outbound,
+}
+
+impl TraceDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TraceDirection::Inbound => "inbound",
+            TraceDirection::Outbound => "outbound",
+        }
+    }
+}
+
+/// One node of a zindeks `trace_call_path` BFS. The root has depth 0.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraceNode {
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+    pub depth: u32,
+}
+
 /// zindeks server health snapshot.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IntelHealth {

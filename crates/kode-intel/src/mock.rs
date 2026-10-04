@@ -2,7 +2,7 @@ use crate::CodeIntelligence;
 use crate::error::{IntelError, Result};
 use crate::types::{
     ArchitectureSummary, CodeContext, CodeContextRequest, CodeSearchResult, FileOutline,
-    IntelHealth,
+    GraphSymbol, IntelHealth, TraceNode,
 };
 
 /// A canned [`CodeIntelligence`] implementation for tests. Defaults to an
@@ -18,6 +18,8 @@ pub struct MockCodeIntelligence {
     pub outline: FileOutline,
     /// When set, `architecture` returns it; otherwise `Err(Unavailable)`.
     pub architecture: Option<ArchitectureSummary>,
+    pub symbols: Vec<GraphSymbol>,
+    pub trace_nodes: Vec<TraceNode>,
 }
 
 impl Default for MockCodeIntelligence {
@@ -42,6 +44,8 @@ impl Default for MockCodeIntelligence {
                 symbols: Vec::new(),
             },
             architecture: None,
+            symbols: Vec::new(),
+            trace_nodes: Vec::new(),
         }
     }
 }
@@ -71,5 +75,31 @@ impl CodeIntelligence for MockCodeIntelligence {
         self.architecture
             .clone()
             .ok_or_else(|| IntelError::Unavailable("no architecture scripted".to_string()))
+    }
+
+    async fn symbols(&self, name_pattern: &str, _limit: u32) -> Result<Vec<GraphSymbol>> {
+        if name_pattern.contains('%') {
+            return Ok(self.symbols.clone());
+        }
+        Ok(self
+            .symbols
+            .iter()
+            .filter(|s| s.name == name_pattern)
+            .cloned()
+            .collect())
+    }
+
+    async fn trace(
+        &self,
+        _symbol: &str,
+        _direction: crate::types::TraceDirection,
+        depth: u32,
+    ) -> Result<Vec<TraceNode>> {
+        Ok(self
+            .trace_nodes
+            .iter()
+            .filter(|n| n.depth <= depth)
+            .cloned()
+            .collect())
     }
 }
