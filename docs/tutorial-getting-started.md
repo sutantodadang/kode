@@ -2,6 +2,8 @@
 
 This tutorial takes you from a clean machine to your first agentic task in Kode. You will install the CLI, log in to a model provider, install Kode's engines, and run a real task in a repo. By step 2 you will see a live model list, and by step 5 you will watch Kode work.
 
+The fast path is to skip steps 2–4: run `kode` in your repo and let the setup cards walk you through provider, login, engine download, and indexing. Press `Esc` to skip any card. The CLI commands below remain the scripted alternative.
+
 ## What you need
 
 A terminal, a git repo you can experiment in, and network access for the install and OAuth login.
@@ -108,6 +110,18 @@ To include a screenshot, use `kode exec --image screenshot.png "explain this err
 ## What you built
 
 You installed Kode, authenticated against a real provider, installed its engines, confirmed health with `doctor`, indexed a repo, and ran a task both interactively and headlessly. Kode now has a working credential store, a working code graph, and a working memory store behind it, all running in-process on your machine.
+
+## Step 7: Share what Kode did
+
+Every task leaves a ledger of what Kode consulted, changed, and verified. Turn it into a receipt for a PR or a commit:
+
+```
+kode receipt            # markdown for the last session
+kode receipt --pr       # add it as a comment on the current branch's PR
+kode receipt --trailer  # git trailers for a commit message
+```
+
+For someone new to the repo, `kode onboard` gives a zero-token tour — the code map, where to start reading, and the team's decisions and known issues.
 
 ## Related
 

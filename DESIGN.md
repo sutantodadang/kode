@@ -113,6 +113,25 @@ Five regions persist, top to bottom: scope row, step rail, thread ledger, now-li
 
 Completed tools collapse to one-line receipts; the active or failed tool may expand. One blank row separates narrative turns; none inside a fact cluster. Permission, failure, and completion may take more rows because they need a decision or explain an outcome.
 
+### Thread ledger additions (2026-10-04)
+
+All reuse existing tokens and glyphs; no new colors.
+
+| Element | Where | Rendering |
+|---|---|---|
+| Setup card | composer region, first run | picker component, `setup N/M · Enter to do it · Esc to skip` |
+| Indexing row | ledger, `g` thread | `g ◐ indexing…` → `g ✓ indexed N files · Ns` / `g ✗ index failed: <reason>` |
+| Repo map | ledger, `g` thread | `repo  N files · N symbols · N edges`, `core  <fan-out leaders>`, `hot   <fan-in leaders>`, closing `map · 0 tokens · Nms` |
+| Graph answer receipt | ledger | `╰▶ graph · <kind> · 0 tokens · Nms` |
+| Impact row | ledger, `g` thread, after the tool receipt | `<symbol> ← N callers, M crates, K tests` |
+| Targeted test step | verify row | `test·targeted` label |
+| Memory proposal | ledger, `m` thread, after the receipt | `◇` (proposed, unsaved), memory color; becomes `●` when saved |
+| `/why` overlay | overlay | picker scrolling, ledger glyphs |
+
+`◇` is the only new glyph: proposed, not yet saved. It becomes `●` when saved. Monochrome terminals keep meaning through the `m` letter and the `remember?` label.
+
+The now-line gains one state: after a graph answer it reads `done · graph answer` on the left and `Enter ask model anyway · Esc done` on the right. The `/why` overlay reuses the picker's scrolling and the ledger's glyphs; it adds no new visual elements.
+
 ## Color
 
 Restrained. Color means provenance or outcome, never decoration. Less than 15% of visible cells carry semantic color. Every colored element also has a glyph or a text label, so monochrome terminals lose nothing.
@@ -143,6 +162,7 @@ Font and size belong to the terminal. Hierarchy uses cell position, weight, and 
 | Glyph | Meaning |
 |---|---|
 | `●` | fact with one known source (a knot) |
+| `◇` | proposed, not yet saved (memory proposal; becomes `●` when saved) |
 | `─ ┼ │` | thread run and idle threads |
 | `╰ ┴ ▶` | threads converging into a decision |
 | `═ ╪` | a change to the working tree |
@@ -235,3 +255,6 @@ The three threads show engine state instead of a logo: graph (symbols indexed, a
 | 2026-09-30 | Input, picker, permission, resume contracts kept | Implemented and tested two days ago; the redesign is about information and identity. |
 | 2026-10-01 | KODE reply label | Owner asked for the reply to stand out; a label mirrors YOU and keeps the no-box rule. |
 | 2026-10-01 | Wrapped rows keep the gutter; prose measure 100 columns | Ratatui wrap dropped continuation rows to column 0, and 200-column prose lines were hard to read. |
+| 2026-10-04 | First-run setup cards in the composer region | A fresh launch should reach an indexed repo without four CLI commands. |
+| 2026-10-04 | Background indexing row + repo map on the `g` thread | Shows real progress and a zero-token repo map; no fabricated file counts. |
+| 2026-10-04 | `◇` for proposed-but-unsaved memories | The one new glyph; monochrome keeps meaning via the `m` letter and `remember?` label. |

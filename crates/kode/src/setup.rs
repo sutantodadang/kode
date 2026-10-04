@@ -206,6 +206,12 @@ async fn setup_zindeks(cfg: &ZindeksConfig, yes: bool) -> anyhow::Result<()> {
     setup_zindeks_embedded(cfg, yes).await
 }
 
+/// Installs the pinned zindeks library without a second consent prompt:
+/// the TUI setup card the user just accepted is the consent.
+pub async fn install_zindeks(cfg: &ZindeksConfig) -> anyhow::Result<()> {
+    setup_zindeks_embedded(cfg, true).await
+}
+
 /// Installs the pinned in-process zindeks shared library under
 /// `~/.kode/runtime/zindeks/<revision>/` (checksum-verified before install).
 async fn setup_zindeks_embedded(cfg: &ZindeksConfig, yes: bool) -> anyhow::Result<()> {

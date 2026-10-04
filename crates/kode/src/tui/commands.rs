@@ -29,6 +29,21 @@ pub enum SlashCommand {
     Image(String),
     /// `/router [key=value…]` — show or correct the last router training record.
     Router(String),
+    /// `/map` — zero-token repo map from the code graph.
+    Map,
+    /// `/index` — build or refresh the code index in the background.
+    Index,
+    /// `/why [N]` — show a turn's provenance from its ledger.
+    Why(String),
+    /// `/remember [--team] <text>` — save an engineering memory.
+    Remember {
+        team: bool,
+        text: String,
+    },
+    /// `/receipt [all]` — copy a shareable receipt.
+    Receipt(String),
+    /// `/onboard` — tour this repo: map, team decisions, start points.
+    Onboard,
     Help,
     /// `/name [args]` where `name` isn't a builtin. Resolved against
     /// discovered custom commands at handle time (not parse time) — an
@@ -46,7 +61,7 @@ pub enum SlashCommand {
 /// filters them out up front.
 pub const BUILTIN_COMMAND_NAMES: &[&str] = &[
     "model", "effort", "provider", "copy", "resume", "status", "exit", "plan", "image", "router",
-    "help",
+    "map", "index", "why", "remember", "receipt", "onboard", "help",
 ];
 
 /// The providers `/provider` accepts, in picker display order.
@@ -76,6 +91,15 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
         "toggle plan mode (plan first, then approve to run)",
     ),
     ("/router", "show or correct the last router decision"),
+    ("/map", "show the repo map (graph, 0 tokens)"),
+    ("/index", "index this repo in the background"),
+    ("/why", "show where the last answer came from"),
+    ("/remember", "save an engineering memory (--team to share)"),
+    ("/receipt", "copy a shareable receipt (all = whole session)"),
+    (
+        "/onboard",
+        "tour this repo: map, team decisions, start points",
+    ),
     ("/help", "list commands + shortcuts"),
 ];
 
@@ -134,6 +158,18 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "/plan" => SlashCommand::Plan,
         "/image" => SlashCommand::Image(rest.to_string()),
         "/router" => SlashCommand::Router(rest.to_string()),
+        "/map" => SlashCommand::Map,
+        "/index" => SlashCommand::Index,
+        "/why" => SlashCommand::Why(rest.to_string()),
+        "/remember" => {
+            let (team, text) = match rest.strip_prefix("--team") {
+                Some(t) => (true, t.trim().to_string()),
+                None => (false, rest.to_string()),
+            };
+            SlashCommand::Remember { team, text }
+        }
+        "/receipt" => SlashCommand::Receipt(rest.to_string()),
+        "/onboard" => SlashCommand::Onboard,
         "/help" => SlashCommand::Help,
         other => {
             let name = other.trim_start_matches('/').to_lowercase();
@@ -204,31 +240,6 @@ pub fn provider_auth_state(
     }
 }
 
-/// Decides the startup hint (if any) shown once at TUI launch: a nudge to
-/// switch providers when the config is still on the `openai` default, no
-/// model has been explicitly chosen, no OpenAI credentials are available,
-/// but Kode's own credential store has something usable. Fires at most one
-/// hint — codex takes priority over opencode. Pure so the decision is
-/// unit-testable without touching the filesystem/env.
-pub(crate) fn startup_hint(
-    provider: &str,
-    model_set: bool,
-    env_key: bool,
-    codex_auth: bool,
-    opencode_any: bool,
-) -> Option<&'static str> {
-    if provider != "openai" || model_set || env_key {
-        return None;
-    }
-    if codex_auth {
-        Some("logged in via codex — run /provider codex to use it")
-    } else if opencode_any {
-        Some("opencode key found — run /provider opencode-go")
-    } else {
-        None
-    }
-}
-
 /// Whether Kode's own codex OAuth credentials file exists (`kode auth login
 /// codex`). Used only to power the `/provider` picker annotation and the
 /// startup hint — not a validity check of the tokens inside.
@@ -279,6 +290,56 @@ pub(crate) fn antigravity_auth_present() -> bool {
     kode_model::antigravity::default_auth_path()
         .map(|p| p.exists())
         .unwrap_or(false)
+}
+
+/// Whether `provider` has usable credentials (same sources the `/provider`
+/// picker annotates).
+pub(crate) fn provider_logged_in(provider: &str) -> bool {
+    !matches!(
+        provider_auth_state(
+            provider,
+            codex_auth_exists(),
+            &opencode_key_ids(),
+            openai_env_key_present(),
+            anthropic_auth_present(),
+            antigravity_auth_present(),
+        ),
+        "" | " · login required"
+    )
+}
+
+pub(crate) fn setup_card_item(card: crate::first_run::SetupCard, provider: &str) -> String {
+    use crate::first_run::SetupCard;
+    match card {
+        SetupCard::Provider => "choose a provider and model".to_string(),
+        SetupCard::Login => format!("log in to {provider} (leaves the TUI, opens your browser)"),
+        SetupCard::Engine => format!(
+            "download the code-graph engine (zindeks v{}, checksum-verified)",
+            crate::engine_assets::ZINDEKS_VERSION
+        ),
+        SetupCard::Index => "index this repo in the background".to_string(),
+    }
+}
+
+/// Shows one setup card through the picker overlay (Enter = do it, Esc =
+/// skip for this launch).
+pub(crate) fn open_setup_card(
+    state: &mut AppState,
+    card: crate::first_run::SetupCard,
+    provider: &str,
+    position: usize,
+    total: usize,
+) {
+    state.picker.request_id = state.picker.request_id.wrapping_add(1);
+    state.picker.open = true;
+    state.picker.kind = PickerKind::Setup;
+    state.picker.filter.clear();
+    state.picker.selected = 0;
+    state.picker.items = vec![setup_card_item(card, provider)];
+    state.picker.note = Some(format!(
+        "setup {position}/{total} · Enter to do it · Esc to skip"
+    ));
+    state.setup_card = Some(card);
 }
 
 /// Validates a reasoning-effort value against
@@ -521,6 +582,37 @@ pub(crate) fn commit_model_selection(
 /// through the exact same path a typed non-slash prompt takes. Every other
 /// variant returns `None`; its side effects (state/config mutation,
 /// transcript notes, picker opens) are applied in place.
+/// Copies a shareable receipt for the last turn (or the whole session) to
+/// the clipboard. Never includes personal memories.
+pub(crate) fn handle_receipt(state: &mut AppState, arg: &str) {
+    if state.history.is_empty() {
+        state
+            .transcript
+            .push(TranscriptLine::new(Gutter::Note, "no completed turns yet"));
+        return;
+    }
+    let turns: Vec<crate::session::Turn> = if arg.trim() == "all" {
+        state.history.clone()
+    } else {
+        vec![state.history.last().unwrap().clone()]
+    };
+    let meta = crate::receipt::ReceiptMeta {
+        session: state
+            .session_id
+            .clone()
+            .unwrap_or_else(|| "unsaved".to_string()),
+        model: Some(state.status.model.clone()).filter(|m| !m.is_empty()),
+    };
+    let body = crate::receipt::markdown(&turns, &meta, false);
+    let note = match super::run::copy_to_clipboard(&body) {
+        Ok(n) => format!("receipt copied ({n} chars)"),
+        Err(()) => "no clipboard tool found — use `kode receipt` instead".to_string(),
+    };
+    state
+        .transcript
+        .push(TranscriptLine::new(Gutter::Note, note));
+}
+
 pub(crate) fn handle_slash_command(
     state: &mut AppState,
     cwd: &Path,
@@ -600,6 +692,18 @@ pub(crate) fn handle_slash_command(
             ));
         }
         SlashCommand::Exit => {}
+        SlashCommand::Map | SlashCommand::Index => {}
+        SlashCommand::Remember { .. } => {}
+        SlashCommand::Receipt(arg) => handle_receipt(state, &arg),
+        SlashCommand::Onboard => {}
+        SlashCommand::Why(arg) => match crate::why::parse_turn_arg(&arg, state.history.len()) {
+            Ok(index) => {
+                state.why_lines = Some(crate::why::why_lines(&state.history[index], index + 1))
+            }
+            Err(message) => state
+                .transcript
+                .push(TranscriptLine::new(Gutter::Note, message)),
+        },
         SlashCommand::Router(args) => {
             let lines = if args.trim().is_empty() {
                 crate::router_cmd::describe_last(cwd)
@@ -683,7 +787,7 @@ pub(crate) fn handle_slash_command(
             state.transcript.push(TranscriptLine::new(
                 Gutter::Note,
                 "commands: /model [name], /effort <minimal|low|medium|high|xhigh|max|ultra>, \
-                 /provider [name], /resume, /status, /exit, /image <path>, /copy, /plan, /help · shift+tab toggles auto mode (tools run \
+                 /provider [name], /resume, /status, /exit, /image <path>, /copy, /plan, /map, /index, /help · shift+tab toggles auto mode (tools run \
                  without asking) · shift+enter adds a newline · long paste becomes a compact \
                  attachment; paste or drag an image path to attach it · Enter follows the composer label: send, steer, or queue · Alt+Enter explicitly queues · \
                  ? opens shortcuts · Ctrl+P opens commands · Ctrl+A inspects attachments · Ctrl+Y copies the last response · Ctrl+T toggles select mode \

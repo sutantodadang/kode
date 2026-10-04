@@ -59,11 +59,27 @@ kode memory status
 
 prints the entry count and how many lines failed to parse (corrupt lines are skipped, never fatal — a corrupt entry from a bad merge doesn't block the rest of the import).
 
+## Tour a repo with team memory
+
+`kode onboard` (or `/onboard` in the TUI) gives a newcomer a zero-token tour: the code map, `start here` entry points, and team memories grouped as decisions, conventions, known issues, and rejected approaches. Corrupt lines are reported as a count, never hidden. `--explain` opts into one model-written narration.
+
 ## Privacy warning
 
 `.kode/memory/team.jsonl` is a normal file in your repo — everyone with read access to the repository can see everything in it, including anyone browsing it on GitHub/GitLab/etc. Only use `--team` for things you're fine with the whole team (and anyone else with repo access) reading. The policy gate blocks obvious secrets (API keys, passwords, tokens) on agent-initiated writes, but it is not a substitute for judgment — nothing stops a human from typing a secret into `kode remember --team` directly.
 
 Personal memories (the default, no `--team`) never touch this file and stay local to your machine.
+
+## Proposed memories
+
+Kode can notice a memorable moment and offer to save it, so you don't have to remember to run `kode remember`. Deterministic triggers decide when: a check failed then passed after a fix, an earlier change was reverted, the user steered the agent, or the same tool failed twice with the same error. Only then does Kode make one small model request to draft a sentence; the draft must pass the same policy gate and a near-duplicate check against Ingat.
+
+In the TUI, after the turn's receipt, a `◇ remember? "…"` row appears:
+
+- `Enter` saves a personal memory; `Tab` saves it as team memory (same `.kode/memory/team.jsonl` path as `--team`).
+- `Ctrl+E` puts `/remember <draft>` in the composer for editing.
+- `Esc` skips; typing a new prompt also skips.
+
+Saved proposals are stored as user-approved (`explicit-user`) with the `kode:proposed` tag, and shown under `MEMORY` in `/why`. Configure with `[memory] propose` (default `true`); `kode exec` only proposes with `--propose-memory` (and saves with `--save-memory`).
 
 ## What's not built yet
 

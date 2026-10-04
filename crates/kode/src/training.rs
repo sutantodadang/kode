@@ -127,7 +127,7 @@ mod tests {
 
     use crate::pipeline::VerificationStatus;
 
-    const VALID: &str = r#"{"tier":{"light":0.1,"standard":0.3,"heavy":0.6},"effort":{"low":0.2,"medium":0.5,"high":0.3},"plan":{"plan":0.7,"direct":0.3}}"#;
+    const VALID: &str = r#"{"tier":{"light":0.1,"standard":0.3,"heavy":0.6},"effort":{"low":0.2,"medium":0.5,"high":0.3},"plan":{"plan":0.7,"direct":0.3},"answer":{"graph":0.3,"model":0.7},"graph_query":{"definition":0.4,"callers":0.2,"callees":0.2,"impact":0.1,"structure":0.1}}"#;
 
     fn scripted(answer: &str) -> MockModel {
         let m = MockModel::new();
@@ -189,6 +189,8 @@ mod tests {
                 vec![0.0, 0.0, 1.0],
                 vec![1.0, 0.0, 0.0],
                 vec![1.0, 0.0],
+                vec![0.0, 1.0],
+                vec![1.0, 0.0, 0.0, 0.0, 0.0],
             ]),
             0.6,
         );

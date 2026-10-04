@@ -218,6 +218,31 @@ fn permission_at_60_columns_shows_action_scope_and_choices() {
 }
 
 #[test]
+fn permission_note_second_line_is_rendered() {
+    let mut s = state();
+    let (tx, _rx) = oneshot::channel();
+    s.push_permission(PermReq {
+        summary: "apply_patch {…}\nimpact · fetch ← 1 caller, 1 crate, 1 test".into(),
+        responder: tx,
+    });
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| draw(frame, &mut s, std::path::Path::new(".")))
+        .unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(
+        screen.contains("impact · fetch ← 1 caller, 1 crate, 1 test"),
+        "{screen}"
+    );
+}
+
+#[test]
 fn long_permission_action_keeps_scope_visible_at_60_columns() {
     let mut s = state();
     let (tx, _rx) = oneshot::channel();
@@ -1830,44 +1855,6 @@ fn provider_auth_state_lmstudio_always_local() {
     );
 }
 
-// -- startup hint (pure fn) ---------------------------------------------
-
-#[test]
-fn startup_hint_fresh_with_codex_auth_shows_codex_hint() {
-    assert_eq!(
-        startup_hint("openai", false, false, true, false),
-        Some("logged in via codex — run /provider codex to use it")
-    );
-}
-
-#[test]
-fn startup_hint_provider_already_codex_is_none() {
-    assert_eq!(startup_hint("codex", false, false, true, false), None);
-}
-
-#[test]
-fn startup_hint_env_key_set_is_none() {
-    assert_eq!(startup_hint("openai", false, true, true, false), None);
-}
-
-#[test]
-fn startup_hint_nothing_is_none() {
-    assert_eq!(startup_hint("openai", false, false, false, false), None);
-}
-
-#[test]
-fn startup_hint_opencode_key_found_when_no_codex_auth() {
-    assert_eq!(
-        startup_hint("openai", false, false, false, true),
-        Some("opencode key found — run /provider opencode-go")
-    );
-}
-
-#[test]
-fn startup_hint_model_already_set_is_none() {
-    assert_eq!(startup_hint("openai", true, false, true, false), None);
-}
-
 #[test]
 fn validate_effort_accepts_known_values() {
     for v in kode_core::config::VALID_EFFORTS {
@@ -3181,6 +3168,7 @@ fn handle_slash_command_resume_with_sessions_opens_picker() {
             images: Vec::new(),
             response: "done".to_string(),
             tool_calls: 1,
+            ledger: Vec::new(),
         },
     )
     .unwrap();
@@ -3458,6 +3446,7 @@ fn restore_session_replays_transcript_and_history() {
             images: Vec::new(),
             response: "first answer".to_string(),
             tool_calls: 1,
+            ledger: Vec::new(),
         },
     )
     .unwrap();
@@ -3470,6 +3459,7 @@ fn restore_session_replays_transcript_and_history() {
             images: Vec::new(),
             response: "second answer".to_string(),
             tool_calls: 0,
+            ledger: Vec::new(),
         },
     )
     .unwrap();
@@ -4657,4 +4647,313 @@ fn kode_label_renders_bold_without_gutter() {
     );
     assert_eq!(line_text(&row), "KODE");
     assert!(row.spans[0].style.add_modifier.contains(Modifier::BOLD));
+}
+
+#[test]
+fn parses_map_and_index_commands() {
+    assert_eq!(parse_slash_command("/map"), Some(SlashCommand::Map));
+    assert_eq!(parse_slash_command("/index"), Some(SlashCommand::Index));
+}
+
+#[test]
+fn index_started_then_finished_updates_one_row_in_place() {
+    let mut s = state();
+    apply_event(&mut s, KodeEvent::IndexStarted);
+    let row = s.index_line.expect("row index recorded");
+    assert!(s.transcript[row].text.contains("indexing"));
+    assert!(s.indexing_since.is_some());
+    apply_event(
+        &mut s,
+        KodeEvent::IndexFinished {
+            files: Some(1830),
+            error: None,
+            elapsed_ms: 22_000,
+        },
+    );
+    assert_eq!(s.transcript[row].text, "✓ indexed 1,830 files · 22s");
+    assert!(s.indexing_since.is_none());
+}
+
+#[test]
+fn index_failure_is_shown_not_hidden() {
+    let mut s = state();
+    apply_event(&mut s, KodeEvent::IndexStarted);
+    apply_event(
+        &mut s,
+        KodeEvent::IndexFinished {
+            files: None,
+            error: Some("disk full".into()),
+            elapsed_ms: 900,
+        },
+    );
+    let row = s.index_line.unwrap();
+    assert_eq!(s.transcript[row].text, "✗ index failed: disk full");
+}
+
+#[test]
+fn submitting_while_indexing_notes_graph_warming() {
+    let mut s = state();
+    apply_event(&mut s, KodeEvent::IndexStarted);
+    push_graph_warming_note(&mut s);
+    assert!(
+        s.transcript
+            .iter()
+            .any(|l| l.text == "graph warming — this task runs without code-graph facts")
+    );
+    // Not indexing: no note.
+    let mut idle = state();
+    push_graph_warming_note(&mut idle);
+    assert!(
+        !idle
+            .transcript
+            .iter()
+            .any(|l| l.text.starts_with("graph warming"))
+    );
+}
+
+#[test]
+fn setup_card_items_say_exactly_what_happens() {
+    use crate::first_run::SetupCard;
+    assert_eq!(
+        setup_card_item(SetupCard::Provider, "openai"),
+        "choose a provider and model"
+    );
+    assert_eq!(
+        setup_card_item(SetupCard::Login, "codex"),
+        "log in to codex (leaves the TUI, opens your browser)"
+    );
+    assert!(
+        setup_card_item(SetupCard::Engine, "codex").starts_with("download the code-graph engine")
+    );
+    assert_eq!(
+        setup_card_item(SetupCard::Index, "codex"),
+        "index this repo in the background"
+    );
+}
+
+#[test]
+fn open_setup_card_uses_the_picker_with_a_skip_hint() {
+    let mut s = state();
+    open_setup_card(&mut s, crate::first_run::SetupCard::Index, "codex", 3, 4);
+    assert!(s.picker.open);
+    assert_eq!(s.picker.kind, PickerKind::Setup);
+    assert_eq!(
+        s.picker.items,
+        vec!["index this repo in the background".to_string()]
+    );
+    assert_eq!(
+        s.picker.note.as_deref(),
+        Some("setup 3/4 · Enter to do it · Esc to skip")
+    );
+    assert_eq!(s.setup_card, Some(crate::first_run::SetupCard::Index));
+}
+
+#[test]
+fn lmstudio_counts_as_logged_in() {
+    assert!(provider_logged_in("lmstudio"));
+}
+
+fn proposal() -> crate::memory_proposal::Proposal {
+    crate::memory_proposal::Proposal {
+        kind: kode_memory::MemoryKind::KnownIssue,
+        text: "Run tests serially on Windows".into(),
+        files: vec![],
+    }
+}
+
+#[test]
+fn receipt_command_parses_and_needs_a_turn() {
+    assert_eq!(
+        parse_slash_command("/receipt all"),
+        Some(SlashCommand::Receipt("all".into()))
+    );
+    let mut s = state();
+    handle_receipt(&mut s, "");
+    assert!(
+        s.transcript
+            .iter()
+            .any(|l| l.text == "no completed turns yet")
+    );
+}
+
+#[test]
+fn offer_row_and_now_line() {
+    let mut s = state();
+    offer_memory(&mut s, proposal());
+    assert!(
+        s.transcript
+            .iter()
+            .any(|l| l.text == "◇ remember? \"Run tests serially on Windows\"")
+    );
+    let text: String = now_line(&s, 100)
+        .spans
+        .iter()
+        .map(|sp| sp.content.to_string())
+        .collect();
+    assert!(text.contains("Enter save · Tab team · Ctrl+E edit · Esc skip"));
+}
+
+#[test]
+fn late_proposal_is_dropped_when_busy() {
+    let mut s = state();
+    s.running = true;
+    offer_memory(&mut s, proposal());
+    assert!(s.memory_offer.is_none());
+    let mut typing = state();
+    typing.insert_input("next task");
+    offer_memory(&mut typing, proposal());
+    assert!(typing.memory_offer.is_none());
+}
+
+#[test]
+fn typing_skips_the_offer() {
+    let mut s = state();
+    offer_memory(&mut s, proposal());
+    s.insert_input("r");
+    assert!(s.memory_offer.is_none());
+}
+
+#[test]
+fn parses_remember_command() {
+    assert_eq!(
+        parse_slash_command("/remember --team use tokio"),
+        Some(SlashCommand::Remember {
+            team: true,
+            text: "use tokio".into()
+        })
+    );
+    assert_eq!(
+        parse_slash_command("/remember use tokio"),
+        Some(SlashCommand::Remember {
+            team: false,
+            text: "use tokio".into()
+        })
+    );
+}
+
+#[test]
+fn why_sheet_keeps_footer_when_cut() {
+    let lines: Vec<String> = (0..30)
+        .map(|i| format!("row {i}"))
+        .chain([" Esc closes".to_string()])
+        .collect();
+    let out = why_sheet_lines(&lines, 10);
+    assert_eq!(out.len(), 10);
+    assert_eq!(out.last().unwrap().spans[0].content, " Esc closes");
+}
+
+#[test]
+fn graph_answered_shows_receipt_and_offers_model() {
+    let mut s = state();
+    s.start_new_task("who calls append_turn", false);
+    apply_event(
+        &mut s,
+        KodeEvent::GraphAnswered {
+            query: "callers".into(),
+            symbol: "append_turn".into(),
+            latency_ms: 12,
+            text: "Callers of append_turn:\n- record".into(),
+        },
+    );
+    assert!(
+        s.transcript
+            .iter()
+            .any(|l| l.text == "╰▶ graph · callers · 0 tokens · 12ms")
+    );
+    assert_eq!(
+        s.graph_offer.as_ref().unwrap().text,
+        "who calls append_turn"
+    );
+    apply_event(
+        &mut s,
+        KodeEvent::TaskFinished {
+            iterations: 0,
+            tool_calls: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: Some(0),
+        },
+    );
+    assert_eq!(s.last_response, "Callers of append_turn:\n- record");
+}
+
+#[test]
+fn typing_clears_graph_answer_offer() {
+    let mut s = state();
+    s.graph_offer = Some(kode_core::UserInput::text("q"));
+    s.insert_input("x");
+    assert!(s.graph_offer.is_none());
+}
+
+#[test]
+fn ask_model_anyway_appends_graph_answer_as_context() {
+    let input = ask_model_anyway_input(
+        &kode_core::UserInput::text("who calls x"),
+        "Callers of x:\n- y",
+    );
+    assert!(input.text.starts_with("who calls x\n\n"));
+    assert!(
+        input
+            .text
+            .contains("The code graph answered this without a model:")
+    );
+    assert!(input.text.contains("- y"));
+}
+
+#[test]
+fn now_line_offers_model_after_graph_answer() {
+    let mut s = state();
+    s.graph_offer = Some(kode_core::UserInput::text("q"));
+    s.completion = Some(CompletionReceipt {
+        iterations: 0,
+        tool_calls: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_tokens: Some(0),
+        elapsed_ms: 12,
+        verify_steps: vec![],
+        numstat: vec![],
+    });
+    let text: String = now_line(&s, 100)
+        .spans
+        .iter()
+        .map(|sp| sp.content.to_string())
+        .collect();
+    assert!(text.contains("done · graph answer"));
+    assert!(text.contains("Enter ask model anyway · Esc done"));
+}
+
+#[test]
+fn completed_turn_carries_the_recorded_ledger() {
+    let mut s = state();
+    s.start_new_task("do it", false);
+    apply_event(
+        &mut s,
+        KodeEvent::SourcedNote {
+            text: "fetch ← 4 callers".into(),
+            source: NoteSource::Zindeks,
+        },
+    );
+    apply_event(
+        &mut s,
+        KodeEvent::TaskFinished {
+            iterations: 1,
+            tool_calls: 0,
+            input_tokens: 5,
+            output_tokens: 1,
+            cached_tokens: None,
+        },
+    );
+    let cwd = temp_project_dir();
+    record_completed_turn(&mut s, &cwd, "codex", "m", 0);
+    let ledger = &s.history.last().unwrap().ledger;
+    assert!(ledger.iter().any(|e| matches!(
+        e,
+        crate::ledger::LedgerEntry::Fact { text, .. } if text == "fetch ← 4 callers"
+    )));
+    assert!(
+        ledger
+            .iter()
+            .any(|e| matches!(e, crate::ledger::LedgerEntry::Usage { .. }))
+    );
 }

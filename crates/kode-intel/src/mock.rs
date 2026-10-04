@@ -1,6 +1,9 @@
 use crate::CodeIntelligence;
 use crate::error::{IntelError, Result};
-use crate::types::{CodeContext, CodeContextRequest, CodeSearchResult, FileOutline, IntelHealth};
+use crate::types::{
+    ArchitectureSummary, CodeContext, CodeContextRequest, CodeSearchResult, FileOutline,
+    GraphSymbol, IntelHealth, TraceNode,
+};
 
 /// A canned [`CodeIntelligence`] implementation for tests. Defaults to an
 /// empty-but-healthy backend; override the fields to script specific
@@ -13,6 +16,12 @@ pub struct MockCodeIntelligence {
     pub context_error: Option<String>,
     pub search_results: Vec<CodeSearchResult>,
     pub outline: FileOutline,
+    /// When set, `file_outline` returns `Err(Unavailable)` with this message.
+    pub outline_error: Option<String>,
+    /// When set, `architecture` returns it; otherwise `Err(Unavailable)`.
+    pub architecture: Option<ArchitectureSummary>,
+    pub symbols: Vec<GraphSymbol>,
+    pub trace_nodes: Vec<TraceNode>,
 }
 
 impl Default for MockCodeIntelligence {
@@ -36,6 +45,10 @@ impl Default for MockCodeIntelligence {
                 path: String::new(),
                 symbols: Vec::new(),
             },
+            outline_error: None,
+            architecture: None,
+            symbols: Vec::new(),
+            trace_nodes: Vec::new(),
         }
     }
 }
@@ -58,6 +71,41 @@ impl CodeIntelligence for MockCodeIntelligence {
     }
 
     async fn file_outline(&self, _path: &str) -> Result<FileOutline> {
+        if let Some(message) = &self.outline_error {
+            return Err(IntelError::Unavailable(message.clone()));
+        }
         Ok(self.outline.clone())
+    }
+
+    async fn architecture(&self, _limit: u32) -> Result<ArchitectureSummary> {
+        self.architecture
+            .clone()
+            .ok_or_else(|| IntelError::Unavailable("no architecture scripted".to_string()))
+    }
+
+    async fn symbols(&self, name_pattern: &str, _limit: u32) -> Result<Vec<GraphSymbol>> {
+        if name_pattern.contains('%') {
+            return Ok(self.symbols.clone());
+        }
+        Ok(self
+            .symbols
+            .iter()
+            .filter(|s| s.name == name_pattern)
+            .cloned()
+            .collect())
+    }
+
+    async fn trace(
+        &self,
+        _symbol: &str,
+        _direction: crate::types::TraceDirection,
+        depth: u32,
+    ) -> Result<Vec<TraceNode>> {
+        Ok(self
+            .trace_nodes
+            .iter()
+            .filter(|n| n.depth <= depth)
+            .cloned()
+            .collect())
     }
 }

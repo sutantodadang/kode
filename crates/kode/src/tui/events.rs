@@ -58,6 +58,8 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
         flush_model_stream(state);
     }
 
+    state.ledger_recorder.observe(&ev);
+
     match ev {
         KodeEvent::AgentStarted => {
             state.running = true;
@@ -408,6 +410,72 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
                     state.ledger.done_at.push((step, Instant::now()));
                 }
             }
+        }
+        // The TUI's CURRENT CHANGE rows already come from the git poll; the
+        // ledger recorder (P0 Task 4) is what consumes this event.
+        KodeEvent::ChangeSet { .. } => {}
+        KodeEvent::IndexStarted => {
+            state.indexing_since = Some(Instant::now());
+            state.index_line = Some(state.transcript.len());
+            let mut line =
+                TranscriptLine::new(Gutter::Zindeks, "◐ indexing this repo in the background");
+            line.born = Some(Instant::now());
+            state.transcript.push(line);
+        }
+        KodeEvent::IndexFinished {
+            files,
+            error,
+            elapsed_ms,
+        } => {
+            state.indexing_since = None;
+            let text = match (error, files) {
+                (Some(error), _) => format!("✗ index failed: {error}"),
+                (None, Some(files)) => format!(
+                    "✓ indexed {} files · {}s",
+                    crate::repo_map::thousands(files),
+                    elapsed_ms / 1000
+                ),
+                (None, None) => format!("✓ indexed · {}s", elapsed_ms / 1000),
+            };
+            match state
+                .index_line
+                .and_then(|row| state.transcript.get_mut(row))
+            {
+                Some(line) => line.text = text,
+                None => state
+                    .transcript
+                    .push(TranscriptLine::new(Gutter::Zindeks, text)),
+            }
+            state.transcript_cache = Default::default();
+        }
+        KodeEvent::GraphAnswered {
+            query,
+            latency_ms,
+            text,
+            ..
+        } => {
+            let mut line = TranscriptLine::new(
+                Gutter::Zindeks,
+                format!("╰▶ graph · {query} · 0 tokens · {latency_ms}ms"),
+            );
+            line.born = Some(Instant::now());
+            state.transcript.push(line);
+            state.response_buf = text;
+            state.graph_offer = state.pending_task.clone();
+        }
+        KodeEvent::Impact {
+            symbol,
+            callers,
+            crates,
+            tests,
+            ..
+        } => {
+            let mut line = TranscriptLine::new(
+                Gutter::Zindeks,
+                crate::impact::row_text_parts(&symbol, callers, crates, tests),
+            );
+            line.born = Some(Instant::now());
+            state.transcript.push(line);
         }
     }
 }

@@ -6,6 +6,54 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/) (pre-1.0:
 minor versions may contain breaking changes).
 
+## [Unreleased]
+
+### Added
+
+- First-run setup cards: launching `kode` with missing setup walks through
+  provider, login, engine download and indexing; Esc skips any card.
+- Background indexing (`/index`) with an honest "graph warming" note for
+  tasks submitted while it runs.
+- `/map`: a zero-token repo map (totals, core orchestrators, hot symbols)
+  from the code graph, also shown after the first index.
+- Sessions store a per-turn ledger of facts, routing, changed files,
+  verification and token usage.
+- Graph answers: when the local router is confident a prompt is a pure
+  structural lookup, Kode answers it from the code graph with zero model
+  tokens, with an "ask model anyway" escape hatch in the TUI and a
+  `--no-graph-answer` flag for `kode exec`.
+- `/why [N]`: the provenance of a persisted turn (route, graph/memory/git
+  facts, changes, checks, cost) from its ledger.
+- Blast radius after each edit: the ledger shows an `impact · <symbol> ← N
+  callers, M crates, K tests` row, the model sees the caller sites in the
+  tool result, and the permission prompt previews the impact before a write.
+- Targeted verification: graph-selected tests run first (`[verify] targeted`,
+  default `"first"`), with the full suite honestly reported as Skipped when
+  it does not run.
+- Memory proposals: after a turn with a memorable moment (fixed after a
+  failed check, reverted approach, user steering, repeated tool failure),
+  the TUI offers `◇ remember? "…"` — `Enter` saves, `Tab` saves to team,
+  `Ctrl+E` edits, `Esc` skips. Saved with the `kode:proposed` tag and shown
+  under `MEMORY` in `/why`. `[memory] propose` (default `true`) controls it;
+  `kode exec` gains `--propose-memory` and `--save-memory`.
+- `/remember [--team] <text>`: save an engineering memory from the TUI.
+- Receipts: `kode receipt` prints a shareable markdown receipt (or `--trailer`
+  git trailers) built only from the session ledger; `--pr` adds it as a PR
+  comment via `gh` (never edits the PR body). `/receipt [all]` copies it in
+  the TUI.
+- Onboarding: `kode onboard` and `/onboard` give a zero-token tour of the
+  repo (code map, start points, team memory grouped by kind); `--explain`
+  opts into one labeled model narration.
+
+### Changed
+
+- `kode exec` always saves its turn to `.kode/sessions/` (previously only
+  with `--continue`).
+- The local router gained two questions (`answer`, `graph_query`), so the
+  router-questions version changed. Team datasets and published team models
+  from the older three-question version are not comparable and must be
+  re-collected.
+
 ## [0.5.0 – 0.5.6] - 2026-09-27 to 2026-10-01
 
 ### Added

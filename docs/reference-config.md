@@ -65,6 +65,19 @@ enabled = true
 # store_path = "/custom/memory.sqlite3"
 ```
 
+## `[memory]`
+
+Kode-side memory behavior (the store itself is `[ingat]`).
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `propose` | bool | `true` | Offer to remember memorable moments after a turn in the TUI. `kode exec` only proposes with `--propose-memory`. |
+
+```toml
+[memory]
+propose = true
+```
+
 ## `[agent]`
 
 | Key | Type | Default | Effect |
@@ -144,6 +157,7 @@ decision model) and Qwen3-Reranker-0.6B on ONNX Runtime; install them with
 |---|---|---|
 | `enabled` | `true` | `false` = static routing, local models never loaded. Builds with no pinned models behave as `false` |
 | `min_confidence` | `0.6` | per answer; below it the static value is used (`static: low confidence …`) |
+| `graph_threshold` | `0.8` | minimum Laya confidence on `answer=graph` before Kode answers a structural question from the code graph with zero model tokens |
 | `device` | `"auto"` | reranker device: `auto` \| `cpu` \| `directml` \| `cuda` \| `coreml`; a failing GPU falls back to CPU. Laya always runs on CPU (faster than GPU for its short sequences) |
 | `rerank` | `true` | rerank up to 24 candidates (16 Ingat memories, 8 zindeks search hits) before budgeting; keeps the best 12 memories and 6 hits |
 | `rerank_on_cpu` | `false` | the reranker is slow on CPU (~0.8 s per candidate); it is skipped there unless this is set (then max 10 candidates — raise `rerank_timeout_ms` to ~10000 as well) |
@@ -211,6 +225,7 @@ Verification is auto-detected by default, including Rust/Go/Node/Python subproje
 | `timeout_seconds` | integer | `600` | Default timeout for each verification step. |
 | `fail_fast` | bool | `true` | Skip remaining steps after a required step fails. |
 | `steps` | array of tables | `[]` | Explicit commands; when non-empty, disables auto-detection. |
+| `targeted` | string | `"first"` | How graph-selected tests run: `"first"` runs them before the full test step and fails fast (a targeted failure reports the full suite Skipped, `targeted tests failed`); `"only"` runs only them and reports the full test step Skipped (`targeted mode`); `"off"` disables targeting. No covering tests found means the targeted step is Skipped (`no covering tests found`) and the full suite runs. |
 
 Each step accepts `name`, `command`, `args`, workspace-relative `cwd`, `required`, and an optional per-step `timeout_seconds` override.
 

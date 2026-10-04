@@ -9,7 +9,10 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::error::{IntelError, Result};
-use crate::types::{CodeContext, CodeSearchResult, FileOutline, IntelHealth, OutlineSymbol};
+use crate::types::{
+    ArchSymbol, ArchitectureSummary, CodeContext, CodeSearchResult, FileOutline, GraphSymbol,
+    IntelHealth, OutlineSymbol, TraceNode,
+};
 
 /// Normalizes a filesystem path for cross-plane comparison (`\` vs `/`, case,
 /// trailing separators). Used to match a bound root against `list_projects`.
@@ -212,6 +215,99 @@ pub(crate) fn outline_from_value(v: &Value, requested_path: &str) -> FileOutline
     FileOutline { path, symbols }
 }
 
+/// Maps a `get_architecture` payload. Missing sections map to empty lists;
+/// paths are normalized to forward slashes for display.
+pub(crate) fn architecture_from_value(v: &Value) -> ArchitectureSummary {
+    let list = |key: &str, degree_key: Option<&str>| -> Vec<ArchSymbol> {
+        v.get(key)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        Some(ArchSymbol {
+                            name: item.get("name")?.as_str()?.to_string(),
+                            kind: item
+                                .get("kind")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                            file: item
+                                .get("file")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .replace('\\', "/"),
+                            degree: degree_key
+                                .and_then(|k| item.get(k))
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0) as u32,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let total = |key: &str| v.get(key).and_then(Value::as_u64).unwrap_or(0);
+    ArchitectureSummary {
+        total_files: total("total_files"),
+        total_symbols: total("total_symbols"),
+        total_edges: total("total_edges"),
+        entry_points: list("entry_points", None),
+        high_fan_out: list("high_fan_out", Some("fan_out")),
+        high_fan_in: list("high_fan_in", Some("fan_in")),
+    }
+}
+
+pub(crate) fn symbols_from_value(v: &Value) -> Vec<GraphSymbol> {
+    v.as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| {
+                    let num = |k: &str| r.get(k).and_then(Value::as_u64).unwrap_or(0) as u32;
+                    Some(GraphSymbol {
+                        name: r.get("n")?.as_str()?.to_string(),
+                        kind: r.get("k").and_then(Value::as_str).unwrap_or("").to_string(),
+                        path: r
+                            .get("p")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .replace('\\', "/"),
+                        line: num("l"),
+                        degree: num("in_degree") + num("out_degree"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn trace_from_value(v: &Value) -> Vec<TraceNode> {
+    v.get("nodes")
+        .and_then(Value::as_array)
+        .map(|nodes| {
+            nodes
+                .iter()
+                .filter_map(|n| {
+                    Some(TraceNode {
+                        name: n.get("name")?.as_str()?.to_string(),
+                        kind: n
+                            .get("kind")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        file: n
+                            .get("file_path")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .replace('\\', "/"),
+                        depth: n.get("depth").and_then(Value::as_u64).unwrap_or(0) as u32,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,5 +362,67 @@ mod tests {
         });
         let err = extract_tool_text(&resp, Path::new("/repo")).unwrap_err();
         assert!(matches!(err, IntelError::NotIndexed(_)));
+    }
+
+    #[test]
+    fn architecture_maps_totals_and_ranked_symbols() {
+        let v: Value = serde_json::from_str(
+            r#"{"total_files":132,"total_symbols":2624,"total_edges":6029,
+                "entry_points":[{"name":"main","kind":"function","file":"crates\\kode\\src\\main.rs"}],
+                "high_fan_out":[{"name":"execute_task","kind":"function","file":"crates\\kode\\src\\pipeline.rs","fan_out":81}],
+                "high_fan_in":[{"name":"apply_event","kind":"function","file":"crates\\kode\\src\\tui\\events.rs","fan_in":104}]}"#,
+        )
+        .unwrap();
+        let a = architecture_from_value(&v);
+        assert_eq!(
+            (a.total_files, a.total_symbols, a.total_edges),
+            (132, 2624, 6029)
+        );
+        assert_eq!(a.entry_points[0].name, "main");
+        assert_eq!(a.entry_points[0].file, "crates/kode/src/main.rs");
+        assert_eq!(a.high_fan_out[0].degree, 81);
+        assert_eq!(a.high_fan_in[0].degree, 104);
+    }
+
+    #[test]
+    fn architecture_tolerates_missing_sections() {
+        let a = architecture_from_value(&serde_json::json!({}));
+        assert_eq!(a.total_files, 0);
+        assert!(a.high_fan_in.is_empty());
+    }
+
+    #[test]
+    fn symbols_map_compact_search_graph_rows() {
+        let v: Value = serde_json::from_str(
+            r#"[{"id":1,"n":"append_turn","k":"function","l":169,"e":174,"p":"crates\\kode\\src\\session.rs","out_degree":1,"in_degree":12}]"#,
+        )
+        .unwrap();
+        let rows = symbols_from_value(&v);
+        assert_eq!(
+            rows,
+            vec![GraphSymbol {
+                name: "append_turn".into(),
+                kind: "function".into(),
+                path: "crates/kode/src/session.rs".into(),
+                line: 169,
+                degree: 13,
+            }]
+        );
+    }
+
+    #[test]
+    fn trace_maps_nodes_with_depth() {
+        let v: Value = serde_json::from_str(
+            r#"{"has_cycle":false,"nodes":[
+                {"name":"append_turn","kind":"function","file_path":"crates\\kode\\src\\session.rs","depth":0},
+                {"name":"record_completed_turn","kind":"function","file_path":"crates\\kode\\src\\tui\\state.rs","depth":1}],
+              "edges":[]}"#,
+        )
+        .unwrap();
+        let nodes = trace_from_value(&v);
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[1].name, "record_completed_turn");
+        assert_eq!(nodes[1].file, "crates/kode/src/tui/state.rs");
+        assert_eq!(nodes[1].depth, 1);
     }
 }

@@ -107,6 +107,40 @@ pub fn route_questions() -> Vec<RouteQuestion> {
                 ]),
             },
         },
+        RouteQuestion {
+            key: "answer",
+            static_value: "model",
+            def: QuestionDef {
+                qtype: QType::Choice,
+                instructions: "Can the code graph alone answer this, without writing or reasoning?"
+                    .to_string(),
+                options: opts(&[
+                    (
+                        "graph",
+                        "lookup: where something is defined, who calls it, what it calls, what depends on it, or how the code is structured",
+                    ),
+                    (
+                        "model",
+                        "needs explanation, reasoning, writing, or editing code",
+                    ),
+                ]),
+            },
+        },
+        RouteQuestion {
+            key: "graph_query",
+            static_value: "definition",
+            def: QuestionDef {
+                qtype: QType::Choice,
+                instructions: "Which code graph lookup answers this?".to_string(),
+                options: opts(&[
+                    ("definition", "where a symbol is defined"),
+                    ("callers", "who calls or uses a symbol"),
+                    ("callees", "what a symbol calls"),
+                    ("impact", "what would be affected by changing a symbol"),
+                    ("structure", "how the repository is organized"),
+                ]),
+            },
+        },
     ]
 }
 
@@ -240,12 +274,34 @@ mod tests {
     #[test]
     fn confident_answers_come_from_laya() {
         let qs = route_questions();
-        let d = resolve_route(&qs, Ok(vec![onehot(3, 2), onehot(3, 0), onehot(2, 0)]), 0.6);
+        let d = resolve_route(
+            &qs,
+            Ok(vec![
+                onehot(3, 2),
+                onehot(3, 0),
+                onehot(2, 0),
+                onehot(2, 0),
+                onehot(5, 1),
+            ]),
+            0.6,
+        );
         assert_eq!(d.tier, "heavy");
         assert_eq!(d.effort, "low");
         assert!(d.plan);
+        assert_eq!(d.answer("answer").unwrap().value, "graph");
+        assert_eq!(d.answer("graph_query").unwrap().value, "callers");
         assert!(d.answers.iter().all(|a| a.source == RouteSource::Laya));
-        assert_eq!(d.probs.len(), 3);
+        assert_eq!(d.probs.len(), 5);
+    }
+
+    #[test]
+    fn graph_questions_default_to_model_path_statically() {
+        let d = resolve_route(&route_questions(), Err("not installed".into()), 0.6);
+        assert_eq!(d.answer("answer").unwrap().value, "model");
+        assert!(matches!(
+            d.answer("answer").unwrap().source,
+            RouteSource::Static(_)
+        ));
     }
 
     #[test]
