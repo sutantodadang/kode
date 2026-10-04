@@ -1,6 +1,6 @@
 //! Graph-selected tests run before the full suite, reported honestly.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -28,21 +28,37 @@ fn skipped(name: &str, reason: &str) -> StepResult {
     }
 }
 
-/// Nearest ancestor `Cargo.toml` with a `[package] name`.
-fn rust_package(root: &Path, file: &str) -> Option<String> {
+/// `dir` relative to `root` (empty when equal).
+fn rel_dir(root: &Path, dir: &Path) -> PathBuf {
+    dir.strip_prefix(root)
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+}
+
+fn slashed(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Nearest ancestor `Cargo.toml` with a `[package] name`: the package name and
+/// the manifest's directory relative to `root`. Only `name` lines inside the
+/// `[package]` section count, so a later `[[bin]] name = ...` is never taken.
+fn rust_package(root: &Path, file: &str) -> Option<(String, PathBuf)> {
     let mut dir: PathBuf = root.join(file).parent()?.to_path_buf();
     loop {
-        if let Ok(text) = std::fs::read_to_string(dir.join("Cargo.toml"))
-            && let Some(name) = text
-                .lines()
-                .skip_while(|l| l.trim() != "[package]")
-                .find_map(|l| {
-                    l.trim()
-                        .strip_prefix("name")
-                        .and_then(|r| r.split('"').nth(1))
-                })
-        {
-            return Some(name.to_string());
+        if let Ok(text) = std::fs::read_to_string(dir.join("Cargo.toml")) {
+            let mut in_package = false;
+            for line in text.lines() {
+                let line = line.trim();
+                if line.starts_with('[') {
+                    in_package = line == "[package]";
+                } else if in_package
+                    && let Some(rest) = line.strip_prefix("name")
+                    && let Some(value) = rest.trim_start().strip_prefix('=')
+                    && let Some(name) = value.split('"').nth(1)
+                {
+                    return Some((name.to_string(), rel_dir(root, &dir)));
+                }
+            }
         }
         if dir == root || !dir.pop() {
             return None;
@@ -50,50 +66,115 @@ fn rust_package(root: &Path, file: &str) -> Option<String> {
     }
 }
 
-fn mk(name: String, program: &str, args: Vec<String>, timeout: Duration) -> VerifyStep {
+/// Nearest ancestor directory of `file` (not above `root`) containing one of
+/// the marker files, relative to `root`.
+fn nearest_dir_with(root: &Path, file: &str, markers: &[&str]) -> Option<PathBuf> {
+    let mut dir: PathBuf = root.join(file).parent()?.to_path_buf();
+    loop {
+        if markers.iter().any(|m| dir.join(m).is_file()) {
+            return Some(rel_dir(root, &dir));
+        }
+        if dir == root || !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Nearest ancestor directory holding a `go.mod`, relative to `root`.
+fn go_module_dir(root: &Path, file: &str) -> Option<PathBuf> {
+    nearest_dir_with(root, file, &["go.mod"])
+}
+
+/// Nearest Python project directory (pytest/packaging config), relative to
+/// `root`; empty (the root) when none is found.
+fn python_project_dir(root: &Path, file: &str) -> PathBuf {
+    nearest_dir_with(
+        root,
+        file,
+        &["pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini"],
+    )
+    .unwrap_or_default()
+}
+
+fn mk(
+    name: String,
+    cwd: PathBuf,
+    program: &str,
+    args: Vec<String>,
+    timeout: Duration,
+) -> VerifyStep {
     VerifyStep {
         name,
         program: program.into(),
         args,
-        cwd: PathBuf::new(),
+        cwd,
         required: true,
         timeout,
     }
 }
 
+/// One targeted step's accumulated inputs (sorted, unique).
+#[derive(Default)]
+struct Group {
+    names: BTreeSet<String>,
+    files: BTreeSet<String>,
+}
+
+/// Builds one step per (project dir, unit). Step names are `test·targeted
+/// <unit>` with no count, so a check keeps its identity across repair runs.
 pub fn targeted_steps(
     root: &Path,
     kind_of: impl Fn(&str) -> ProjectKind,
     tests: &[(String, String)],
     timeout: Duration,
 ) -> Vec<VerifyStep> {
-    let mut groups: BTreeMap<(String, String), Vec<String>> = BTreeMap::new(); // (kind, unit) -> names
-    let mut py_files: Vec<String> = Vec::new();
+    // (kind, cwd, unit) -> names/files
+    let mut groups: BTreeMap<(&'static str, String, String), Group> = BTreeMap::new();
     for (name, file) in tests {
         match kind_of(file) {
             ProjectKind::Rust => {
-                if let Some(pkg) = rust_package(root, file) {
+                if let Some((pkg, cwd)) = rust_package(root, file) {
                     groups
-                        .entry(("rust".into(), pkg))
+                        .entry(("rust", slashed(&cwd), pkg))
                         .or_default()
-                        .push(name.clone());
+                        .names
+                        .insert(name.clone());
                 }
             }
             ProjectKind::Go => {
                 let dir = file.rsplit_once('/').map(|(d, _)| d).unwrap_or(".");
+                let (cwd, unit) = match go_module_dir(root, file) {
+                    Some(module) => {
+                        let module = slashed(&module);
+                        let unit = if module == dir {
+                            ".".to_string()
+                        } else if module.is_empty() {
+                            format!("./{dir}")
+                        } else {
+                            let rest = dir.strip_prefix(&format!("{module}/")).unwrap_or(dir);
+                            format!("./{rest}")
+                        };
+                        (module, unit)
+                    }
+                    None => (String::new(), format!("./{dir}")),
+                };
                 groups
-                    .entry(("go".into(), format!("./{dir}")))
+                    .entry(("go", cwd, unit))
                     .or_default()
-                    .push(name.clone());
+                    .names
+                    .insert(name.clone());
             }
             ProjectKind::Python => {
-                if !py_files.contains(file) {
-                    py_files.push(file.clone());
-                }
-                groups
-                    .entry(("py".into(), String::new()))
-                    .or_default()
-                    .push(name.clone());
+                let cwd = python_project_dir(root, file);
+                let cwd_s = slashed(&cwd);
+                let rel_file = slashed(
+                    Path::new(file)
+                        .strip_prefix(&cwd)
+                        .unwrap_or(Path::new(file)),
+                );
+                let group = groups.entry(("py", cwd_s.clone(), cwd_s)).or_default();
+                group.names.insert(name.clone());
+                group.files.insert(rel_file);
             }
             _ => {}
         }
@@ -105,17 +186,19 @@ pub fn targeted_steps(
     };
     groups
         .into_iter()
-        .map(|((kind, unit), mut names)| {
-            names.dedup();
-            let label = format!("test·targeted ({})", names.len());
-            match kind.as_str() {
+        .map(|((kind, cwd, unit), group)| {
+            let cwd = PathBuf::from(cwd);
+            let names: Vec<String> = group.names.into_iter().collect();
+            match kind {
                 "rust" => {
+                    let label = format!("test·targeted {unit}");
                     let mut args = vec!["test".into(), "-p".into(), unit, "--".into()];
                     args.extend(names);
-                    mk(label, "cargo", args, timeout)
+                    mk(label, cwd, "cargo", args, timeout)
                 }
                 "go" => mk(
-                    label,
+                    format!("test·targeted {unit}"),
+                    cwd,
                     "go",
                     vec![
                         "test".into(),
@@ -126,11 +209,15 @@ pub fn targeted_steps(
                     timeout,
                 ),
                 _ => {
+                    let label = format!(
+                        "test·targeted {}",
+                        if unit.is_empty() { "." } else { &unit }
+                    );
                     let mut args = vec!["-m".into(), "pytest".into(), "-q".into()];
-                    args.extend(py_files.clone());
+                    args.extend(group.files);
                     args.push("-k".into());
                     args.push(names.join(" or "));
-                    mk(label, python, args, timeout)
+                    mk(label, cwd, python, args, timeout)
                 }
             }
         })
@@ -281,7 +368,7 @@ mod tests {
         assert!(is_test_step(&step("web:test")));
         assert!(is_test_step(&step("py:pytest")));
         assert!(!is_test_step(&step("clippy")));
-        assert!(!is_test_step(&step("test·targeted (2)")));
+        assert!(!is_test_step(&step("test·targeted kode-core")));
     }
 
     #[test]
@@ -297,7 +384,7 @@ mod tests {
             Duration::from_secs(60),
         );
         assert_eq!(steps.len(), 1);
-        assert_eq!(steps[0].name, "test·targeted (2)");
+        assert_eq!(steps[0].name, "test·targeted kode-core");
         assert_eq!(steps[0].program, "cargo");
         assert_eq!(
             steps[0].args,
@@ -350,7 +437,7 @@ mod tests {
         let report = run_with_steps(
             std::path::Path::new("."),
             &profile,
-            vec![step("test·targeted (1)")],
+            vec![step("test·targeted pkg")],
             TargetedMode::Only,
             &CancellationToken::new(),
         )
@@ -361,12 +448,12 @@ mod tests {
             .map(|s| (s.name.as_str(), s.status.clone()))
             .collect();
         assert!(names.contains(&("test", StepStatus::Skipped("targeted mode".into()))));
-        assert!(names.iter().any(|(n, _)| *n == "test·targeted (1)"));
+        assert!(names.iter().any(|(n, _)| *n == "test·targeted pkg"));
     }
 
     #[tokio::test]
     async fn first_mode_skips_full_tests_when_targeted_fail() {
-        let mut failing = step("test·targeted (1)");
+        let mut failing = step("test·targeted pkg");
         failing.program = if cfg!(windows) {
             "cmd".into()
         } else {
@@ -435,5 +522,165 @@ mod tests {
             StepStatus::Skipped("no covering tests found".into())
         );
         assert_eq!(report.steps[1].name, "test");
+    }
+
+    fn temp_root(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kode-targeted-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write(root: &Path, rel: &str, text: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn nested_rust_crate_runs_in_its_own_dir() {
+        let root = temp_root("nested");
+        write(
+            &root,
+            "backend/Cargo.toml",
+            "[package]\nname = \"nested-pkg\"\n",
+        );
+        let steps = targeted_steps(
+            &root,
+            |_| ProjectKind::Rust,
+            &[("it_works".into(), "backend/src/lib.rs".into())],
+            Duration::from_secs(60),
+        );
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].cwd, Path::new("backend"));
+        assert_eq!(steps[0].name, "test·targeted nested-pkg");
+        assert_eq!(
+            steps[0].args,
+            vec!["test", "-p", "nested-pkg", "--", "it_works"]
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_crate_targeted_pass_does_not_skip_real_test_step() {
+        let root = temp_root("e2e");
+        write(
+            &root,
+            "backend/Cargo.toml",
+            "[package]\nname = \"nested-pkg\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+        );
+        write(
+            &root,
+            "backend/src/lib.rs",
+            "#[cfg(test)]\nmod t {\n    #[test]\n    fn it_works() {}\n}\n",
+        );
+        let mut real = step("backend:test");
+        real.cwd = "backend".into();
+        let profile = ProjectProfile {
+            kind: ProjectKind::Mixed,
+            steps: vec![real],
+            fail_fast: false,
+        };
+        let report = run_with_targets(
+            &root,
+            &profile,
+            &[("it_works".into(), "backend/src/lib.rs".into())],
+            TargetedMode::First,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(report.ok, "{:?}", report.steps);
+        assert!(
+            !report
+                .steps
+                .iter()
+                .any(|s| s.name == "backend:test" && matches!(s.status, StepStatus::Skipped(_)))
+        );
+    }
+
+    #[test]
+    fn duplicate_test_names_are_listed_once() {
+        let root = temp_rust_ws();
+        let steps = targeted_steps(
+            &root,
+            |_| ProjectKind::Rust,
+            &[
+                ("parses".into(), "crates/kode-core/src/a.rs".into()),
+                ("round_trip".into(), "crates/kode-core/src/b.rs".into()),
+                ("parses".into(), "crates/kode-core/src/c.rs".into()),
+            ],
+            Duration::from_secs(60),
+        );
+        assert_eq!(steps[0].args.iter().filter(|a| *a == "parses").count(), 1);
+    }
+
+    #[test]
+    fn step_name_is_stable_across_test_counts() {
+        let root = temp_rust_ws();
+        let f = "crates/kode-core/src/a.rs";
+        let three: Vec<_> = (0..3).map(|i| (format!("t{i}"), f.to_string())).collect();
+        let four: Vec<_> = (0..4).map(|i| (format!("t{i}"), f.to_string())).collect();
+        let a = targeted_steps(&root, |_| ProjectKind::Rust, &three, Duration::from_secs(1));
+        let b = targeted_steps(&root, |_| ProjectKind::Rust, &four, Duration::from_secs(1));
+        assert_eq!(a[0].name, b[0].name);
+        assert_eq!(a[0].name, "test·targeted kode-core");
+    }
+
+    #[test]
+    fn bin_name_after_package_without_name_is_not_used() {
+        let root = temp_root("bin");
+        write(
+            &root,
+            "Cargo.toml",
+            "[package]\nversion = \"0.1.0\"\n\n[[bin]]\nname = \"tool\"\n",
+        );
+        let steps = targeted_steps(
+            &root,
+            |_| ProjectKind::Rust,
+            &[("t".into(), "src/lib.rs".into())],
+            Duration::from_secs(1),
+        );
+        assert!(steps.is_empty());
+    }
+
+    #[test]
+    fn go_nested_module_and_python_project_dirs() {
+        let root = temp_root("polyglot");
+        write(&root, "svc/go.mod", "module svc\n");
+        write(&root, "svc/pkg/a/a_test.go", "package a\n");
+        write(&root, "svc/x_test.go", "package svc\n");
+        write(&root, "api/pyproject.toml", "[project]\n");
+        write(&root, "api/tests/test_api.py", "");
+        let go = targeted_steps(
+            &root,
+            |_| ProjectKind::Go,
+            &[
+                ("TestA".into(), "svc/pkg/a/a_test.go".into()),
+                ("TestX".into(), "svc/x_test.go".into()),
+            ],
+            Duration::from_secs(1),
+        );
+        assert_eq!(go.len(), 2);
+        assert!(go.iter().all(|s| s.cwd == Path::new("svc")));
+        let units: Vec<_> = go.iter().map(|s| s.args[1].as_str()).collect();
+        assert!(units.contains(&"./pkg/a") && units.contains(&"."));
+        assert!(go.iter().any(|s| s.name == "test·targeted ./pkg/a"));
+        let py = targeted_steps(
+            &root,
+            |_| ProjectKind::Python,
+            &[("test_x".into(), "api/tests/test_api.py".into())],
+            Duration::from_secs(1),
+        );
+        assert_eq!(py[0].cwd, Path::new("api"));
+        assert_eq!(py[0].name, "test·targeted api");
+        assert_eq!(
+            py[0].args,
+            vec!["-m", "pytest", "-q", "tests/test_api.py", "-k", "test_x"]
+        );
     }
 }
