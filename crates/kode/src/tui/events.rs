@@ -409,6 +409,9 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
                 }
             }
         }
+        // The TUI's CURRENT CHANGE rows already come from the git poll; the
+        // ledger recorder (P0 Task 4) is what consumes this event.
+        KodeEvent::ChangeSet { .. } => {}
     }
 }
 

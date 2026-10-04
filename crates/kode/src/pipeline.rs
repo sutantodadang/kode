@@ -712,6 +712,10 @@ async fn execute_task(
         }
     }
 
+    // Snapshot before the agent edits anything, so the task's ChangeSet
+    // excludes changes that were already uncommitted.
+    let changes_before = kode_context::git::change_snapshot(cwd).await;
+
     let outcome1 = agent
         .run_with_context_and_steering(
             &exec_task,
@@ -723,7 +727,6 @@ async fn execute_task(
         )
         .await
         .map_err(|err| anyhow::anyhow!(err))?;
-
     events.emit(KodeEvent::TaskProgress {
         step: TaskStep::Change,
         done: outcome1.mutated,
@@ -828,6 +831,10 @@ async fn execute_task(
             outcome1.mutated,
         ),
     };
+
+    if mutated_any {
+        emit_change_set(&events, changes_before.as_ref(), cwd).await;
+    }
 
     if let Some(adapter) = bound_backend.as_ref()
         && mutated_any
@@ -1226,6 +1233,32 @@ fn emit_verify_steps(events: &EventBus, report: &kode_verify::VerificationReport
             skipped,
             duration_ms: step.duration.as_millis() as u64,
         });
+    }
+}
+
+/// Emits the task's `ChangeSet` from a start snapshot and a fresh one.
+/// Outside a repository (either snapshot missing) it says so instead.
+async fn emit_change_set(
+    events: &EventBus,
+    before: Option<&kode_context::git::ChangeSnapshot>,
+    cwd: &Path,
+) {
+    let after = kode_context::git::change_snapshot(cwd).await;
+    match (before, after) {
+        (Some(before), Some(after)) => {
+            let files = kode_context::git::change_set(before, &after)
+                .into_iter()
+                .map(|row| kode_core::event::FileChange {
+                    path: row.path,
+                    added: row.added,
+                    removed: row.deleted,
+                })
+                .collect();
+            events.emit(KodeEvent::ChangeSet { files });
+        }
+        _ => events.emit(KodeEvent::Note {
+            text: "changed files not recorded: git unavailable or not a repository".to_string(),
+        }),
     }
 }
 
@@ -1757,5 +1790,30 @@ mod knowledge_tests {
             .map(|tool| tool.name)
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["memory_search", "remember"]);
+    }
+}
+
+#[cfg(test)]
+mod change_set_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn emit_change_set_outside_a_repo_notes_instead() {
+        let dir = std::env::temp_dir().join(format!(
+            "kode-emit-change-set-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bus = EventBus::new(8);
+        let mut rx = bus.subscribe();
+        emit_change_set(&bus, None, &dir).await;
+        match rx.recv().await.unwrap() {
+            KodeEvent::Note { text } => assert!(text.contains("changed files not recorded")),
+            other => panic!("expected Note, got {other:?}"),
+        }
     }
 }

@@ -61,6 +61,14 @@ pub fn router_summary(answers: &[RouteAnswer]) -> String {
     format!("router: {}", parts.join(" · "))
 }
 
+/// One file's line delta for a task, relative to `HEAD`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChange {
+    pub path: String,
+    pub added: u32,
+    pub removed: u32,
+}
+
 /// Events emitted during an agent run.
 #[derive(Debug, Clone)]
 pub enum KodeEvent {
@@ -183,6 +191,12 @@ pub enum KodeEvent {
     TaskProgress {
         step: TaskStep,
         done: bool,
+    },
+    /// Files whose diff against `HEAD` moved during the task, from git.
+    /// Emitted once per task after the agent loop (and any repair), only
+    /// when the task mutated files and both git snapshots succeeded.
+    ChangeSet {
+        files: Vec<FileChange>,
     },
 }
 

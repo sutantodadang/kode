@@ -93,6 +93,54 @@ pub fn parse_numstat(raw: &str) -> Vec<NumstatRow> {
         .collect()
 }
 
+/// Per-file `(added, deleted)` line counts against `HEAD`, keyed by
+/// repo-relative path, untracked files included as all-added.
+pub type ChangeSnapshot = std::collections::BTreeMap<String, (u32, u32)>;
+
+/// Largest untracked file whose lines are counted; bigger ones count as 0.
+const UNTRACKED_COUNT_LIMIT: u64 = 4 * 1024 * 1024;
+
+/// Snapshot of what differs from `HEAD` right now. `None` when git fails or
+/// `root` is not a repository. A repository without commits has no `HEAD`,
+/// so the staged diff is used instead.
+pub async fn change_snapshot(root: &Path) -> Option<ChangeSnapshot> {
+    let raw = match run_git(root, &["diff", "HEAD", "--numstat"]).await {
+        Some(raw) => raw,
+        None => run_git(root, &["diff", "--cached", "--numstat"]).await?,
+    };
+    let mut snapshot: ChangeSnapshot = parse_numstat(&raw)
+        .into_iter()
+        .map(|row| (row.path, (row.added, row.deleted)))
+        .collect();
+    let untracked = run_git(root, &["ls-files", "--others", "--exclude-standard"]).await?;
+    for path in untracked.lines().map(str::trim).filter(|p| !p.is_empty()) {
+        let full = root.join(path);
+        let lines = match std::fs::metadata(&full) {
+            Ok(meta) if meta.len() <= UNTRACKED_COUNT_LIMIT => std::fs::read_to_string(&full)
+                .map(|text| text.lines().count() as u32)
+                .unwrap_or(0),
+            _ => 0,
+        };
+        snapshot.insert(path.to_string(), (lines, 0));
+    }
+    Some(snapshot)
+}
+
+/// Files whose delta against `HEAD` moved between two snapshots, reported
+/// with their `after` counts. Files restored to their `HEAD` content are
+/// omitted: there is nothing left to show.
+pub fn change_set(before: &ChangeSnapshot, after: &ChangeSnapshot) -> Vec<NumstatRow> {
+    after
+        .iter()
+        .filter(|(path, delta)| before.get(*path) != Some(*delta))
+        .map(|(path, (added, deleted))| NumstatRow {
+            path: path.clone(),
+            added: *added,
+            deleted: *deleted,
+        })
+        .collect()
+}
+
 fn truncate_diff(diff: &str) -> String {
     if diff.chars().count() <= DIFF_TRUNCATE_CHARS {
         return diff.to_string();
@@ -290,5 +338,64 @@ mod tests {
         let state = repo_state(&dir).await.unwrap();
         assert!(state.dirty);
         assert!(state.numstat.is_empty());
+    }
+
+    #[tokio::test]
+    async fn change_snapshot_non_repo_is_none() {
+        let dir = temp_dir("snap-non-repo");
+        assert!(change_snapshot(&dir).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn change_snapshot_counts_tracked_and_untracked() {
+        let dir = temp_dir("snap-mixed");
+        init_repo(&dir);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git(&dir, &["add", "a.txt"]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+        std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(dir.join("new.txt"), "x\ny\n").unwrap();
+
+        let snap = change_snapshot(&dir).await.unwrap();
+        assert_eq!(snap.get("a.txt"), Some(&(2, 0)));
+        assert_eq!(snap.get("new.txt"), Some(&(2, 0)));
+    }
+
+    #[tokio::test]
+    async fn change_snapshot_without_commits_uses_staged() {
+        let dir = temp_dir("snap-no-head");
+        init_repo(&dir);
+        std::fs::write(dir.join("s.txt"), "a\nb\n").unwrap();
+        git(&dir, &["add", "s.txt"]);
+
+        let snap = change_snapshot(&dir).await.unwrap();
+        assert_eq!(snap.get("s.txt"), Some(&(2, 0)));
+    }
+
+    #[test]
+    fn change_set_reports_only_files_whose_delta_moved() {
+        let mut before = ChangeSnapshot::new();
+        before.insert("dirty-before.rs".into(), (3, 1));
+        before.insert("untouched.rs".into(), (5, 0));
+        let mut after = before.clone();
+        after.insert("dirty-before.rs".into(), (7, 1));
+        after.insert("new.rs".into(), (10, 0));
+
+        let rows = change_set(&before, &after);
+        assert_eq!(
+            rows,
+            vec![
+                NumstatRow {
+                    path: "dirty-before.rs".into(),
+                    added: 7,
+                    deleted: 1
+                },
+                NumstatRow {
+                    path: "new.rs".into(),
+                    added: 10,
+                    deleted: 0
+                },
+            ]
+        );
     }
 }
