@@ -82,6 +82,7 @@ Run an agentic task against the configured model, non-interactively.
 | `--effort <EFFORT>` | Override reasoning effort for this run only. One of: `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`. |
 | `-c`, `--continue` | Send prior session turns as history and append this task to that session, instead of starting fresh. |
 | `--plan` | Plan first: the model produces a numbered plan (no tools) and Kode asks `execute this plan? [y/N]` before running the task. Answering `N` exits without running it. |
+| `--no-graph-answer` | Always use the model, never answer a structural question from the code graph alone. Use it when a script needs a consistent output shape. |
 | `--image <PATH>` | Attach a PNG, JPEG, GIF, or WebP image. Repeat the flag to attach more than one image. |
 
 Examples:
@@ -98,6 +99,8 @@ kode exec --image before.png --image after.png "compare these screens"
 `TASK` may also be a custom slash command (`/name [args]`) — see [howto-custom-commands.md](./howto-custom-commands.md). It's expanded from its `.md` template before the task runs; an unrecognized `/name` fails with an error listing the commands discovered in `.kode/commands/` and `~/.kode/commands/`.
 
 Every `kode exec` run saves its turn to `.kode/sessions/` (previously only with `-c`/`--continue`), so `kode receipt` and session history work after headless and CI runs.
+
+When the local router is confident a prompt is a pure structural lookup (where something is defined, who calls it, what it calls, what depends on it, how the repo is organized), Kode answers from the code graph with zero model tokens: facts print as plain lines and a final `graph answer · 0 tokens` line. In the TUI the same answer shows `╰▶ graph · <kind> · 0 tokens · Nms`, and Enter re-asks the model with the graph answer included as context. `--no-graph-answer` forces the model path.
 
 ```
 kode exec "/review the auth module"
@@ -233,6 +236,7 @@ Available inside the interactive `kode` TUI, with a live hint menu as you type `
 | `/router [key=value…]` | Show the last local-router decision, or correct it (`/router tier=heavy`). See [howto-router-training.md](./howto-router-training.md). |
 | `/map` | Show a zero-token repo map (totals, core orchestrators, hot symbols) from the code graph. |
 | `/index` | Build or refresh the code index in the background; tasks submitted while it runs say `graph warming`. |
+| `/why [N]` | Show where a turn's answer came from (route, graph/memory/git facts, changes, checks, cost) from its persisted ledger. Defaults to the last turn. |
 | `/help` | Show available commands and shortcuts. |
 | `/exit` | Exit Kode. |
 | `/name [args]` | Custom command — expands the `.kode/commands/name.md` or `~/.kode/commands/name.md` template and submits it as a task. See [howto-custom-commands.md](./howto-custom-commands.md). |

@@ -4,6 +4,15 @@ Kode's local router (Laya) decides each task's model tier, reasoning
 effort, and whether to plan first. Out of the box it is a general model;
 this guide makes it learn from your team.
 
+> **Router questions changed (2026-10-04).** Laya now also decides whether
+> the code graph alone can answer a task (`answer`) and which lookup it is
+> (`graph_query`), for zero-token graph answers. The questions version
+> (a hash of the question texts and options) therefore changed: datasets and
+> team models collected with the older three-question version are marked
+> incomparable and must be re-collected. When a developer presses Enter on a
+> graph answer ("ask model anyway") with training on, Kode records an
+> `answer=model` correction for that task.
+
 ## 1. Turn on collection
 
 In `.kode/config.toml` (commit it):

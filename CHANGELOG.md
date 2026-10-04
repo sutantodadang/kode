@@ -18,11 +18,21 @@ minor versions may contain breaking changes).
   from the code graph, also shown after the first index.
 - Sessions store a per-turn ledger of facts, routing, changed files,
   verification and token usage.
+- Graph answers: when the local router is confident a prompt is a pure
+  structural lookup, Kode answers it from the code graph with zero model
+  tokens, with an "ask model anyway" escape hatch in the TUI and a
+  `--no-graph-answer` flag for `kode exec`.
+- `/why [N]`: the provenance of a persisted turn (route, graph/memory/git
+  facts, changes, checks, cost) from its ledger.
 
 ### Changed
 
 - `kode exec` always saves its turn to `.kode/sessions/` (previously only
   with `--continue`).
+- The local router gained two questions (`answer`, `graph_query`), so the
+  router-questions version changed. Team datasets and published team models
+  from the older three-question version are not comparable and must be
+  re-collected.
 
 ## [0.5.0 – 0.5.6] - 2026-09-27 to 2026-10-01
 

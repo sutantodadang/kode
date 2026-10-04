@@ -130,6 +130,8 @@ All reuse existing tokens and glyphs; no new colors.
 
 `◇` is the only new glyph: proposed, not yet saved. It becomes `●` when saved. Monochrome terminals keep meaning through the `m` letter and the `remember?` label.
 
+The now-line gains one state: after a graph answer it reads `done · graph answer` on the left and `Enter ask model anyway · Esc done` on the right. The `/why` overlay reuses the picker's scrolling and the ledger's glyphs; it adds no new visual elements.
+
 ## Color
 
 Restrained. Color means provenance or outcome, never decoration. Less than 15% of visible cells carry semantic color. Every colored element also has a glyph or a text label, so monochrome terminals lose nothing.
