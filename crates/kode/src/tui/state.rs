@@ -502,6 +502,9 @@ pub struct AppState {
     pub runtime: Arc<crate::session_runtime::SessionRuntime>,
     /// Task text of the in-flight run; consumed when TaskFinished arrives.
     pub pending_task: Option<UserInput>,
+    /// Collects the in-flight task's provenance ledger; taken into the
+    /// persisted `Turn` by `record_completed_turn`.
+    pub(crate) ledger_recorder: crate::ledger::LedgerRecorder,
     /// Stable receipt for the most recently completed run. Cleared as soon
     /// as the user begins composing the next instruction.
     pub completion: Option<CompletionReceipt>,
@@ -628,6 +631,7 @@ impl AppState {
             cache_key: crate::pipeline::new_cache_key(),
             runtime: Arc::new(crate::session_runtime::SessionRuntime::new()),
             pending_task: None,
+            ledger_recorder: Default::default(),
             completion: None,
             last_error: None,
             shortcuts_open: false,
@@ -709,6 +713,7 @@ impl AppState {
         self.stream_pending.clear();
         self.stream_last_flush = None;
         self.pending_task = Some(task);
+        self.ledger_recorder.begin();
         self.completion = None;
         self.last_error = None;
         self.shortcuts_open = false;
@@ -1114,6 +1119,7 @@ pub(crate) fn record_completed_turn(
             images: task_input.images,
             response: state.last_response.clone(),
             tool_calls,
+            ledger: state.ledger_recorder.take(),
         };
         let id = match state.session_id.clone() {
             Some(id) => Some(id),

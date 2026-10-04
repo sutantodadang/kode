@@ -123,84 +123,99 @@ pub async fn run(
         // `last_response` on `TaskFinished` — see `tui.rs::apply_event`.
         let mut response_buf = String::new();
         let mut final_tool_calls: u32 = 0;
+        let mut recorder = crate::ledger::LedgerRecorder::default();
+        recorder.begin();
         loop {
             match rx.recv().await {
-                Ok(KodeEvent::ModelToken { text }) => {
-                    print!("{text}");
-                    let _ = std::io::stdout().flush();
-                    response_buf.push_str(&text);
+                Ok(ev) => {
+                    recorder.observe(&ev);
+                    match ev {
+                        KodeEvent::ModelToken { text } => {
+                            print!("{text}");
+                            let _ = std::io::stdout().flush();
+                            response_buf.push_str(&text);
+                        }
+                        KodeEvent::Note { text } => {
+                            eprintln!("◆ {text}");
+                        }
+                        KodeEvent::RouterDecision { answers } => {
+                            eprintln!("◆ {}", router_summary(&answers));
+                        }
+                        KodeEvent::VerifyStep {
+                            name,
+                            passed,
+                            skipped,
+                            ..
+                        } => {
+                            let tag = if skipped {
+                                "SKIP"
+                            } else if passed {
+                                "PASS"
+                            } else {
+                                "FAIL"
+                            };
+                            eprintln!("◆ {name}: {tag}");
+                        }
+                        KodeEvent::Knowledge {
+                            zindeks,
+                            ingat,
+                            git,
+                            ..
+                        } => {
+                            eprintln!(
+                                "◆ knows: Z:{} I:{} G:{}",
+                                zindeks.len(),
+                                ingat.len(),
+                                git.len()
+                            );
+                        }
+                        KodeEvent::SubagentStarted { id, ownership } => {
+                            let scope = if ownership.is_empty() {
+                                "read-only".to_string()
+                            } else {
+                                format!("owns {}", ownership.join(", "))
+                            };
+                            eprintln!("◆ subagent {id}: started ({scope})");
+                        }
+                        KodeEvent::SubagentActivity { id, text } => {
+                            eprintln!("  ├─ {id}: {text}");
+                        }
+                        KodeEvent::SubagentFinished { id, ok, summary } => {
+                            eprintln!(
+                                "◆ subagent {id}: {} — {summary}",
+                                if ok { "done" } else { "failed" }
+                            );
+                        }
+                        KodeEvent::TaskFinished {
+                            iterations,
+                            tool_calls,
+                            input_tokens,
+                            output_tokens,
+                            cached_tokens,
+                        } => {
+                            let cached = match cached_tokens {
+                                Some(tokens) => format!("{tokens} cached"),
+                                None => "cached ? not reported".to_string(),
+                            };
+                            eprintln!(
+                                "— {iterations} iterations, {tool_calls} tool calls, {input_tokens}→{output_tokens} tokens ({cached})"
+                            );
+                            final_tool_calls = tool_calls;
+                        }
+                        KodeEvent::AgentError { message } => {
+                            eprintln!("{message}");
+                        }
+                        KodeEvent::ChangeSet { files } => {
+                            for file in &files {
+                                eprintln!(
+                                    "◆ change {} +{} −{}",
+                                    file.path, file.added, file.removed
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
                 }
-                Ok(KodeEvent::Note { text }) => {
-                    eprintln!("◆ {text}");
-                }
-                Ok(KodeEvent::RouterDecision { answers }) => {
-                    eprintln!("◆ {}", router_summary(&answers));
-                }
-                Ok(KodeEvent::VerifyStep {
-                    name,
-                    passed,
-                    skipped,
-                    ..
-                }) => {
-                    let tag = if skipped {
-                        "SKIP"
-                    } else if passed {
-                        "PASS"
-                    } else {
-                        "FAIL"
-                    };
-                    eprintln!("◆ {name}: {tag}");
-                }
-                Ok(KodeEvent::Knowledge {
-                    zindeks,
-                    ingat,
-                    git,
-                    ..
-                }) => {
-                    eprintln!(
-                        "◆ knows: Z:{} I:{} G:{}",
-                        zindeks.len(),
-                        ingat.len(),
-                        git.len()
-                    );
-                }
-                Ok(KodeEvent::SubagentStarted { id, ownership }) => {
-                    let scope = if ownership.is_empty() {
-                        "read-only".to_string()
-                    } else {
-                        format!("owns {}", ownership.join(", "))
-                    };
-                    eprintln!("◆ subagent {id}: started ({scope})");
-                }
-                Ok(KodeEvent::SubagentActivity { id, text }) => {
-                    eprintln!("  ├─ {id}: {text}");
-                }
-                Ok(KodeEvent::SubagentFinished { id, ok, summary }) => {
-                    eprintln!(
-                        "◆ subagent {id}: {} — {summary}",
-                        if ok { "done" } else { "failed" }
-                    );
-                }
-                Ok(KodeEvent::TaskFinished {
-                    iterations,
-                    tool_calls,
-                    input_tokens,
-                    output_tokens,
-                    cached_tokens,
-                }) => {
-                    let cached = match cached_tokens {
-                        Some(tokens) => format!("{tokens} cached"),
-                        None => "cached ? not reported".to_string(),
-                    };
-                    eprintln!(
-                        "— {iterations} iterations, {tool_calls} tool calls, {input_tokens}→{output_tokens} tokens ({cached})"
-                    );
-                    final_tool_calls = tool_calls;
-                }
-                Ok(KodeEvent::AgentError { message }) => {
-                    eprintln!("{message}");
-                }
-                Ok(_) => {}
                 Err(RecvError::Closed) => break,
                 Err(RecvError::Lagged(n)) => {
                     eprintln!("{}", lagged_note(n));
@@ -210,7 +225,7 @@ pub async fn run(
                 }
             }
         }
-        (response_buf, final_tool_calls)
+        (response_buf, final_tool_calls, recorder.take())
     });
 
     let runtime = crate::session_runtime::SessionRuntime::new();
@@ -229,26 +244,31 @@ pub async fn run(
     )
     .await;
 
-    let (final_text, tool_calls) = printer.await.unwrap_or_default();
+    let (final_text, tool_calls, ledger) = printer.await.unwrap_or_default();
 
     if result.is_ok() {
         println!();
-        if continue_session {
-            let id = match session_id.clone() {
-                Some(id) => id,
-                None => session::create(cwd, &config.model.provider, &config.model.model)?,
-            };
-            let (_, ts) = session::now_utc_stamp();
-            let turn = session::Turn {
-                ts,
-                task: input.text.clone(),
-                images: input.images.clone(),
-                response: final_text,
-                tool_calls,
-            };
-            if let Err(e) = session::append_turn(cwd, &id, &turn) {
-                println!("session append failed (non-fatal): {e}");
+        match session_for_run(
+            cwd,
+            continue_session,
+            &config.model.provider,
+            &config.model.model,
+        ) {
+            Ok(id) => {
+                let (_, ts) = session::now_utc_stamp();
+                let turn = session::Turn {
+                    ts,
+                    task: input.text.clone(),
+                    images: input.images.clone(),
+                    response: final_text,
+                    tool_calls,
+                    ledger,
+                };
+                if let Err(e) = session::append_turn(cwd, &id, &turn) {
+                    println!("session append failed (non-fatal): {e}");
+                }
             }
+            Err(e) => println!("session store unavailable (non-fatal): {e}"),
         }
     }
     let outcome = result?;
@@ -267,6 +287,21 @@ pub async fn run(
         }
     }
     Ok(())
+}
+
+/// Session that receives this exec run's turn: the latest one with
+/// `--continue` (if any exists), otherwise a new one. Every exec run is
+/// persisted so `kode receipt` works after it.
+fn session_for_run(
+    cwd: &Path,
+    continue_session: bool,
+    provider: &str,
+    model: &str,
+) -> std::io::Result<String> {
+    match continue_session.then(|| session::latest(cwd)).flatten() {
+        Some(id) => Ok(id),
+        None => session::create(cwd, provider, model),
+    }
 }
 
 /// Message printed when the event printer falls behind and the broadcast
@@ -358,5 +393,26 @@ mod tests {
         let dir = temp_dir("empty");
         let err = resolve_custom_task("/nope", &dir).unwrap_err();
         assert!(err.to_string().contains("no custom commands found"));
+    }
+
+    #[test]
+    fn session_for_run_creates_fresh_without_continue_and_reuses_latest_with_it() {
+        let dir = temp_dir("session-for-run");
+        let first = session_for_run(&dir, false, "codex", "m").unwrap();
+        crate::session::append_turn(
+            &dir,
+            &first,
+            &crate::session::Turn {
+                ts: "t".into(),
+                task: "x".into(),
+                images: vec![],
+                response: "y".into(),
+                tool_calls: 0,
+                ledger: vec![],
+            },
+        )
+        .unwrap();
+        assert_eq!(session_for_run(&dir, true, "codex", "m").unwrap(), first);
+        assert_ne!(session_for_run(&dir, false, "codex", "m").unwrap(), first);
     }
 }

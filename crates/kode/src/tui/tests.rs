@@ -3181,6 +3181,7 @@ fn handle_slash_command_resume_with_sessions_opens_picker() {
             images: Vec::new(),
             response: "done".to_string(),
             tool_calls: 1,
+            ledger: Vec::new(),
         },
     )
     .unwrap();
@@ -3458,6 +3459,7 @@ fn restore_session_replays_transcript_and_history() {
             images: Vec::new(),
             response: "first answer".to_string(),
             tool_calls: 1,
+            ledger: Vec::new(),
         },
     )
     .unwrap();
@@ -3470,6 +3472,7 @@ fn restore_session_replays_transcript_and_history() {
             images: Vec::new(),
             response: "second answer".to_string(),
             tool_calls: 0,
+            ledger: Vec::new(),
         },
     )
     .unwrap();
@@ -4657,4 +4660,39 @@ fn kode_label_renders_bold_without_gutter() {
     );
     assert_eq!(line_text(&row), "KODE");
     assert!(row.spans[0].style.add_modifier.contains(Modifier::BOLD));
+}
+
+#[test]
+fn completed_turn_carries_the_recorded_ledger() {
+    let mut s = state();
+    s.start_new_task("do it", false);
+    apply_event(
+        &mut s,
+        KodeEvent::SourcedNote {
+            text: "fetch ← 4 callers".into(),
+            source: NoteSource::Zindeks,
+        },
+    );
+    apply_event(
+        &mut s,
+        KodeEvent::TaskFinished {
+            iterations: 1,
+            tool_calls: 0,
+            input_tokens: 5,
+            output_tokens: 1,
+            cached_tokens: None,
+        },
+    );
+    let cwd = temp_project_dir();
+    record_completed_turn(&mut s, &cwd, "codex", "m", 0);
+    let ledger = &s.history.last().unwrap().ledger;
+    assert!(ledger.iter().any(|e| matches!(
+        e,
+        crate::ledger::LedgerEntry::Fact { text, .. } if text == "fetch ← 4 callers"
+    )));
+    assert!(
+        ledger
+            .iter()
+            .any(|e| matches!(e, crate::ledger::LedgerEntry::Usage { .. }))
+    );
 }

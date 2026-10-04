@@ -58,6 +58,8 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
         flush_model_stream(state);
     }
 
+    state.ledger_recorder.observe(&ev);
+
     match ev {
         KodeEvent::AgentStarted => {
             state.running = true;

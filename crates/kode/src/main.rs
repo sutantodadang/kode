@@ -7,6 +7,7 @@ mod exec;
 mod index_cmd;
 mod intel_backend;
 mod intel_tools;
+mod ledger;
 mod local;
 mod memory_backend;
 mod memory_import;

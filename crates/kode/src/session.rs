@@ -18,6 +18,10 @@ pub struct Turn {
     pub images: Vec<ImageAttachment>,
     pub response: String,
     pub tool_calls: u32,
+    /// What the agent knew, decided, changed and verified this turn.
+    /// Empty for turns written before ledgers existed.
+    #[serde(default)]
+    pub ledger: Vec<crate::ledger::LedgerEntry>,
 }
 
 /// Listing row for the `/resume` picker.
@@ -203,6 +207,7 @@ mod tests {
             images: Vec::new(),
             response: format!("answer to {task}"),
             tool_calls: 1,
+            ledger: Vec::new(),
         }
     }
 
@@ -283,5 +288,34 @@ mod tests {
         assert_eq!(&id[8..9], "-");
         assert!(rfc.ends_with('Z'));
         assert_eq!(rfc.len(), 20);
+    }
+
+    #[test]
+    fn old_turn_lines_load_with_empty_ledger() {
+        let cwd = temp_cwd();
+        let id = create(&cwd, "codex", "m").unwrap();
+        let path = cwd
+            .join(".kode")
+            .join("sessions")
+            .join(format!("{id}.jsonl"));
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        // A turn written before the ledger field existed.
+        writeln!(
+            f,
+            r#"{{"ts":"2026-08-17T00:00:00Z","task":"old","response":"r","tool_calls":0}}"#
+        )
+        .unwrap();
+        let mut new_turn = turn("new");
+        new_turn.ledger = vec![crate::ledger::LedgerEntry::Usage {
+            input: 1,
+            output: 2,
+            cached: None,
+        }];
+        append_turn(&cwd, &id, &new_turn).unwrap();
+
+        let (turns, corrupt) = load(&cwd, &id).unwrap();
+        assert_eq!(corrupt, 0);
+        assert!(turns[0].ledger.is_empty());
+        assert_eq!(turns[1].ledger, new_turn.ledger);
     }
 }
