@@ -141,6 +141,16 @@ pub fn change_set(before: &ChangeSnapshot, after: &ChangeSnapshot) -> Vec<Numsta
         .collect()
 }
 
+/// Files that differed from `HEAD` before and match it now: the task
+/// undid them.
+pub fn reverted_paths(before: &ChangeSnapshot, after: &ChangeSnapshot) -> Vec<String> {
+    before
+        .keys()
+        .filter(|p| !after.contains_key(*p))
+        .cloned()
+        .collect()
+}
+
 fn truncate_diff(diff: &str) -> String {
     if diff.chars().count() <= DIFF_TRUNCATE_CHARS {
         return diff.to_string();
@@ -370,6 +380,19 @@ mod tests {
 
         let snap = change_snapshot(&dir).await.unwrap();
         assert_eq!(snap.get("s.txt"), Some(&(2, 0)));
+    }
+
+    #[test]
+    fn reverted_paths_are_files_back_at_head() {
+        let mut before = ChangeSnapshot::new();
+        before.insert("tried.rs".into(), (4, 0));
+        before.insert("kept.rs".into(), (1, 0));
+        let mut after = ChangeSnapshot::new();
+        after.insert("kept.rs".into(), (2, 0));
+        assert_eq!(
+            reverted_paths(&before, &after),
+            vec!["tried.rs".to_string()]
+        );
     }
 
     #[test]

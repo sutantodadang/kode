@@ -85,7 +85,7 @@ pub fn why_lines(turn: &Turn, number: usize) -> Vec<String> {
                 } => graph.push(format!(
                     "answered from graph: {query} of {symbol} · 0 tokens · {latency_ms}ms"
                 )),
-                LedgerEntry::Change { files } => git.extend(
+                LedgerEntry::Change { files, .. } => git.extend(
                     files
                         .iter()
                         .map(|f| format!("{} +{} −{}", f.path, f.added, f.removed)),
@@ -120,6 +120,10 @@ pub fn why_lines(turn: &Turn, number: usize) -> Vec<String> {
                     Some(c) => format!("{input} in ({c} cached) · {output} out"),
                     None => format!("{input} in · {output} out · cache not reported"),
                 }),
+                LedgerEntry::Memory { text, team, .. } => memory.push(format!(
+                    "saved{}: {text}",
+                    if *team { " · team" } else { "" }
+                )),
             }
         }
         section(&mut out, "ROUTE", route);
@@ -196,6 +200,7 @@ mod tests {
                         added: 3,
                         removed: 1,
                     }],
+                    reverted: vec![],
                 },
                 LedgerEntry::Verify {
                     name: "lint".into(),

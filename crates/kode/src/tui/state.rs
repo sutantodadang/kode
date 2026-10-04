@@ -523,6 +523,10 @@ pub struct AppState {
     pub(crate) graph_offer: Option<UserInput>,
     /// `/why` overlay lines, drawn until Esc closes them.
     pub why_lines: Option<Vec<String>>,
+    /// A drafted memory awaiting the user's key; `None` when nothing is offered.
+    pub(crate) memory_offer: Option<crate::memory_proposal::Proposal>,
+    /// The finished turn's steering/tool-error signals, for proposal triggers.
+    pub(crate) last_signals: crate::ledger::TurnSignals,
     /// Last terminal agent error, rendered as a recovery surface until the
     /// user begins composing again.
     pub last_error: Option<String>,
@@ -655,6 +659,8 @@ impl AppState {
             completion: None,
             graph_offer: None,
             why_lines: None,
+            memory_offer: None,
+            last_signals: Default::default(),
             last_error: None,
             shortcuts_open: false,
             attachments_open: false,
@@ -739,6 +745,7 @@ impl AppState {
         self.completion = None;
         self.graph_offer = None;
         self.why_lines = None;
+        self.memory_offer = None;
         self.last_error = None;
         self.shortcuts_open = false;
         self.attachments_open = false;
@@ -773,6 +780,7 @@ impl AppState {
 
     pub(crate) fn insert_input(&mut self, text: &str) {
         self.graph_offer = None;
+        self.memory_offer = None;
         self.begin_composing();
         let at = self.cursor_byte();
         self.input.insert_str(at, text);
@@ -1138,6 +1146,19 @@ pub(crate) fn push_graph_warming_note(state: &mut AppState) {
     }
 }
 
+/// Shows a drafted memory, unless the user has moved on (a run started or
+/// they are typing) — then the late draft is dropped silently.
+pub(crate) fn offer_memory(state: &mut AppState, proposal: crate::memory_proposal::Proposal) {
+    if state.running || state.composer_has_content() || state.graph_offer.is_some() {
+        return;
+    }
+    state.transcript.push(TranscriptLine::new(
+        Gutter::Ingat,
+        format!("◇ remember? \"{}\"", proposal.text),
+    ));
+    state.memory_offer = Some(proposal);
+}
+
 /// The original prompt plus the graph's answer, for "ask model anyway".
 pub(crate) fn ask_model_anyway_input(original: &UserInput, answer_text: &str) -> UserInput {
     UserInput {
@@ -1160,13 +1181,15 @@ pub(crate) fn record_completed_turn(
 ) {
     if let Some(task_input) = state.pending_task.take() {
         let (_, ts) = crate::session::now_utc_stamp();
+        let (ledger, signals) = state.ledger_recorder.take_turn();
+        state.last_signals = signals;
         let turn = crate::session::Turn {
             ts,
             task: task_input.text,
             images: task_input.images,
             response: state.last_response.clone(),
             tool_calls,
-            ledger: state.ledger_recorder.take(),
+            ledger,
         };
         let id = match state.session_id.clone() {
             Some(id) => Some(id),

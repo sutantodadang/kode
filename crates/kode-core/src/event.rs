@@ -197,6 +197,8 @@ pub enum KodeEvent {
     /// when the task mutated files and both git snapshots succeeded.
     ChangeSet {
         files: Vec<FileChange>,
+        /// Files that had uncommitted changes at task start and now match `HEAD`.
+        reverted: Vec<String>,
     },
     /// Background indexing started (TUI first run or `/index`). The engine
     /// reports no per-file progress, so only start and finish exist.

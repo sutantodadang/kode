@@ -1644,6 +1644,10 @@ pub(crate) fn now_line(state: &AppState, width: u16) -> Line<'static> {
             Style::default().fg(theme::OK),
         ));
         right = Some("Enter ask model anyway · Esc done".to_string());
+    } else if state.memory_offer.is_some() && !state.composer_has_content() {
+        left.push(glyph_bold("◇".to_string(), theme::I));
+        left.push(Span::styled(" remember?", Style::default().fg(theme::I)));
+        right = Some("Enter save · Tab team · Ctrl+E edit · Esc skip".to_string());
     } else if let Some(error) = &state.last_error {
         let prefix = "✗ stopped · ";
         let room = w.saturating_sub(1 + prefix.chars().count());

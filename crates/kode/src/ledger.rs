@@ -79,6 +79,8 @@ pub enum LedgerEntry {
     },
     Change {
         files: Vec<ChangeRecord>,
+        #[serde(default)]
+        reverted: Vec<String>,
     },
     GraphAnswer {
         query: String,
@@ -92,6 +94,11 @@ pub enum LedgerEntry {
         crates: u32,
         tests: u32,
     },
+    Memory {
+        id: String,
+        text: String,
+        team: bool,
+    },
     Verify {
         name: String,
         outcome: VerifyOutcome,
@@ -104,6 +111,13 @@ pub enum LedgerEntry {
     },
 }
 
+/// Non-ledger signals the recorder collects for memory-proposal triggers.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct TurnSignals {
+    pub steering: Vec<String>,
+    pub tool_errors: Vec<(String, String)>,
+}
+
 /// Collects one task's ledger from the event stream. Records only between
 /// `begin` and `take`, so events emitted outside a task (a `/map` run, an
 /// index finishing) never leak into a turn.
@@ -111,6 +125,7 @@ pub enum LedgerEntry {
 pub struct LedgerRecorder {
     active: bool,
     entries: Vec<LedgerEntry>,
+    signals: TurnSignals,
     seen_facts: HashSet<(FactSource, String)>,
 }
 
@@ -118,6 +133,7 @@ impl LedgerRecorder {
     pub fn begin(&mut self) {
         self.active = true;
         self.entries.clear();
+        self.signals = TurnSignals::default();
         self.seen_facts.clear();
     }
 
@@ -146,7 +162,7 @@ impl LedgerRecorder {
             KodeEvent::RouterDecision { answers } => self.entries.push(LedgerEntry::Route {
                 answers: answers.iter().map(RouteRecord::from).collect(),
             }),
-            KodeEvent::ChangeSet { files } => self.entries.push(LedgerEntry::Change {
+            KodeEvent::ChangeSet { files, reverted } => self.entries.push(LedgerEntry::Change {
                 files: files
                     .iter()
                     .map(|f| ChangeRecord {
@@ -155,6 +171,7 @@ impl LedgerRecorder {
                         removed: f.removed,
                     })
                     .collect(),
+                reverted: reverted.clone(),
             }),
             KodeEvent::GraphAnswered {
                 query,
@@ -179,6 +196,14 @@ impl LedgerRecorder {
                 crates: *crates,
                 tests: *tests,
             }),
+            KodeEvent::SteeringAccepted { message } => {
+                self.signals.steering.push(message.text.clone())
+            }
+            KodeEvent::ToolFinished {
+                name,
+                ok: false,
+                error: Some(error),
+            } => self.signals.tool_errors.push((name.clone(), error.clone())),
             KodeEvent::VerifyStep {
                 name,
                 passed,
@@ -212,10 +237,18 @@ impl LedgerRecorder {
         }
     }
 
-    pub fn take(&mut self) -> Vec<LedgerEntry> {
+    pub fn take_turn(&mut self) -> (Vec<LedgerEntry>, TurnSignals) {
         self.active = false;
         self.seen_facts.clear();
-        std::mem::take(&mut self.entries)
+        (
+            std::mem::take(&mut self.entries),
+            std::mem::take(&mut self.signals),
+        )
+    }
+
+    #[cfg(test)]
+    pub fn take(&mut self) -> Vec<LedgerEntry> {
+        self.take_turn().0
     }
 
     /// `Knowledge` lines and `SourcedNote`s can repeat one fact; keep it once.
@@ -285,6 +318,7 @@ mod tests {
                 added: 3,
                 removed: 1,
             }],
+            reverted: vec![],
         });
         r.observe(&KodeEvent::VerifyStep {
             name: "lint".into(),
@@ -335,7 +369,8 @@ mod tests {
                         path: "a.rs".into(),
                         added: 3,
                         removed: 1
-                    }]
+                    }],
+                    reverted: vec![],
                 },
                 LedgerEntry::Verify {
                     name: "lint".into(),
@@ -400,6 +435,33 @@ mod tests {
     }
 
     #[test]
+    fn signals_capture_steering_and_tool_errors() {
+        let mut r = LedgerRecorder::default();
+        r.begin();
+        r.observe(&KodeEvent::SteeringAccepted {
+            message: kode_core::UserInput::text("use the async client"),
+        });
+        r.observe(&KodeEvent::ToolFinished {
+            name: "run_command".into(),
+            ok: false,
+            error: Some("port in use".into()),
+        });
+        r.observe(&KodeEvent::ToolFinished {
+            name: "run_command".into(),
+            ok: true,
+            error: None,
+        });
+        let (_, signals) = r.take_turn();
+        assert_eq!(signals.steering, vec!["use the async client"]);
+        assert_eq!(
+            signals.tool_errors,
+            vec![("run_command".to_string(), "port in use".to_string())]
+        );
+        r.begin();
+        assert_eq!(r.take_turn().1, TurnSignals::default());
+    }
+
+    #[test]
     fn every_entry_round_trips_through_json() {
         let entries = vec![
             LedgerEntry::Fact {
@@ -421,6 +483,7 @@ mod tests {
                     added: 1,
                     removed: 0,
                 }],
+                reverted: vec![],
             },
             LedgerEntry::Verify {
                 name: "test".into(),
@@ -437,5 +500,15 @@ mod tests {
         assert!(json.contains("\"k\":\"fact\""));
         let back: Vec<LedgerEntry> = serde_json::from_str(&json).unwrap();
         assert_eq!(back, entries);
+
+        // A `change` written before `reverted` existed loads with an empty list.
+        let old: LedgerEntry = serde_json::from_str(r#"{"k":"change","files":[]}"#).unwrap();
+        assert_eq!(
+            old,
+            LedgerEntry::Change {
+                files: vec![],
+                reverted: vec![]
+            }
+        );
     }
 }

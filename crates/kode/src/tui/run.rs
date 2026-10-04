@@ -468,6 +468,117 @@ pub(crate) fn spawn_git_poll(cwd: std::path::PathBuf, tx: mpsc::UnboundedSender<
     });
 }
 
+/// Detects a memorable moment in the just-finished turn and, only then,
+/// drafts one memory on a background task.
+fn spawn_memory_proposal(
+    state: &AppState,
+    config: &KodeConfig,
+    cwd: &Path,
+    tx: &mpsc::UnboundedSender<crate::memory_proposal::Proposal>,
+) {
+    if !config.memory.propose {
+        return;
+    }
+    let Some((turn, earlier)) = state.history.split_last() else {
+        return;
+    };
+    let Some(trigger) = crate::memory_proposal::detect(turn, earlier, &state.last_signals) else {
+        return; // no trigger: no request, no tokens
+    };
+    let Ok(model) = crate::pipeline::ModelFactory::create(config) else {
+        return;
+    };
+    let turn = turn.clone();
+    let runtime = state.runtime.clone();
+    let ingat = config.ingat.clone();
+    let repository = cwd.file_name().map(|n| n.to_string_lossy().to_string());
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let memory = runtime.memory(&ingat).await.ok().flatten();
+        if let Some(p) = crate::memory_proposal::propose(
+            model.as_ref(),
+            memory.as_deref(),
+            repository,
+            &trigger,
+            &turn,
+        )
+        .await
+        {
+            let _ = tx.send(p);
+        }
+    });
+}
+
+/// Saves an approved proposal as a personal or team memory.
+fn spawn_save_memory(
+    state: &AppState,
+    config: &KodeConfig,
+    cwd: &Path,
+    tx: &mpsc::UnboundedSender<Result<(String, String, bool), String>>,
+    proposal: crate::memory_proposal::Proposal,
+    team: bool,
+) {
+    let runtime = state.runtime.clone();
+    let ingat = config.ingat.clone();
+    let repository = cwd.file_name().map(|n| n.to_string_lossy().to_string());
+    let root = cwd.to_path_buf();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let memory = crate::remember::proposed_memory(&proposal, repository, team);
+        let text = memory.body.clone();
+        let result = match runtime.memory(&ingat).await {
+            Ok(Some(backend)) => crate::remember::save_memory(&root, backend.as_ref(), &memory)
+                .await
+                .map(|id| (id, text, team))
+                .map_err(|e| e.to_string()),
+            Ok(None) => Err("memory is disabled in config".to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        let _ = tx.send(result);
+    });
+}
+
+/// Saves a `/remember [--team] <text>` memory directly.
+fn spawn_save_command_memory(
+    state: &AppState,
+    config: &KodeConfig,
+    cwd: &Path,
+    tx: &mpsc::UnboundedSender<Result<(String, String, bool), String>>,
+    text: String,
+    team: bool,
+) {
+    use kode_memory::{MemoryContext, MemoryKind, NewMemory, Provenance};
+
+    let runtime = state.runtime.clone();
+    let ingat = config.ingat.clone();
+    let repository = cwd.file_name().map(|n| n.to_string_lossy().to_string());
+    let root = cwd.to_path_buf();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let memory = NewMemory {
+            kind: MemoryKind::Convention,
+            summary: text.chars().take(100).collect(),
+            body: text.clone(),
+            tags: vec![],
+            provenance: Provenance::ExplicitUser,
+            context: MemoryContext {
+                repository,
+                ..Default::default()
+            },
+            team,
+        };
+        let result = match runtime.memory(&ingat).await {
+            Ok(Some(backend)) => crate::remember::save_memory(&root, backend.as_ref(), &memory)
+                .await
+                .map(|id| (id, text, team))
+                .map_err(|e| e.to_string()),
+            Ok(None) => Err("memory is disabled in config".to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        let _ = tx.send(result);
+    });
+}
+
 /// Renders the repo map into the transcript via the shared event bus.
 fn spawn_repo_map(state: &AppState, config: &KodeConfig, cwd: &Path, events: &EventBus) {
     let runtime = state.runtime.clone();
@@ -776,6 +887,10 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
 
     let (picker_tx, mut picker_rx) = mpsc::unbounded_channel::<PickerLoaded>();
 
+    let (memory_tx, mut memory_rx) = mpsc::unbounded_channel::<crate::memory_proposal::Proposal>();
+    let (memory_saved_tx, mut memory_saved_rx) =
+        mpsc::unbounded_channel::<Result<(String, String, bool), String>>();
+
     let (git_tx, mut git_rx) = mpsc::unbounded_channel::<RepoState>();
     spawn_git_poll(cwd.to_path_buf(), git_tx.clone());
 
@@ -1032,6 +1147,39 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                     continue 'outer;
                                 }
                             }
+                            if !state.running
+                                && state.memory_offer.is_some()
+                                && !state.composer_has_content()
+                            {
+                                match key.code {
+                                    KeyCode::Esc => {
+                                        state.memory_offer = None;
+                                        continue 'outer;
+                                    }
+                                    KeyCode::Enter | KeyCode::Tab => {
+                                        let proposal = state.memory_offer.take().unwrap();
+                                        let team = key.code == KeyCode::Tab;
+                                        spawn_save_memory(
+                                            &state,
+                                            &config,
+                                            cwd,
+                                            &memory_saved_tx,
+                                            proposal,
+                                            team,
+                                        );
+                                        continue 'outer;
+                                    }
+                                    KeyCode::Char('e')
+                                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        let proposal = state.memory_offer.take().unwrap();
+                                        state.input = format!("/remember {}", proposal.text);
+                                        state.input_cursor = None;
+                                        continue 'outer;
+                                    }
+                                    _ => {}
+                                }
+                            }
                             if handle_key(&mut state, cwd, key.code, key.modifiers, &current_cancel) {
                                 break 'outer;
                             }
@@ -1088,6 +1236,25 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                     }
                                     if matches!(command.as_ref(), Some(SlashCommand::Index)) {
                                         spawn_background_index(&mut state, &config, cwd, &events);
+                                        continue 'outer;
+                                    }
+                                    if let Some(SlashCommand::Remember { team, text }) = command.as_ref() {
+                                        let (team, text) = (*team, text.clone());
+                                        if text.trim().is_empty() {
+                                            state.transcript.push(TranscriptLine::new(
+                                                Gutter::Note,
+                                                "usage: /remember [--team] <text>",
+                                            ));
+                                        } else {
+                                            spawn_save_command_memory(
+                                                &state,
+                                                &config,
+                                                cwd,
+                                                &memory_saved_tx,
+                                                text,
+                                                team,
+                                            );
+                                        }
                                         continue 'outer;
                                     }
                                     if let Some(cmd) = command {
@@ -1180,6 +1347,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                 &config.model.model,
                                 tool_calls,
                             );
+                            spawn_memory_proposal(&state, &config, cwd, &memory_tx);
                             // Refresh the dirty flag + CURRENT CHANGE rows now
                             // that the task's edits (if any) have landed —
                             // same lazy poll as TUI start, no fixed interval.
@@ -1260,6 +1428,43 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
             indexed = indexed_rx.recv() => {
                 if let Some(answer) = indexed {
                     state.repo_indexed = answer;
+                }
+            }
+
+            proposal = memory_rx.recv() => {
+                if let Some(proposal) = proposal {
+                    offer_memory(&mut state, proposal);
+                }
+            }
+
+            saved = memory_saved_rx.recv() => {
+                if let Some(result) = saved {
+                    let text = match &result {
+                        Ok((_, _, true)) => "m ● saved · team".to_string(),
+                        Ok(_) => "m ● saved".to_string(),
+                        Err(e) => format!("memory not saved: {e}"),
+                    };
+                    state.transcript.push(TranscriptLine::new(Gutter::Ingat, text));
+                    if let (Ok((id, saved_text, team)), Some(session)) =
+                        (result, state.session_id.clone())
+                    {
+                        let entry = crate::ledger::LedgerEntry::Memory {
+                            id,
+                            text: saved_text,
+                            team,
+                        };
+                        if let Some(last) = state.history.last_mut() {
+                            last.ledger.push(entry.clone());
+                        }
+                        if let Err(e) =
+                            crate::session::amend_last_turn(cwd, &session, |t| t.ledger.push(entry))
+                        {
+                            state.transcript.push(TranscriptLine::new(
+                                Gutter::Note,
+                                format!("session amend failed (non-fatal): {e}"),
+                            ));
+                        }
+                    }
                 }
             }
 

@@ -15,6 +15,7 @@ mod ledger;
 mod local;
 mod memory_backend;
 mod memory_import;
+mod memory_proposal;
 mod models;
 mod pipeline;
 mod remember;
@@ -86,6 +87,12 @@ enum Command {
         /// Always use the model, never answer from the code graph alone.
         #[arg(long)]
         no_graph_answer: bool,
+        /// After the task, draft a memory if something memorable happened.
+        #[arg(long)]
+        propose_memory: bool,
+        /// Save the drafted memory (personal) without asking. Requires --propose-memory.
+        #[arg(long)]
+        save_memory: bool,
     },
     /// List available models for the configured provider.
     Models,
@@ -250,6 +257,8 @@ async fn main() -> anyhow::Result<()> {
             plan,
             images,
             no_graph_answer,
+            propose_memory,
+            save_memory,
         }) => {
             if let Some(e) = &effort
                 && !kode_core::config::VALID_EFFORTS.contains(&e.as_str())
@@ -270,6 +279,8 @@ async fn main() -> anyhow::Result<()> {
                 plan,
                 &images,
                 no_graph_answer,
+                propose_memory,
+                save_memory,
             )
             .await?;
         }

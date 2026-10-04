@@ -35,6 +35,11 @@ pub enum SlashCommand {
     Index,
     /// `/why [N]` — show a turn's provenance from its ledger.
     Why(String),
+    /// `/remember [--team] <text>` — save an engineering memory.
+    Remember {
+        team: bool,
+        text: String,
+    },
     Help,
     /// `/name [args]` where `name` isn't a builtin. Resolved against
     /// discovered custom commands at handle time (not parse time) — an
@@ -52,7 +57,7 @@ pub enum SlashCommand {
 /// filters them out up front.
 pub const BUILTIN_COMMAND_NAMES: &[&str] = &[
     "model", "effort", "provider", "copy", "resume", "status", "exit", "plan", "image", "router",
-    "map", "index", "why", "help",
+    "map", "index", "why", "remember", "help",
 ];
 
 /// The providers `/provider` accepts, in picker display order.
@@ -85,6 +90,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/map", "show the repo map (graph, 0 tokens)"),
     ("/index", "index this repo in the background"),
     ("/why", "show where the last answer came from"),
+    ("/remember", "save an engineering memory (--team to share)"),
     ("/help", "list commands + shortcuts"),
 ];
 
@@ -146,6 +152,13 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "/map" => SlashCommand::Map,
         "/index" => SlashCommand::Index,
         "/why" => SlashCommand::Why(rest.to_string()),
+        "/remember" => {
+            let (team, text) = match rest.strip_prefix("--team") {
+                Some(t) => (true, t.trim().to_string()),
+                None => (false, rest.to_string()),
+            };
+            SlashCommand::Remember { team, text }
+        }
         "/help" => SlashCommand::Help,
         other => {
             let name = other.trim_start_matches('/').to_lowercase();
@@ -638,6 +651,7 @@ pub(crate) fn handle_slash_command(
         }
         SlashCommand::Exit => {}
         SlashCommand::Map | SlashCommand::Index => {}
+        SlashCommand::Remember { .. } => {}
         SlashCommand::Why(arg) => match crate::why::parse_turn_arg(&arg, state.history.len()) {
             Ok(index) => {
                 state.why_lines = Some(crate::why::why_lines(&state.history[index], index + 1))

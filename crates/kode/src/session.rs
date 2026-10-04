@@ -177,6 +177,25 @@ pub fn append_turn(cwd: &Path, id: &str, turn: &Turn) -> std::io::Result<()> {
     writeln!(f, "{}", serde_json::to_string(turn)?)
 }
 
+/// Rewrites the last valid turn line in place (temp file + rename), e.g.
+/// to record a memory saved after the turn finished. Every other line is
+/// kept byte-for-byte.
+pub fn amend_last_turn(cwd: &Path, id: &str, f: impl FnOnce(&mut Turn)) -> std::io::Result<()> {
+    let path = session_path(cwd, id);
+    let text = fs::read_to_string(&path)?;
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let index = (1..lines.len())
+        .rev()
+        .find(|&i| serde_json::from_str::<Turn>(&lines[i]).is_ok())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no turn to amend"))?;
+    let mut turn: Turn = serde_json::from_str(&lines[index])?;
+    f(&mut turn);
+    lines[index] = serde_json::to_string(&turn)?;
+    let tmp = path.with_extension("jsonl.tmp");
+    fs::write(&tmp, lines.join("\n") + "\n")?;
+    fs::rename(&tmp, &path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +307,42 @@ mod tests {
         assert_eq!(&id[8..9], "-");
         assert!(rfc.ends_with('Z'));
         assert_eq!(rfc.len(), 20);
+    }
+
+    #[test]
+    fn amend_last_turn_only_touches_last_turn() {
+        let cwd = temp_cwd();
+        let id = create(&cwd, "codex", "m").unwrap();
+        append_turn(&cwd, &id, &turn("first")).unwrap();
+        let path = cwd
+            .join(".kode")
+            .join("sessions")
+            .join(format!("{id}.jsonl"));
+        {
+            let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(f, "{{not json").unwrap();
+        }
+        append_turn(&cwd, &id, &turn("last")).unwrap();
+        {
+            let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(f).unwrap(); // trailing blank line
+        }
+        let before = fs::read_to_string(&path).unwrap();
+        amend_last_turn(&cwd, &id, |t| {
+            t.ledger.push(crate::ledger::LedgerEntry::Memory {
+                id: "m1".into(),
+                text: "x".into(),
+                team: false,
+            })
+        })
+        .unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        let (b, a): (Vec<_>, Vec<_>) = (before.lines().collect(), after.lines().collect());
+        assert_eq!(b[..3], a[..3]); // header, first, corrupt line unchanged
+        let (turns, corrupt) = load(&cwd, &id).unwrap();
+        assert_eq!(corrupt, 1);
+        assert_eq!(turns[1].task, "last");
+        assert_eq!(turns[1].ledger.len(), 1);
     }
 
     #[test]

@@ -4753,6 +4753,69 @@ fn lmstudio_counts_as_logged_in() {
     assert!(provider_logged_in("lmstudio"));
 }
 
+fn proposal() -> crate::memory_proposal::Proposal {
+    crate::memory_proposal::Proposal {
+        kind: kode_memory::MemoryKind::KnownIssue,
+        text: "Run tests serially on Windows".into(),
+        files: vec![],
+    }
+}
+
+#[test]
+fn offer_row_and_now_line() {
+    let mut s = state();
+    offer_memory(&mut s, proposal());
+    assert!(
+        s.transcript
+            .iter()
+            .any(|l| l.text == "◇ remember? \"Run tests serially on Windows\"")
+    );
+    let text: String = now_line(&s, 100)
+        .spans
+        .iter()
+        .map(|sp| sp.content.to_string())
+        .collect();
+    assert!(text.contains("Enter save · Tab team · Ctrl+E edit · Esc skip"));
+}
+
+#[test]
+fn late_proposal_is_dropped_when_busy() {
+    let mut s = state();
+    s.running = true;
+    offer_memory(&mut s, proposal());
+    assert!(s.memory_offer.is_none());
+    let mut typing = state();
+    typing.insert_input("next task");
+    offer_memory(&mut typing, proposal());
+    assert!(typing.memory_offer.is_none());
+}
+
+#[test]
+fn typing_skips_the_offer() {
+    let mut s = state();
+    offer_memory(&mut s, proposal());
+    s.insert_input("r");
+    assert!(s.memory_offer.is_none());
+}
+
+#[test]
+fn parses_remember_command() {
+    assert_eq!(
+        parse_slash_command("/remember --team use tokio"),
+        Some(SlashCommand::Remember {
+            team: true,
+            text: "use tokio".into()
+        })
+    );
+    assert_eq!(
+        parse_slash_command("/remember use tokio"),
+        Some(SlashCommand::Remember {
+            team: false,
+            text: "use tokio".into()
+        })
+    );
+}
+
 #[test]
 fn why_sheet_keeps_footer_when_cut() {
     let lines: Vec<String> = (0..30)

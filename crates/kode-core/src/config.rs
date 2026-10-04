@@ -108,6 +108,8 @@ pub struct KodeConfig {
     pub verify: VerifyConfig,
     pub ui: UiConfig,
     pub router: RouterConfig,
+    #[serde(default)]
+    pub memory: MemoryConfig,
 }
 
 impl KodeConfig {
@@ -508,6 +510,21 @@ impl Default for UiConfig {
             reduced_motion: default_reduced_motion(),
             theme: UiTheme::default(),
         }
+    }
+}
+
+/// `[memory]`: Kode-side memory behavior (the store itself is `[ingat]`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryConfig {
+    /// Offer to remember memorable moments (TUI). Exec needs `--propose-memory`.
+    #[serde(default = "default_true")]
+    pub propose: bool,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self { propose: true }
     }
 }
 
@@ -1031,6 +1048,13 @@ effort = "high"
         assert_eq!(RouterConfig::default().graph_threshold, 0.8);
         let cfg: KodeConfig = toml::from_str("[router]\ngraph_threshold = 0.9\n").unwrap();
         assert_eq!(cfg.router.graph_threshold, 0.9);
+    }
+
+    #[test]
+    fn memory_propose_defaults_on() {
+        assert!(KodeConfig::default().memory.propose);
+        let cfg: KodeConfig = toml::from_str("[memory]\npropose = false\n").unwrap();
+        assert!(!cfg.memory.propose);
     }
 
     #[test]

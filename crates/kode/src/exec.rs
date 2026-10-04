@@ -42,7 +42,10 @@ pub async fn run(
     plan_mode: bool,
     image_paths: &[std::path::PathBuf],
     no_graph_answer: bool,
+    propose_memory: bool,
+    save_memory: bool,
 ) -> anyhow::Result<()> {
+    validate_memory_flags(propose_memory, save_memory).map_err(|e| anyhow::anyhow!(e))?;
     let mut config = KodeConfig::load(cwd)?;
     if let Some(model) = model_override {
         config.model.model = model;
@@ -206,7 +209,7 @@ pub async fn run(
                         KodeEvent::AgentError { message } => {
                             eprintln!("{message}");
                         }
-                        KodeEvent::ChangeSet { files } => {
+                        KodeEvent::ChangeSet { files, .. } => {
                             for file in &files {
                                 eprintln!(
                                     "◆ change {} +{} −{}",
@@ -246,7 +249,7 @@ pub async fn run(
                 }
             }
         }
-        (response_buf, final_tool_calls, recorder.take())
+        (response_buf, final_tool_calls, recorder.take_turn())
     });
 
     let runtime = crate::session_runtime::SessionRuntime::new();
@@ -266,8 +269,9 @@ pub async fn run(
     )
     .await;
 
-    let (final_text, tool_calls, ledger) = printer.await.unwrap_or_default();
+    let (final_text, tool_calls, (ledger, signals)) = printer.await.unwrap_or_default();
 
+    let mut saved_id: Option<String> = None;
     if result.is_ok() {
         println!();
         match session_for_run(
@@ -289,9 +293,14 @@ pub async fn run(
                 if let Err(e) = session::append_turn(cwd, &id, &turn) {
                     println!("session append failed (non-fatal): {e}");
                 }
+                saved_id = Some(id);
             }
             Err(e) => println!("session store unavailable (non-fatal): {e}"),
         }
+    }
+
+    if result.is_ok() && propose_memory {
+        maybe_propose_memory(cwd, &config, saved_id.as_deref(), &signals, save_memory).await;
     }
     let outcome = result?;
     if !outcome.is_success() {
@@ -309,6 +318,73 @@ pub async fn run(
         }
     }
     Ok(())
+}
+
+fn validate_memory_flags(propose: bool, save: bool) -> Result<(), String> {
+    if save && !propose {
+        return Err("--save-memory requires --propose-memory".to_string());
+    }
+    Ok(())
+}
+
+/// Detects a memorable moment in the run's turn and drafts one memory.
+async fn maybe_propose_memory(
+    cwd: &Path,
+    config: &KodeConfig,
+    session_id: Option<&str>,
+    signals: &crate::ledger::TurnSignals,
+    save: bool,
+) {
+    let Some(id) = session_id else {
+        return;
+    };
+    let Ok((turns, _)) = session::load(cwd, id) else {
+        return;
+    };
+    let Some((turn, earlier)) = turns.split_last() else {
+        return;
+    };
+    let Some(trigger) = crate::memory_proposal::detect(turn, earlier, signals) else {
+        return;
+    };
+    let Ok(model) = crate::pipeline::ModelFactory::create(config) else {
+        return;
+    };
+    let runtime = crate::session_runtime::SessionRuntime::new();
+    let memory = runtime.memory(&config.ingat).await.ok().flatten();
+    let repository = cwd.file_name().map(|n| n.to_string_lossy().to_string());
+    let Some(proposal) = crate::memory_proposal::propose(
+        model.as_ref(),
+        memory.as_deref(),
+        repository.clone(),
+        &trigger,
+        turn,
+    )
+    .await
+    else {
+        return;
+    };
+    eprintln!("◇ remember? \"{}\"", proposal.text);
+    if !save {
+        return;
+    }
+    let Some(backend) = memory else {
+        eprintln!("memory not saved: memory is disabled in config");
+        return;
+    };
+    let new_memory = crate::remember::proposed_memory(&proposal, repository, false);
+    match crate::remember::save_memory(cwd, backend.as_ref(), &new_memory).await {
+        Ok(saved) => {
+            eprintln!("m ● saved ({saved})");
+            let entry = crate::ledger::LedgerEntry::Memory {
+                id: saved,
+                text: proposal.text,
+                team: false,
+            };
+            let _ = session::amend_last_turn(cwd, id, |t| t.ledger.push(entry));
+        }
+        Err(e) => eprintln!("memory not saved: {e}"),
+    }
 }
 
 /// Session that receives this exec run's turn: the latest one with
@@ -415,6 +491,15 @@ mod tests {
         let dir = temp_dir("empty");
         let err = resolve_custom_task("/nope", &dir).unwrap_err();
         assert!(err.to_string().contains("no custom commands found"));
+    }
+
+    #[test]
+    fn save_memory_without_propose_is_rejected() {
+        assert_eq!(
+            validate_memory_flags(false, true).unwrap_err(),
+            "--save-memory requires --propose-memory"
+        );
+        assert!(validate_memory_flags(true, false).is_ok());
     }
 
     #[test]
