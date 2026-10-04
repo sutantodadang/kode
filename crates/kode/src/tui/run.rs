@@ -399,6 +399,19 @@ pub(crate) fn spawn_git_poll(cwd: std::path::PathBuf, tx: mpsc::UnboundedSender<
     });
 }
 
+/// Renders the repo map into the transcript via the shared event bus.
+fn spawn_repo_map(state: &AppState, config: &KodeConfig, cwd: &Path, events: &EventBus) {
+    let runtime = state.runtime.clone();
+    let cfg = config.zindeks.clone();
+    let root = cwd.to_path_buf();
+    let events = events.clone();
+    tokio::spawn(async move {
+        for ev in crate::repo_map::map_events(&runtime, &cfg, &root).await {
+            events.emit(ev);
+        }
+    });
+}
+
 /// Starts `task` running through the pipeline: resets per-run state, pushes
 /// the user transcript line, and spawns the task future. Shared by the
 /// plain-text Enter path and expanded custom-slash-command prompts so both
@@ -729,6 +742,8 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                                             format!("draft kept; type {name} after sending or clearing it"),
                                                         ));
                                                     }
+                                                } else if name == "/map" {
+                                                    spawn_repo_map(&state, &config, cwd, &events);
                                                 } else if let Some(command) = parse_slash_command(name) {
                                                     handle_slash_command(&mut state, cwd, &mut config, &picker_tx, command);
                                                 }
@@ -791,6 +806,10 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                     };
                                     if matches!(command.as_ref(), Some(SlashCommand::Exit)) {
                                         break 'outer;
+                                    }
+                                    if matches!(command.as_ref(), Some(SlashCommand::Map)) {
+                                        spawn_repo_map(&state, &config, cwd, &events);
+                                        continue 'outer;
                                     }
                                     if let Some(cmd) = command {
                                         if let Some(expanded) =

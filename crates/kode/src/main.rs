@@ -14,6 +14,7 @@ mod memory_import;
 mod models;
 mod pipeline;
 mod remember;
+mod repo_map;
 mod router_cmd;
 mod routing;
 mod session;

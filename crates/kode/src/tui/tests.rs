@@ -4663,6 +4663,12 @@ fn kode_label_renders_bold_without_gutter() {
 }
 
 #[test]
+fn parses_map_and_index_commands() {
+    assert_eq!(parse_slash_command("/map"), Some(SlashCommand::Map));
+    assert_eq!(parse_slash_command("/index"), Some(SlashCommand::Index));
+}
+
+#[test]
 fn completed_turn_carries_the_recorded_ledger() {
     let mut s = state();
     s.start_new_task("do it", false);

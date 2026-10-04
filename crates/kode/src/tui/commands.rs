@@ -29,6 +29,10 @@ pub enum SlashCommand {
     Image(String),
     /// `/router [key=value…]` — show or correct the last router training record.
     Router(String),
+    /// `/map` — zero-token repo map from the code graph.
+    Map,
+    /// `/index` — build or refresh the code index in the background.
+    Index,
     Help,
     /// `/name [args]` where `name` isn't a builtin. Resolved against
     /// discovered custom commands at handle time (not parse time) — an
@@ -46,7 +50,7 @@ pub enum SlashCommand {
 /// filters them out up front.
 pub const BUILTIN_COMMAND_NAMES: &[&str] = &[
     "model", "effort", "provider", "copy", "resume", "status", "exit", "plan", "image", "router",
-    "help",
+    "map", "index", "help",
 ];
 
 /// The providers `/provider` accepts, in picker display order.
@@ -76,6 +80,8 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
         "toggle plan mode (plan first, then approve to run)",
     ),
     ("/router", "show or correct the last router decision"),
+    ("/map", "show the repo map (graph, 0 tokens)"),
+    ("/index", "index this repo in the background"),
     ("/help", "list commands + shortcuts"),
 ];
 
@@ -134,6 +140,8 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "/plan" => SlashCommand::Plan,
         "/image" => SlashCommand::Image(rest.to_string()),
         "/router" => SlashCommand::Router(rest.to_string()),
+        "/map" => SlashCommand::Map,
+        "/index" => SlashCommand::Index,
         "/help" => SlashCommand::Help,
         other => {
             let name = other.trim_start_matches('/').to_lowercase();
@@ -600,6 +608,7 @@ pub(crate) fn handle_slash_command(
             ));
         }
         SlashCommand::Exit => {}
+        SlashCommand::Map | SlashCommand::Index => {}
         SlashCommand::Router(args) => {
             let lines = if args.trim().is_empty() {
                 crate::router_cmd::describe_last(cwd)
@@ -683,7 +692,7 @@ pub(crate) fn handle_slash_command(
             state.transcript.push(TranscriptLine::new(
                 Gutter::Note,
                 "commands: /model [name], /effort <minimal|low|medium|high|xhigh|max|ultra>, \
-                 /provider [name], /resume, /status, /exit, /image <path>, /copy, /plan, /help · shift+tab toggles auto mode (tools run \
+                 /provider [name], /resume, /status, /exit, /image <path>, /copy, /plan, /map, /index, /help · shift+tab toggles auto mode (tools run \
                  without asking) · shift+enter adds a newline · long paste becomes a compact \
                  attachment; paste or drag an image path to attach it · Enter follows the composer label: send, steer, or queue · Alt+Enter explicitly queues · \
                  ? opens shortcuts · Ctrl+P opens commands · Ctrl+A inspects attachments · Ctrl+Y copies the last response · Ctrl+T toggles select mode \
