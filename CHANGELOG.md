@@ -24,6 +24,12 @@ minor versions may contain breaking changes).
   `--no-graph-answer` flag for `kode exec`.
 - `/why [N]`: the provenance of a persisted turn (route, graph/memory/git
   facts, changes, checks, cost) from its ledger.
+- Blast radius after each edit: the ledger shows an `impact · <symbol> ← N
+  callers, M crates, K tests` row, the model sees the caller sites in the
+  tool result, and the permission prompt previews the impact before a write.
+- Targeted verification: graph-selected tests run first (`[verify] targeted`,
+  default `"first"`), with the full suite honestly reported as Skipped when
+  it does not run.
 
 ### Changed
 

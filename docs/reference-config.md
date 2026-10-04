@@ -212,6 +212,7 @@ Verification is auto-detected by default, including Rust/Go/Node/Python subproje
 | `timeout_seconds` | integer | `600` | Default timeout for each verification step. |
 | `fail_fast` | bool | `true` | Skip remaining steps after a required step fails. |
 | `steps` | array of tables | `[]` | Explicit commands; when non-empty, disables auto-detection. |
+| `targeted` | string | `"first"` | How graph-selected tests run: `"first"` runs them before the full test step and fails fast (a targeted failure reports the full suite Skipped, `targeted tests failed`); `"only"` runs only them and reports the full test step Skipped (`targeted mode`); `"off"` disables targeting. No covering tests found means the targeted step is Skipped (`no covering tests found`) and the full suite runs. |
 
 Each step accepts `name`, `command`, `args`, workspace-relative `cwd`, `required`, and an optional per-step `timeout_seconds` override.
 
