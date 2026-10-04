@@ -510,6 +510,9 @@ pub struct AppState {
     pub(crate) indexing_since: Option<Instant>,
     /// Transcript row of the latest indexing line, updated in place.
     pub(crate) index_line: Option<usize>,
+    /// Setup facts may have changed; `maybe_show_setup_card` only re-reads
+    /// them from disk while this is set.
+    pub(crate) setup_dirty: bool,
     /// Setup cards the user skipped this launch (Esc).
     pub(crate) setup_skipped: std::collections::HashSet<crate::first_run::SetupCard>,
     /// Startup probe result: is this repo indexed? `None` until it answers.
@@ -653,6 +656,7 @@ impl AppState {
             ledger_recorder: Default::default(),
             indexing_since: None,
             index_line: None,
+            setup_dirty: true,
             setup_skipped: std::collections::HashSet::new(),
             repo_indexed: None,
             setup_card: None,
@@ -1234,6 +1238,7 @@ pub(crate) fn restore_session(state: &mut AppState, cwd: &Path, id: &str) -> boo
             }
             state.transcript.clear();
             state.transcript_cache = Default::default();
+            state.index_line = None;
             state.history.clear();
             state.current_stream.clear();
             state.stream_pending.clear();

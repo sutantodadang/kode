@@ -183,17 +183,47 @@ pub fn append_turn(cwd: &Path, id: &str, turn: &Turn) -> std::io::Result<()> {
 pub fn amend_last_turn(cwd: &Path, id: &str, f: impl FnOnce(&mut Turn)) -> std::io::Result<()> {
     let path = session_path(cwd, id);
     let text = fs::read_to_string(&path)?;
-    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let lines: Vec<String> = text.lines().map(str::to_string).collect();
     let index = (1..lines.len())
         .rev()
         .find(|&i| serde_json::from_str::<Turn>(&lines[i]).is_ok())
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no turn to amend"))?;
+    rewrite_line(&path, lines, index, f)
+}
+
+/// Rewrites the `index`-th (0-based) line that parses as a [`Turn`], same
+/// temp file + rename as [`amend_last_turn`]. `NotFound` when the session
+/// has fewer turns.
+pub fn amend_turn(
+    cwd: &Path,
+    id: &str,
+    index: usize,
+    f: impl FnOnce(&mut Turn),
+) -> std::io::Result<()> {
+    let path = session_path(cwd, id);
+    let text = fs::read_to_string(&path)?;
+    let lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let line = (1..lines.len())
+        .filter(|&i| serde_json::from_str::<Turn>(&lines[i]).is_ok())
+        .nth(index)
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no such turn to amend")
+        })?;
+    rewrite_line(&path, lines, line, f)
+}
+
+fn rewrite_line(
+    path: &Path,
+    mut lines: Vec<String>,
+    index: usize,
+    f: impl FnOnce(&mut Turn),
+) -> std::io::Result<()> {
     let mut turn: Turn = serde_json::from_str(&lines[index])?;
     f(&mut turn);
     lines[index] = serde_json::to_string(&turn)?;
     let tmp = path.with_extension("jsonl.tmp");
     fs::write(&tmp, lines.join("\n") + "\n")?;
-    fs::rename(&tmp, &path)
+    fs::rename(&tmp, path)
 }
 
 #[cfg(test)]
@@ -343,6 +373,36 @@ mod tests {
         assert_eq!(corrupt, 1);
         assert_eq!(turns[1].task, "last");
         assert_eq!(turns[1].ledger.len(), 1);
+    }
+
+    #[test]
+    fn amend_turn_targets_indexed_turn_and_rejects_out_of_range() {
+        let cwd = temp_cwd();
+        let id = create(&cwd, "codex", "m").unwrap();
+        append_turn(&cwd, &id, &turn("first")).unwrap();
+        let path = cwd
+            .join(".kode")
+            .join("sessions")
+            .join(format!("{id}.jsonl"));
+        {
+            let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(f, "{{not json").unwrap();
+        }
+        append_turn(&cwd, &id, &turn("second")).unwrap();
+        amend_turn(&cwd, &id, 0, |t| {
+            t.ledger.push(crate::ledger::LedgerEntry::Memory {
+                id: "m1".into(),
+                text: "x".into(),
+                team: false,
+            })
+        })
+        .unwrap();
+        let (turns, corrupt) = load(&cwd, &id).unwrap();
+        assert_eq!(corrupt, 1);
+        assert_eq!(turns[0].ledger.len(), 1);
+        assert!(turns[1].ledger.is_empty());
+        let err = amend_turn(&cwd, &id, 2, |_| {}).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]

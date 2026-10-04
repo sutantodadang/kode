@@ -432,10 +432,18 @@ fn setup_facts(state: &AppState, config: &KodeConfig, cwd: &Path) -> crate::firs
 
 /// Shows the next applicable setup card when nothing else is on screen.
 fn maybe_show_setup_card(state: &mut AppState, config: &KodeConfig, cwd: &Path) {
-    if state.picker.open || state.running || !state.pending.is_empty() {
+    if state.picker.open
+        || state.running
+        || !state.pending.is_empty()
+        || state.composer_has_content()
+    {
+        return;
+    }
+    if !state.setup_dirty {
         return;
     }
     let facts = setup_facts(state, config, cwd);
+    state.setup_dirty = false;
     let Some(card) = crate::first_run::next_card(&facts, &state.setup_skipped) else {
         state.setup_card = None;
         return;
@@ -509,14 +517,25 @@ fn spawn_memory_proposal(
     });
 }
 
+/// A memory that finished saving.
+struct SavedMemory {
+    id: String,
+    text: String,
+    team: bool,
+    /// `state.history` index the memory belongs to; `None` for `/remember`,
+    /// which is not part of any turn.
+    turn: Option<usize>,
+}
+
 /// Saves an approved proposal as a personal or team memory.
 fn spawn_save_memory(
     state: &AppState,
     config: &KodeConfig,
     cwd: &Path,
-    tx: &mpsc::UnboundedSender<Result<(String, String, bool), String>>,
+    tx: &mpsc::UnboundedSender<Result<SavedMemory, String>>,
     proposal: crate::memory_proposal::Proposal,
     team: bool,
+    turn: usize,
 ) {
     let runtime = state.runtime.clone();
     let ingat = config.ingat.clone();
@@ -529,7 +548,12 @@ fn spawn_save_memory(
         let result = match runtime.memory(&ingat).await {
             Ok(Some(backend)) => crate::remember::save_memory(&root, backend.as_ref(), &memory)
                 .await
-                .map(|id| (id, text, team))
+                .map(|id| SavedMemory {
+                    id,
+                    text,
+                    team,
+                    turn: Some(turn),
+                })
                 .map_err(|e| e.to_string()),
             Ok(None) => Err("memory is disabled in config".to_string()),
             Err(e) => Err(e.to_string()),
@@ -543,7 +567,7 @@ fn spawn_save_command_memory(
     state: &AppState,
     config: &KodeConfig,
     cwd: &Path,
-    tx: &mpsc::UnboundedSender<Result<(String, String, bool), String>>,
+    tx: &mpsc::UnboundedSender<Result<SavedMemory, String>>,
     text: String,
     team: bool,
 ) {
@@ -570,7 +594,12 @@ fn spawn_save_command_memory(
         let result = match runtime.memory(&ingat).await {
             Ok(Some(backend)) => crate::remember::save_memory(&root, backend.as_ref(), &memory)
                 .await
-                .map(|id| (id, text, team))
+                .map(|id| SavedMemory {
+                    id,
+                    text,
+                    team,
+                    turn: None,
+                })
                 .map_err(|e| e.to_string()),
             Ok(None) => Err("memory is disabled in config".to_string()),
             Err(e) => Err(e.to_string()),
@@ -902,7 +931,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
 
     let (memory_tx, mut memory_rx) = mpsc::unbounded_channel::<crate::memory_proposal::Proposal>();
     let (memory_saved_tx, mut memory_saved_rx) =
-        mpsc::unbounded_channel::<Result<(String, String, bool), String>>();
+        mpsc::unbounded_channel::<Result<SavedMemory, String>>();
 
     let (git_tx, mut git_rx) = mpsc::unbounded_channel::<RepoState>();
     spawn_git_poll(cwd.to_path_buf(), git_tx.clone());
@@ -971,6 +1000,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
 
     'outer: loop {
         let animating = motion_active(&state, Instant::now());
+        let picker_was_open = state.picker.open;
         tokio::select! {
             biased;
 
@@ -1181,6 +1211,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                             &memory_saved_tx,
                                             proposal,
                                             team,
+                                            state.history.len().saturating_sub(1),
                                         );
                                         continue 'outer;
                                     }
@@ -1345,6 +1376,10 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                             KodeEvent::SteeringDeferred { messages } => Some(messages.clone()),
                             _ => None,
                         };
+                        if matches!(ev, KodeEvent::IndexFinished { .. }) {
+                            // Index prompt state on disk changed.
+                            state.setup_dirty = true;
+                        }
                         apply_event(&mut state, ev);
                         if let Some(messages) = deferred_steering {
                             for message in messages {
@@ -1447,6 +1482,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
             indexed = indexed_rx.recv() => {
                 if let Some(answer) = indexed {
                     state.repo_indexed = answer;
+                    state.setup_dirty = true;
                 }
             }
 
@@ -1459,12 +1495,12 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
             saved = memory_saved_rx.recv() => {
                 if let Some(result) = saved {
                     let text = match &result {
-                        Ok((_, _, true)) => "m ● saved · team".to_string(),
+                        Ok(m) if m.team => "m ● saved · team".to_string(),
                         Ok(_) => "m ● saved".to_string(),
                         Err(e) => format!("memory not saved: {e}"),
                     };
                     state.transcript.push(TranscriptLine::new(Gutter::Ingat, text));
-                    if let (Ok((id, saved_text, team)), Some(session)) =
+                    if let (Ok(SavedMemory { id, text: saved_text, team, turn: Some(index) }), Some(session)) =
                         (result, state.session_id.clone())
                     {
                         let entry = crate::ledger::LedgerEntry::Memory {
@@ -1472,12 +1508,12 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                             text: saved_text,
                             team,
                         };
-                        if let Some(last) = state.history.last_mut() {
-                            last.ledger.push(entry.clone());
+                        if let Some(turn) = state.history.get_mut(index) {
+                            turn.ledger.push(entry.clone());
                         }
-                        if let Err(e) =
-                            crate::session::amend_last_turn(cwd, &session, |t| t.ledger.push(entry))
-                        {
+                        if let Err(e) = crate::session::amend_turn(cwd, &session, index, |t| {
+                            t.ledger.push(entry)
+                        }) {
                             state.transcript.push(TranscriptLine::new(
                                 Gutter::Note,
                                 format!("session amend failed (non-fatal): {e}"),
@@ -1498,6 +1534,10 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
             _ = motion_tick.tick(), if animating => {
                 motion_tick_update(&mut state, Instant::now());
             }
+        }
+
+        if picker_was_open && !state.picker.open {
+            state.setup_dirty = true;
         }
 
         // Sync real terminal mouse capture to `state.select_mode` (Ctrl+T)
@@ -1953,6 +1993,51 @@ mod native_log_tests {
             String::from_utf8_lossy(&log[before as usize..]).contains("file watcher enabled"),
             "zindeks watcher log was not captured"
         );
+    }
+}
+
+#[cfg(test)]
+mod setup_card_tests {
+    use super::*;
+
+    fn idle_state() -> (AppState, KodeConfig, std::path::PathBuf) {
+        let cwd = std::env::temp_dir().join(format!(
+            "kode-setup-card-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let state = AppState::new(String::new(), String::new(), String::new());
+        (state, KodeConfig::default(), cwd)
+    }
+
+    #[test]
+    fn setup_card_waits_while_user_is_typing() {
+        let (mut state, config, cwd) = idle_state();
+        state.input = "half-typed task".to_string();
+        maybe_show_setup_card(&mut state, &config, &cwd);
+        assert!(!state.picker.open);
+        assert!(state.setup_dirty, "typing must not consume the dirty flag");
+    }
+
+    #[test]
+    fn setup_card_skips_disk_reads_when_clean() {
+        let (mut state, config, cwd) = idle_state();
+        state.setup_dirty = false;
+        maybe_show_setup_card(&mut state, &config, &cwd);
+        assert!(!state.picker.open);
+    }
+
+    #[test]
+    fn setup_card_opens_once_when_dirty_and_idle() {
+        let (mut state, config, cwd) = idle_state();
+        maybe_show_setup_card(&mut state, &config, &cwd);
+        assert!(state.picker.open);
+        assert_eq!(state.picker.kind, PickerKind::Setup);
+        assert!(!state.setup_dirty);
     }
 }
 

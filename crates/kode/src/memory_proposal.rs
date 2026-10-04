@@ -138,8 +138,13 @@ pub fn parse_draft(raw: &str) -> Option<String> {
     let line = line
         .trim_matches(|c| c == '"' || c == '\'' || c == '`')
         .trim();
-    let bare = line.trim_end_matches('.').to_ascii_lowercase();
-    if bare == "none" || line.is_empty() || line.chars().count() > REJECT_OVER_CHARS {
+    // `NONE`, `None.`, `NONE - nothing durable` all mean no proposal;
+    // `NONEXISTENT config ...` is a real sentence.
+    let upper = line.to_ascii_uppercase();
+    let is_none = upper
+        .strip_prefix("NONE")
+        .is_some_and(|rest| rest.chars().next().is_none_or(|c| !c.is_alphanumeric()));
+    if is_none || line.is_empty() || line.chars().count() > REJECT_OVER_CHARS {
         return None;
     }
     Some(line.chars().take(MAX_DRAFT_CHARS).collect())
@@ -351,6 +356,13 @@ mod tests {
     fn parse_draft_normalizes() {
         assert_eq!(parse_draft("  NONE "), None);
         assert_eq!(parse_draft("none."), None);
+        assert_eq!(parse_draft("none"), None);
+        assert_eq!(parse_draft("None."), None);
+        assert_eq!(parse_draft("NONE - nothing durable was learned."), None);
+        assert_eq!(
+            parse_draft("NONEXISTENT config breaks builds"),
+            Some("NONEXISTENT config breaks builds".into())
+        );
         assert_eq!(
             parse_draft("\"Run tests serially on Windows.\"\nextra"),
             Some("Run tests serially on Windows.".into())

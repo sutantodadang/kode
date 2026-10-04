@@ -4675,6 +4675,42 @@ fn index_started_then_finished_updates_one_row_in_place() {
 }
 
 #[test]
+fn resume_during_index_does_not_overwrite_replayed_line() {
+    let dir = temp_project_dir();
+    let id = crate::session::create(&dir, "codex", "gpt-test").unwrap();
+    for task in ["first task", "second task"] {
+        crate::session::append_turn(
+            &dir,
+            &id,
+            &crate::session::Turn {
+                ts: "2026-08-17T00:00:00Z".to_string(),
+                task: task.to_string(),
+                images: Vec::new(),
+                response: format!("{task} answer"),
+                tool_calls: 0,
+                ledger: Vec::new(),
+            },
+        )
+        .unwrap();
+    }
+    let mut s = state();
+    apply_event(&mut s, KodeEvent::IndexStarted);
+    assert!(restore_session(&mut s, &dir, &id));
+    let before: Vec<String> = s.transcript.iter().map(|l| l.text.clone()).collect();
+    apply_event(
+        &mut s,
+        KodeEvent::IndexFinished {
+            files: Some(3),
+            error: None,
+            elapsed_ms: 1000,
+        },
+    );
+    let after: Vec<String> = s.transcript.iter().map(|l| l.text.clone()).collect();
+    assert_eq!(after[..before.len()], before[..]);
+    assert_eq!(s.transcript.last().unwrap().text, "✓ indexed 3 files · 1s");
+}
+
+#[test]
 fn index_failure_is_shown_not_hidden() {
     let mut s = state();
     apply_event(&mut s, KodeEvent::IndexStarted);
