@@ -1360,6 +1360,9 @@ pub(crate) fn handle_key(
     modifiers: KeyModifiers,
     current_cancel: &Option<CancellationToken>,
 ) -> bool {
+    if code == KeyCode::Esc && state.why_lines.take().is_some() {
+        return false;
+    }
     if state.shortcuts_open {
         if code == KeyCode::Esc || code == KeyCode::Char('?') {
             state.shortcuts_open = false;

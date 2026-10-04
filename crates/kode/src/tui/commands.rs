@@ -33,6 +33,8 @@ pub enum SlashCommand {
     Map,
     /// `/index` — build or refresh the code index in the background.
     Index,
+    /// `/why [N]` — show a turn's provenance from its ledger.
+    Why(String),
     Help,
     /// `/name [args]` where `name` isn't a builtin. Resolved against
     /// discovered custom commands at handle time (not parse time) — an
@@ -50,7 +52,7 @@ pub enum SlashCommand {
 /// filters them out up front.
 pub const BUILTIN_COMMAND_NAMES: &[&str] = &[
     "model", "effort", "provider", "copy", "resume", "status", "exit", "plan", "image", "router",
-    "map", "index", "help",
+    "map", "index", "why", "help",
 ];
 
 /// The providers `/provider` accepts, in picker display order.
@@ -82,6 +84,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/router", "show or correct the last router decision"),
     ("/map", "show the repo map (graph, 0 tokens)"),
     ("/index", "index this repo in the background"),
+    ("/why", "show where the last answer came from"),
     ("/help", "list commands + shortcuts"),
 ];
 
@@ -142,6 +145,7 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "/router" => SlashCommand::Router(rest.to_string()),
         "/map" => SlashCommand::Map,
         "/index" => SlashCommand::Index,
+        "/why" => SlashCommand::Why(rest.to_string()),
         "/help" => SlashCommand::Help,
         other => {
             let name = other.trim_start_matches('/').to_lowercase();
@@ -634,6 +638,14 @@ pub(crate) fn handle_slash_command(
         }
         SlashCommand::Exit => {}
         SlashCommand::Map | SlashCommand::Index => {}
+        SlashCommand::Why(arg) => match crate::why::parse_turn_arg(&arg, state.history.len()) {
+            Ok(index) => {
+                state.why_lines = Some(crate::why::why_lines(&state.history[index], index + 1))
+            }
+            Err(message) => state
+                .transcript
+                .push(TranscriptLine::new(Gutter::Note, message)),
+        },
         SlashCommand::Router(args) => {
             let lines = if args.trim().is_empty() {
                 crate::router_cmd::describe_last(cwd)

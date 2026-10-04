@@ -1803,6 +1803,23 @@ fn draw_sheet(f: &mut ratatui::Frame, lines: Vec<Line<'static>>) {
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), popup);
 }
 
+/// Fits `/why` into the screen: keeps the header and the "Esc closes"
+/// footer, and marks how many middle rows were cut.
+pub(crate) fn why_sheet_lines(lines: &[String], max_rows: usize) -> Vec<Line<'static>> {
+    let styled = |s: &str| Line::from(s.to_string());
+    if lines.len() <= max_rows || max_rows < 4 {
+        return lines.iter().map(|l| styled(l)).collect();
+    }
+    let keep_top = max_rows - 2;
+    let mut out: Vec<Line<'static>> = lines[..keep_top].iter().map(|l| styled(l)).collect();
+    out.push(styled(&format!(
+        " … {} more rows (enlarge the terminal)",
+        lines.len() - keep_top - 1
+    )));
+    out.push(styled(lines.last().unwrap()));
+    out
+}
+
 pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
     state.input_columns = f.area().width.saturating_sub(4).max(1) as usize;
     let mut focus_lines = if state.ledger_open {
@@ -2070,7 +2087,10 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
 
     draw_input(f, input_area, state);
 
-    if state.picker.open {
+    if let Some(lines) = &state.why_lines {
+        let max_rows = f.area().height.saturating_sub(4) as usize;
+        draw_sheet(f, why_sheet_lines(lines, max_rows));
+    } else if state.picker.open {
         draw_picker(f, &state.picker);
     } else if state.shortcuts_open {
         draw_sheet(f, shortcut_sheet_lines(state));

@@ -29,6 +29,7 @@ mod training;
 mod tui;
 mod update;
 mod verify;
+mod why;
 
 use clap::Parser;
 use kode_core::{CancellationToken, cancel_on_ctrl_c};

@@ -521,6 +521,8 @@ pub struct AppState {
     pub completion: Option<CompletionReceipt>,
     /// Set after a graph answer; Enter on an empty composer re-asks the model.
     pub(crate) graph_offer: Option<UserInput>,
+    /// `/why` overlay lines, drawn until Esc closes them.
+    pub why_lines: Option<Vec<String>>,
     /// Last terminal agent error, rendered as a recovery surface until the
     /// user begins composing again.
     pub last_error: Option<String>,
@@ -652,6 +654,7 @@ impl AppState {
             setup_card: None,
             completion: None,
             graph_offer: None,
+            why_lines: None,
             last_error: None,
             shortcuts_open: false,
             attachments_open: false,
@@ -735,6 +738,7 @@ impl AppState {
         self.ledger_recorder.begin();
         self.completion = None;
         self.graph_offer = None;
+        self.why_lines = None;
         self.last_error = None;
         self.shortcuts_open = false;
         self.attachments_open = false;

@@ -4729,6 +4729,17 @@ fn lmstudio_counts_as_logged_in() {
 }
 
 #[test]
+fn why_sheet_keeps_footer_when_cut() {
+    let lines: Vec<String> = (0..30)
+        .map(|i| format!("row {i}"))
+        .chain([" Esc closes".to_string()])
+        .collect();
+    let out = why_sheet_lines(&lines, 10);
+    assert_eq!(out.len(), 10);
+    assert_eq!(out.last().unwrap().spans[0].content, " Esc closes");
+}
+
+#[test]
 fn graph_answered_shows_receipt_and_offers_model() {
     let mut s = state();
     s.start_new_task("who calls append_turn", false);
