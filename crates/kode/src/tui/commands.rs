@@ -40,6 +40,10 @@ pub enum SlashCommand {
         team: bool,
         text: String,
     },
+    /// `/receipt [all]` — copy a shareable receipt.
+    Receipt(String),
+    /// `/onboard` — tour this repo: map, team decisions, start points.
+    Onboard,
     Help,
     /// `/name [args]` where `name` isn't a builtin. Resolved against
     /// discovered custom commands at handle time (not parse time) — an
@@ -57,7 +61,7 @@ pub enum SlashCommand {
 /// filters them out up front.
 pub const BUILTIN_COMMAND_NAMES: &[&str] = &[
     "model", "effort", "provider", "copy", "resume", "status", "exit", "plan", "image", "router",
-    "map", "index", "why", "remember", "help",
+    "map", "index", "why", "remember", "receipt", "onboard", "help",
 ];
 
 /// The providers `/provider` accepts, in picker display order.
@@ -91,6 +95,11 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/index", "index this repo in the background"),
     ("/why", "show where the last answer came from"),
     ("/remember", "save an engineering memory (--team to share)"),
+    ("/receipt", "copy a shareable receipt (all = whole session)"),
+    (
+        "/onboard",
+        "tour this repo: map, team decisions, start points",
+    ),
     ("/help", "list commands + shortcuts"),
 ];
 
@@ -159,6 +168,8 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
             };
             SlashCommand::Remember { team, text }
         }
+        "/receipt" => SlashCommand::Receipt(rest.to_string()),
+        "/onboard" => SlashCommand::Onboard,
         "/help" => SlashCommand::Help,
         other => {
             let name = other.trim_start_matches('/').to_lowercase();
@@ -571,6 +582,37 @@ pub(crate) fn commit_model_selection(
 /// through the exact same path a typed non-slash prompt takes. Every other
 /// variant returns `None`; its side effects (state/config mutation,
 /// transcript notes, picker opens) are applied in place.
+/// Copies a shareable receipt for the last turn (or the whole session) to
+/// the clipboard. Never includes personal memories.
+pub(crate) fn handle_receipt(state: &mut AppState, arg: &str) {
+    if state.history.is_empty() {
+        state
+            .transcript
+            .push(TranscriptLine::new(Gutter::Note, "no completed turns yet"));
+        return;
+    }
+    let turns: Vec<crate::session::Turn> = if arg.trim() == "all" {
+        state.history.clone()
+    } else {
+        vec![state.history.last().unwrap().clone()]
+    };
+    let meta = crate::receipt::ReceiptMeta {
+        session: state
+            .session_id
+            .clone()
+            .unwrap_or_else(|| "unsaved".to_string()),
+        model: Some(state.status.model.clone()).filter(|m| !m.is_empty()),
+    };
+    let body = crate::receipt::markdown(&turns, &meta, false);
+    let note = match super::run::copy_to_clipboard(&body) {
+        Ok(n) => format!("receipt copied ({n} chars)"),
+        Err(()) => "no clipboard tool found — use `kode receipt` instead".to_string(),
+    };
+    state
+        .transcript
+        .push(TranscriptLine::new(Gutter::Note, note));
+}
+
 pub(crate) fn handle_slash_command(
     state: &mut AppState,
     cwd: &Path,
@@ -652,6 +694,8 @@ pub(crate) fn handle_slash_command(
         SlashCommand::Exit => {}
         SlashCommand::Map | SlashCommand::Index => {}
         SlashCommand::Remember { .. } => {}
+        SlashCommand::Receipt(arg) => handle_receipt(state, &arg),
+        SlashCommand::Onboard => {}
         SlashCommand::Why(arg) => match crate::why::parse_turn_arg(&arg, state.history.len()) {
             Ok(index) => {
                 state.why_lines = Some(crate::why::why_lines(&state.history[index], index + 1))

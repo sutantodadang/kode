@@ -17,14 +17,14 @@ const GENERIC: &[&str] = &[
 ];
 const PER_ROW: usize = 3;
 
-fn is_noise(s: &ArchSymbol) -> bool {
+pub(crate) fn is_noise(s: &ArchSymbol) -> bool {
     GENERIC.contains(&s.name.as_str())
         || s.file.ends_with("tests.rs")
         || s.file.contains("/tests/")
         || s.name.starts_with("test_")
 }
 
-fn file_name(path: &str) -> &str {
+pub(crate) fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 

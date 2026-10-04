@@ -579,6 +579,19 @@ fn spawn_save_command_memory(
     });
 }
 
+/// Zero-token repo tour: map, start points, grouped team memory.
+fn spawn_onboard(state: &AppState, config: &KodeConfig, cwd: &Path, events: &EventBus) {
+    let runtime = state.runtime.clone();
+    let cfg = config.zindeks.clone();
+    let root = cwd.to_path_buf();
+    let events = events.clone();
+    tokio::spawn(async move {
+        for ev in crate::onboard::onboard_events(&runtime, &cfg, &root).await {
+            events.emit(ev);
+        }
+    });
+}
+
 /// Renders the repo map into the transcript via the shared event bus.
 fn spawn_repo_map(state: &AppState, config: &KodeConfig, cwd: &Path, events: &EventBus) {
     let runtime = state.runtime.clone();
@@ -1031,6 +1044,8 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                                     spawn_repo_map(&state, &config, cwd, &events);
                                                 } else if name == "/index" {
                                                     spawn_background_index(&mut state, &config, cwd, &events);
+                                                } else if name == "/onboard" {
+                                                    spawn_onboard(&state, &config, cwd, &events);
                                                 } else if let Some(command) = parse_slash_command(name) {
                                                     handle_slash_command(&mut state, cwd, &mut config, &picker_tx, command);
                                                 }
@@ -1236,6 +1251,10 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                     }
                                     if matches!(command.as_ref(), Some(SlashCommand::Index)) {
                                         spawn_background_index(&mut state, &config, cwd, &events);
+                                        continue 'outer;
+                                    }
+                                    if matches!(command.as_ref(), Some(SlashCommand::Onboard)) {
+                                        spawn_onboard(&state, &config, cwd, &events);
                                         continue 'outer;
                                     }
                                     if let Some(SlashCommand::Remember { team, text }) = command.as_ref() {

@@ -4762,6 +4762,21 @@ fn proposal() -> crate::memory_proposal::Proposal {
 }
 
 #[test]
+fn receipt_command_parses_and_needs_a_turn() {
+    assert_eq!(
+        parse_slash_command("/receipt all"),
+        Some(SlashCommand::Receipt("all".into()))
+    );
+    let mut s = state();
+    handle_receipt(&mut s, "");
+    assert!(
+        s.transcript
+            .iter()
+            .any(|l| l.text == "no completed turns yet")
+    );
+}
+
+#[test]
 fn offer_row_and_now_line() {
     let mut s = state();
     offer_memory(&mut s, proposal());

@@ -17,7 +17,9 @@ mod memory_backend;
 mod memory_import;
 mod memory_proposal;
 mod models;
+mod onboard;
 mod pipeline;
+mod receipt;
 mod remember;
 mod repo_map;
 mod router_cmd;
@@ -103,6 +105,30 @@ enum Command {
     Index,
     /// Run diagnostic checks across config, LLM, zindeks, Ingat, git, and env.
     Doctor,
+    /// Print a shareable receipt for a session (markdown, or git trailers).
+    Receipt {
+        /// Session id (default: latest).
+        #[arg(long)]
+        session: Option<String>,
+        /// 1-based turn number (default: all turns).
+        #[arg(long)]
+        turn: Option<usize>,
+        /// Post as a comment on the current branch's pull request via `gh`.
+        #[arg(long, conflicts_with = "trailer")]
+        pr: bool,
+        /// Print git trailers instead of markdown.
+        #[arg(long)]
+        trailer: bool,
+        /// Include personal (non-team) memories.
+        #[arg(long)]
+        include_personal: bool,
+    },
+    /// Zero-token tour of this repo: code map, team decisions, where to start.
+    Onboard {
+        /// Also ask the model to narrate the tour (costs tokens; labeled).
+        #[arg(long)]
+        explain: bool,
+    },
     /// Install/bootstrap the zindeks and Ingat engines (consent-gated).
     Setup {
         /// Skip confirmation prompts and proceed with all installs.
@@ -303,6 +329,20 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Doctor) => {
             let cwd = std::env::current_dir()?;
             doctor::run(&cwd).await?;
+        }
+        Some(Command::Receipt {
+            session,
+            turn,
+            pr,
+            trailer,
+            include_personal,
+        }) => {
+            let cwd = std::env::current_dir()?;
+            receipt::run(&cwd, session, turn, pr, trailer, include_personal).await?;
+        }
+        Some(Command::Onboard { explain }) => {
+            let cwd = std::env::current_dir()?;
+            onboard::run(&cwd, explain).await?;
         }
         Some(Command::Update { yes }) => {
             update::run(yes).await?;
