@@ -65,6 +65,18 @@ prints the entry count and how many lines failed to parse (corrupt lines are ski
 
 Personal memories (the default, no `--team`) never touch this file and stay local to your machine.
 
+## Proposed memories
+
+Kode can notice a memorable moment and offer to save it, so you don't have to remember to run `kode remember`. Deterministic triggers decide when: a check failed then passed after a fix, an earlier change was reverted, the user steered the agent, or the same tool failed twice with the same error. Only then does Kode make one small model request to draft a sentence; the draft must pass the same policy gate and a near-duplicate check against Ingat.
+
+In the TUI, after the turn's receipt, a `◇ remember? "…"` row appears:
+
+- `Enter` saves a personal memory; `Tab` saves it as team memory (same `.kode/memory/team.jsonl` path as `--team`).
+- `Ctrl+E` puts `/remember <draft>` in the composer for editing.
+- `Esc` skips; typing a new prompt also skips.
+
+Saved proposals are stored as user-approved (`explicit-user`) with the `kode:proposed` tag, and shown under `MEMORY` in `/why`. Configure with `[memory] propose` (default `true`); `kode exec` only proposes with `--propose-memory` (and saves with `--save-memory`).
+
 ## What's not built yet
 
 Team memory currently only flows one direction into your local Ingat (import). There's no `kode export`, no hosted server, and no way to un-share a memory once it's committed — treat the file the way you'd treat any other committed text: removing a line from a future commit doesn't erase it from git history.

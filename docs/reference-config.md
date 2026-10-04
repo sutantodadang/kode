@@ -65,6 +65,19 @@ enabled = true
 # store_path = "/custom/memory.sqlite3"
 ```
 
+## `[memory]`
+
+Kode-side memory behavior (the store itself is `[ingat]`).
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `propose` | bool | `true` | Offer to remember memorable moments after a turn in the TUI. `kode exec` only proposes with `--propose-memory`. |
+
+```toml
+[memory]
+propose = true
+```
+
 ## `[agent]`
 
 | Key | Type | Default | Effect |

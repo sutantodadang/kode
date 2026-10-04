@@ -30,6 +30,13 @@ minor versions may contain breaking changes).
 - Targeted verification: graph-selected tests run first (`[verify] targeted`,
   default `"first"`), with the full suite honestly reported as Skipped when
   it does not run.
+- Memory proposals: after a turn with a memorable moment (fixed after a
+  failed check, reverted approach, user steering, repeated tool failure),
+  the TUI offers `◇ remember? "…"` — `Enter` saves, `Tab` saves to team,
+  `Ctrl+E` edits, `Esc` skips. Saved with the `kode:proposed` tag and shown
+  under `MEMORY` in `/why`. `[memory] propose` (default `true`) controls it;
+  `kode exec` gains `--propose-memory` and `--save-memory`.
+- `/remember [--team] <text>`: save an engineering memory from the TUI.
 
 ### Changed
 

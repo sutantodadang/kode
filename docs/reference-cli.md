@@ -83,6 +83,8 @@ Run an agentic task against the configured model, non-interactively.
 | `-c`, `--continue` | Send prior session turns as history and append this task to that session, instead of starting fresh. |
 | `--plan` | Plan first: the model produces a numbered plan (no tools) and Kode asks `execute this plan? [y/N]` before running the task. Answering `N` exits without running it. |
 | `--no-graph-answer` | Always use the model, never answer a structural question from the code graph alone. Use it when a script needs a consistent output shape. |
+| `--propose-memory` | After the task, draft a memory if a memorable moment occurred; print `◇ remember? "…"` to stderr. |
+| `--save-memory` | Save the drafted memory (personal) without asking. Requires `--propose-memory`. |
 | `--image <PATH>` | Attach a PNG, JPEG, GIF, or WebP image. Repeat the flag to attach more than one image. |
 
 Examples:
@@ -237,6 +239,7 @@ Available inside the interactive `kode` TUI, with a live hint menu as you type `
 | `/map` | Show a zero-token repo map (totals, core orchestrators, hot symbols) from the code graph. |
 | `/index` | Build or refresh the code index in the background; tasks submitted while it runs say `graph warming`. |
 | `/why [N]` | Show where a turn's answer came from (route, graph/memory/git facts, changes, checks, cost) from its persisted ledger. Defaults to the last turn. |
+| `/remember [--team] <text>` | Save an engineering memory directly; `--team` shares it via `.kode/memory/team.jsonl`. |
 | `/help` | Show available commands and shortcuts. |
 | `/exit` | Exit Kode. |
 | `/name [args]` | Custom command — expands the `.kode/commands/name.md` or `~/.kode/commands/name.md` template and submits it as a task. See [howto-custom-commands.md](./howto-custom-commands.md). |
