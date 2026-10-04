@@ -22,6 +22,8 @@ pub struct MockCodeIntelligence {
     pub architecture: Option<ArchitectureSummary>,
     pub symbols: Vec<GraphSymbol>,
     pub trace_nodes: Vec<TraceNode>,
+    /// When set, `refresh` returns `Err(Unavailable)` with this message.
+    pub refresh_error: Option<String>,
 }
 
 impl Default for MockCodeIntelligence {
@@ -49,6 +51,7 @@ impl Default for MockCodeIntelligence {
             architecture: None,
             symbols: Vec::new(),
             trace_nodes: Vec::new(),
+            refresh_error: None,
         }
     }
 }
@@ -83,29 +86,34 @@ impl CodeIntelligence for MockCodeIntelligence {
             .ok_or_else(|| IntelError::Unavailable("no architecture scripted".to_string()))
     }
 
-    async fn symbols(&self, name_pattern: &str, _limit: u32) -> Result<Vec<GraphSymbol>> {
-        if name_pattern.contains('%') {
-            return Ok(self.symbols.clone());
-        }
+    async fn exact_symbols(&self, name: &str, path: Option<&str>) -> Result<Vec<GraphSymbol>> {
+        let path = path.map(|p| p.replace('\\', "/").trim_start_matches("./").to_string());
         Ok(self
             .symbols
             .iter()
-            .filter(|s| s.name == name_pattern)
+            .filter(|s| s.name == name && path.as_ref().is_none_or(|p| &s.path == p))
             .cloned()
             .collect())
     }
 
-    async fn trace(
+    async fn trace_ids(
         &self,
-        _symbol: &str,
+        _ids: &[i64],
         _direction: crate::types::TraceDirection,
         depth: u32,
     ) -> Result<Vec<TraceNode>> {
         Ok(self
             .trace_nodes
             .iter()
-            .filter(|n| n.depth <= depth)
+            .filter(|n| n.depth >= 1 && n.depth <= depth)
             .cloned()
             .collect())
+    }
+
+    async fn refresh(&self) -> Result<()> {
+        match &self.refresh_error {
+            Some(message) => Err(IntelError::Unavailable(message.clone())),
+            None => Ok(()),
+        }
     }
 }

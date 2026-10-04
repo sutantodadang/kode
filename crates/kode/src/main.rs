@@ -29,6 +29,7 @@ mod session_runtime;
 mod setup;
 mod status;
 mod team_memory;
+mod test_symbols;
 mod trainer;
 mod training;
 mod tui;

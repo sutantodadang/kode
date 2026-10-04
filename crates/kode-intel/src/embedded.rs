@@ -198,6 +198,14 @@ impl EmbeddedZindeks {
             .map_err(|_| IntelError::Unavailable("zindeks engine dropped the reply".to_string()))?
     }
 
+    /// Runs a read-only SQL `query_graph` (max 200 rows) and returns its rows.
+    async fn query_rows(&self, sql: String) -> Result<Vec<Value>> {
+        let text = self
+            .tool_call_text("query_graph", json!({"query": sql, "limit": 200}))
+            .await?;
+        mapping::rows_from_value(&mapping::parse_tool_json(&text)?)
+    }
+
     /// Runs one `tools/call` on the engine thread and returns its text.
     async fn tool_call_text(&self, name: &str, arguments: Value) -> Result<String> {
         let request = json!({
@@ -283,31 +291,75 @@ impl CodeIntelligence for EmbeddedZindeks {
         )?))
     }
 
-    async fn symbols(&self, name_pattern: &str, limit: u32) -> Result<Vec<GraphSymbol>> {
-        let text = self
-            .tool_call_text(
-                "search_graph",
-                json!({"name_pattern": name_pattern, "limit": limit}),
-            )
-            .await?;
-        Ok(mapping::symbols_from_value(&mapping::parse_tool_json(
-            &text,
-        )?))
+    async fn exact_symbols(&self, name: &str, path: Option<&str>) -> Result<Vec<GraphSymbol>> {
+        let mut sql = format!(
+            "SELECT s.id AS id, s.name AS name, s.kind AS kind, REPLACE(d.path, char(92), '/') AS path, s.line_start AS line_start, s.line_end AS line_end, (SELECT COUNT(*) FROM edges e WHERE e.edge_type = 'calls' AND (e.target_symbol_id = s.id OR e.source_symbol_id = s.id)) AS degree FROM symbols s JOIN documents d ON d.id = s.document_id WHERE s.name = {}",
+            sql_str(name)
+        );
+        if let Some(path) = path {
+            let path = path.replace('\\', "/");
+            let path = path.trim_start_matches("./");
+            sql.push_str(&format!(
+                " AND REPLACE(d.path, char(92), '/') = {}",
+                sql_str(path)
+            ));
+        }
+        sql.push_str(" ORDER BY degree DESC, path");
+        let rows = self.query_rows(sql).await?;
+        Ok(rows
+            .iter()
+            .filter_map(mapping::graph_symbol_from_row)
+            .collect())
     }
 
-    async fn trace(
+    async fn trace_ids(
         &self,
-        symbol: &str,
+        ids: &[i64],
         direction: TraceDirection,
         depth: u32,
     ) -> Result<Vec<TraceNode>> {
-        let text = self
-            .tool_call_text(
-                "trace_call_path",
-                json!({"name": symbol, "direction": direction.as_str(), "max_depth": depth}),
-            )
-            .await?;
-        Ok(mapping::trace_from_value(&mapping::parse_tool_json(&text)?))
+        let (from, to) = match direction {
+            TraceDirection::Inbound => ("target_symbol_id", "source_symbol_id"),
+            TraceDirection::Outbound => ("source_symbol_id", "target_symbol_id"),
+        };
+        let mut visited: std::collections::HashSet<i64> = ids.iter().copied().collect();
+        let mut frontier: Vec<i64> = ids.to_vec();
+        let mut out: Vec<TraceNode> = Vec::new();
+        for d in 1..=depth {
+            if frontier.is_empty() || out.len() >= 500 {
+                break;
+            }
+            let mut next = Vec::new();
+            // ponytail: each query is capped at 200 rows by the engine, so a
+            // very wide level can be truncated.
+            for chunk in frontier.chunks(200) {
+                let list = chunk
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "SELECT DISTINCT s.id AS id, s.name AS name, s.kind AS kind, REPLACE(d.path, char(92), '/') AS path, s.line_start AS line_start FROM edges e JOIN symbols s ON s.id = e.{to} JOIN documents d ON d.id = s.document_id WHERE e.edge_type = 'calls' AND e.{from} IN ({list})"
+                );
+                for row in self.query_rows(sql).await? {
+                    if let Some(node) = mapping::trace_node_from_row(&row, d)
+                        && visited.insert(node.id)
+                    {
+                        next.push(node.id);
+                        out.push(node);
+                    }
+                }
+            }
+            out.truncate(500);
+            frontier = next;
+        }
+        Ok(out)
+    }
+
+    async fn refresh(&self) -> Result<()> {
+        self.tool_call_text("update_index", json!({}))
+            .await
+            .map(|_| ())
     }
 
     async fn ensure_bound(&self) -> Result<()> {
@@ -500,6 +552,11 @@ impl Drop for OwnedBuffer<'_> {
         // SAFETY: `buf` was produced by this library's open/request.
         unsafe { (self.symbols.buffer_free)(&mut self.buf) };
     }
+}
+
+/// Quotes `s` as a SQL string literal.
+fn sql_str(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 /// Formats a path for zindeks tool arguments. Forward slashes are accepted on

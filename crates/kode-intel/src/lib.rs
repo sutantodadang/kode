@@ -39,22 +39,32 @@ pub trait CodeIntelligence: Send + Sync {
         ))
     }
 
-    /// Symbols whose name matches the SQL LIKE `name_pattern`.
-    async fn symbols(&self, _name_pattern: &str, _limit: u32) -> Result<Vec<GraphSymbol>> {
+    /// Exact-name symbol matches, optionally only in repo-relative `path`
+    /// (`/`-separated). Sorted by degree descending then path; at most 200.
+    async fn exact_symbols(&self, _name: &str, _path: Option<&str>) -> Result<Vec<GraphSymbol>> {
         Err(IntelError::Tool(
-            "symbols is not supported by this backend".to_string(),
+            "exact_symbols is not supported by this backend".into(),
         ))
     }
 
-    /// BFS over the call graph from `symbol` to `depth`.
-    async fn trace(
+    /// BFS over `calls` edges from the given symbol ids. Returns nodes at
+    /// depth 1..=`depth` (roots excluded), each symbol once at its minimum
+    /// depth, at most 500 nodes.
+    async fn trace_ids(
         &self,
-        _symbol: &str,
+        _ids: &[i64],
         _direction: TraceDirection,
         _depth: u32,
     ) -> Result<Vec<TraceNode>> {
         Err(IntelError::Tool(
-            "trace is not supported by this backend".to_string(),
+            "trace_ids is not supported by this backend".into(),
+        ))
+    }
+
+    /// Apply on-disk changes to the index incrementally.
+    async fn refresh(&self) -> Result<()> {
+        Err(IntelError::Tool(
+            "refresh is not supported by this backend".into(),
         ))
     }
 

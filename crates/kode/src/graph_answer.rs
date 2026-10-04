@@ -2,8 +2,12 @@
 //! router is confident. Every miss is an `Err(reason)` the caller turns
 //! into a sourced note before falling back to the model.
 
+use std::path::Path;
+
 use kode_intel::{CodeIntelligence, GraphSymbol, TraceDirection, TraceNode};
 use kode_local::route::RouteDecision;
+
+use crate::test_symbols::TestClassifier;
 
 const MAX_LIST: usize = 15;
 const MAX_DEFS: usize = 5;
@@ -104,37 +108,21 @@ pub fn candidates(task: &str) -> Vec<String> {
     out
 }
 
-/// First candidate with an exact-name match; among same-named symbols the
-/// highest graph degree wins.
+/// First candidate with an exact-name match, with ALL its rows (highest
+/// degree first); the caller decides what to do with ambiguity.
 pub async fn resolve_symbol(
     intel: &dyn CodeIntelligence,
     candidates: &[String],
-) -> Option<GraphSymbol> {
+) -> Option<(String, Vec<GraphSymbol>)> {
     for name in candidates {
-        let Ok(rows) = intel.symbols(name, 20).await else {
+        let Ok(rows) = intel.exact_symbols(name, None).await else {
             continue;
         };
-        if let Some(best) = rows
-            .into_iter()
-            .filter(|r| &r.name == name)
-            .max_by_key(|r| r.degree)
-        {
-            return Some(best);
+        if !rows.is_empty() {
+            return Some((name.clone(), rows));
         }
     }
     None
-}
-
-pub fn is_test_symbol(name: &str, file: &str) -> bool {
-    let file_name = file.rsplit('/').next().unwrap_or(file);
-    name.starts_with("test_")
-        || name.starts_with("Test")
-        || file.contains("/tests/")
-        || file.starts_with("tests/")
-        || file_name == "tests.rs"
-        || file_name.ends_with("_test.go")
-        || file_name.ends_with("_test.py")
-        || (file_name.starts_with("test_") && file_name.ends_with(".py"))
 }
 
 fn file_name(path: &str) -> &str {
@@ -168,6 +156,7 @@ pub async fn answer(
     intel: &dyn CodeIntelligence,
     query: GraphQuery,
     task: &str,
+    root: &Path,
 ) -> Result<GraphAnswer, String> {
     if query == GraphQuery::Structure {
         let arch = intel.architecture(10).await.map_err(|e| e.to_string())?;
@@ -181,19 +170,25 @@ pub async fn answer(
             text,
         });
     }
-    let symbol = resolve_symbol(intel, &candidates(task))
+    let (name, rows) = resolve_symbol(intel, &candidates(task))
         .await
         .ok_or_else(|| "no known symbol in the prompt".to_string())?;
-    let name = symbol.name.clone();
+    if query != GraphQuery::Definition && rows.len() > 1 {
+        return Err(format!(
+            "`{name}` names {} symbols; ask about one by file",
+            rows.len()
+        ));
+    }
     let (facts, heading) = match query {
         GraphQuery::Definition => {
-            let rows = intel.symbols(&name, 20).await.map_err(|e| e.to_string())?;
-            let facts: Vec<String> = rows
+            let mut facts: Vec<String> = rows
                 .iter()
-                .filter(|r| r.name == name)
                 .take(MAX_DEFS)
                 .map(|r| format!("{} · {} · {}:{}", r.name, r.kind, r.path, r.line))
                 .collect();
+            if rows.len() > MAX_DEFS {
+                facts.push(format!("+{} more", rows.len() - MAX_DEFS));
+            }
             (facts, format!("Definition of {name}:"))
         }
         GraphQuery::Callers | GraphQuery::Callees => {
@@ -203,7 +198,7 @@ pub async fn answer(
                 TraceDirection::Outbound
             };
             let nodes = intel
-                .trace(&name, direction, 1)
+                .trace_ids(&[rows[0].id], direction, 1)
                 .await
                 .map_err(|e| e.to_string())?;
             let arrow = if direction == TraceDirection::Inbound {
@@ -226,25 +221,32 @@ pub async fn answer(
                     } else {
                         "Callees"
                     },
-                    symbol.path
+                    rows[0].path
                 ),
             )
         }
         GraphQuery::Impact => {
             let nodes = intel
-                .trace(&name, TraceDirection::Inbound, 3)
+                .trace_ids(&[rows[0].id], TraceDirection::Inbound, 3)
                 .await
                 .map_err(|e| e.to_string())?;
+            let mut classifier = TestClassifier::new(root);
+            let is_test: Vec<bool> = nodes
+                .iter()
+                .map(|n| classifier.is_test(&n.name, &n.file, n.line))
+                .collect();
             let tests = nodes
                 .iter()
-                .filter(|n| n.depth > 0 && is_test_symbol(&n.name, &n.file))
+                .zip(&is_test)
+                .filter(|(n, t)| n.depth > 0 && **t)
                 .count();
             let mut facts: Vec<String> = (1..=3)
                 .filter_map(|d| {
-                    let at: Vec<String> = listed(&nodes, d)
+                    let at: Vec<String> = nodes
                         .iter()
-                        .filter(|n| !is_test_symbol(&n.name, &n.file))
-                        .map(|n| n.name.clone())
+                        .zip(&is_test)
+                        .filter(|(n, t)| n.depth == d && !**t)
+                        .map(|(n, _)| n.name.clone())
                         .collect();
                     (!at.is_empty()).then(|| {
                         let shown: Vec<String> = at.iter().take(MAX_LIST).cloned().collect();
@@ -261,7 +263,10 @@ pub async fn answer(
             if tests > 0 {
                 facts.push(format!("covered by {tests} tests"));
             }
-            (facts, format!("Changing {name} ({}) affects:", symbol.path))
+            (
+                facts,
+                format!("Changing {name} ({}) affects:", rows[0].path),
+            )
         }
         GraphQuery::Structure => unreachable!("handled above"),
     };
@@ -315,13 +320,26 @@ mod tests {
         }
     }
 
-    fn sym(name: &str, path: &str, degree: u32) -> GraphSymbol {
+    fn sym(id: i64, name: &str, path: &str, degree: u32) -> GraphSymbol {
         GraphSymbol {
+            id,
             name: name.into(),
             kind: "function".into(),
             path: path.into(),
             line: 10,
+            line_end: 20,
             degree,
+        }
+    }
+
+    fn tnode(id: i64, name: &str, file: &str, line: u32, depth: u32) -> TraceNode {
+        TraceNode {
+            id,
+            name: name.into(),
+            kind: "function".into(),
+            file: file.into(),
+            line,
+            depth,
         }
     }
 
@@ -362,17 +380,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_prefers_exact_highest_degree() {
+    async fn resolve_returns_all_exact_rows() {
         let mock = MockCodeIntelligence {
             symbols: vec![
-                sym("new", "crates/a.rs", 3),
-                sym("new", "crates/b.rs", 40),
-                sym("newer", "crates/c.rs", 99),
+                sym(1, "new", "crates/a.rs", 3),
+                sym(2, "new", "crates/b.rs", 40),
+                sym(3, "newer", "crates/c.rs", 99),
             ],
             ..Default::default()
         };
-        let got = resolve_symbol(&mock, &["new".to_string()]).await.unwrap();
-        assert_eq!(got.path, "crates/b.rs");
+        let (name, rows) = resolve_symbol(&mock, &["new".to_string()]).await.unwrap();
+        assert_eq!(name, "new");
+        assert_eq!(rows.len(), 2);
     }
 
     #[tokio::test]
@@ -386,28 +405,99 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn callers_answer_lists_depth_one_nodes() {
+    async fn exact_symbol_among_many_substring_matches_still_answers() {
+        let mut symbols: Vec<GraphSymbol> = (0..40)
+            .map(|n| sym(100 + n, &format!("append_turn_{n:02}"), "x.rs", 0))
+            .collect();
+        symbols.push(sym(1, "append_turn", "crates/kode/src/session.rs", 13));
         let mock = MockCodeIntelligence {
-            symbols: vec![sym("append_turn", "crates/kode/src/session.rs", 13)],
-            trace_nodes: vec![
-                TraceNode {
-                    name: "append_turn".into(),
-                    kind: "function".into(),
-                    file: "crates/kode/src/session.rs".into(),
-                    depth: 0,
-                },
-                TraceNode {
-                    name: "record_completed_turn".into(),
-                    kind: "function".into(),
-                    file: "crates/kode/src/tui/state.rs".into(),
-                    depth: 1,
-                },
-            ],
+            symbols,
+            trace_nodes: vec![tnode(2, "record", "crates/kode/src/tui/state.rs", 5, 1)],
             ..Default::default()
         };
-        let a = answer(&mock, GraphQuery::Callers, "who calls append_turn")
+        let a = answer(
+            &mock,
+            GraphQuery::Callers,
+            "who calls append_turn",
+            Path::new("."),
+        )
+        .await
+        .unwrap();
+        assert_eq!(a.facts, vec!["append_turn ← record (state.rs)"]);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_symbol_falls_back_for_callers_but_lists_definitions() {
+        let mock = MockCodeIntelligence {
+            symbols: vec![
+                sym(1, "new", "crates/a.rs", 3),
+                sym(2, "new", "crates/b.rs", 40),
+            ],
+            trace_nodes: vec![tnode(3, "x", "y.rs", 1, 1)],
+            ..Default::default()
+        };
+        let err = answer(
+            &mock,
+            GraphQuery::Callers,
+            "who calls `new`",
+            Path::new("."),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("names 2 symbols"), "{err}");
+        let def = answer(
+            &mock,
+            GraphQuery::Definition,
+            "where is `new`",
+            Path::new("."),
+        )
+        .await
+        .unwrap();
+        assert_eq!(def.facts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn impact_counts_inline_module_test_as_test() {
+        let root = std::env::temp_dir().join(format!("kode-graph-answer-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("lib.rs"),
+            "fn target() {}\n\n#[cfg(test)]\nmod tests {\n    fn checks() {\n    }\n}\n",
+        )
+        .unwrap();
+        let mock = MockCodeIntelligence {
+            symbols: vec![sym(1, "target", "lib.rs", 1)],
+            trace_nodes: vec![tnode(2, "checks", "lib.rs", 5, 1)],
+            ..Default::default()
+        };
+        let a = answer(&mock, GraphQuery::Impact, "impact of `target`", &root)
             .await
             .unwrap();
+        assert_eq!(a.facts, vec!["covered by 1 tests"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn callers_answer_lists_depth_one_nodes() {
+        let mock = MockCodeIntelligence {
+            symbols: vec![sym(1, "append_turn", "crates/kode/src/session.rs", 13)],
+            trace_nodes: vec![tnode(
+                2,
+                "record_completed_turn",
+                "crates/kode/src/tui/state.rs",
+                9,
+                1,
+            )],
+            ..Default::default()
+        };
+        let a = answer(
+            &mock,
+            GraphQuery::Callers,
+            "who calls append_turn",
+            Path::new("."),
+        )
+        .await
+        .unwrap();
         assert_eq!(a.symbol, "append_turn");
         assert_eq!(
             a.facts,
@@ -422,34 +512,31 @@ mod tests {
     #[tokio::test]
     async fn empty_result_is_a_miss_not_an_answer() {
         let mock = MockCodeIntelligence {
-            symbols: vec![sym("lonely", "x.rs", 0)],
+            symbols: vec![sym(1, "lonely", "x.rs", 0)],
             ..Default::default()
         };
-        let err = answer(&mock, GraphQuery::Callers, "who calls `lonely`")
-            .await
-            .unwrap_err();
+        let err = answer(
+            &mock,
+            GraphQuery::Callers,
+            "who calls `lonely`",
+            Path::new("."),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err, "no callers found for lonely");
     }
 
     #[tokio::test]
     async fn no_symbol_is_a_miss() {
         let mock = MockCodeIntelligence::default();
-        let err = answer(&mock, GraphQuery::Definition, "where is the thing")
-            .await
-            .unwrap_err();
+        let err = answer(
+            &mock,
+            GraphQuery::Definition,
+            "where is the thing",
+            Path::new("."),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err, "no known symbol in the prompt");
-    }
-
-    #[test]
-    fn test_symbol_detection() {
-        assert!(is_test_symbol("test_parse", "src/lib.rs"));
-        assert!(is_test_symbol("parses", "crates/kode/tests/status.rs"));
-        assert!(is_test_symbol("parses", "crates/kode/src/tui/tests.rs"));
-        assert!(is_test_symbol("TestFoo", "pkg/foo_test.go"));
-        assert!(is_test_symbol("check", "tests/test_api.py"));
-        assert!(!is_test_symbol(
-            "execute_task",
-            "crates/kode/src/pipeline.rs"
-        ));
     }
 }

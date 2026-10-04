@@ -4,8 +4,6 @@ use std::collections::BTreeSet;
 
 use kode_intel::{FileOutline, TraceNode};
 
-use crate::graph_answer::is_test_symbol;
-
 const MAX_SYMBOLS: usize = 5;
 const MAX_SITES: usize = 10;
 const CALLABLE: &[&str] = &["function", "method"];
@@ -26,6 +24,27 @@ pub fn changed_range(old: &str, new: &str) -> Option<(u32, u32)> {
     let start = prefix as u32 + 1;
     // Pure insertion changes no old line; anchor on the old line that follows it.
     let end = (a.len() - suffix).max(prefix + 1) as u32;
+    Some((start.min(end), end))
+}
+
+/// Like [`changed_range`] but in NEW-file line coordinates: the lines of
+/// `new` that differ from `old` (a pure deletion anchors on the line that
+/// now follows it).
+pub fn new_range(old: &str, new: &str) -> Option<(u32, u32)> {
+    if old == new {
+        return None;
+    }
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    let prefix = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let suffix = a[prefix..]
+        .iter()
+        .rev()
+        .zip(b[prefix..].iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    let start = prefix as u32 + 1;
+    let end = (b.len() - suffix).max(prefix + 1) as u32;
     Some((start.min(end), end))
 }
 
@@ -88,16 +107,25 @@ fn package_of(file: &str) -> &str {
     }
 }
 
-pub fn summarize(file: &str, symbol: &str, nodes: &[TraceNode]) -> Impact {
+pub fn summarize(
+    file: &str,
+    symbol: &str,
+    nodes: &[TraceNode],
+    is_test: &mut dyn FnMut(&TraceNode) -> bool,
+) -> Impact {
+    let flags: Vec<bool> = nodes.iter().map(is_test).collect();
     let callers: Vec<&TraceNode> = nodes
         .iter()
-        .filter(|n| n.depth == 1 && !is_test_symbol(&n.name, &n.file))
+        .zip(&flags)
+        .filter(|(n, t)| n.depth == 1 && !**t)
+        .map(|(n, _)| n)
         .collect();
     let crates: BTreeSet<&str> = callers.iter().map(|n| package_of(&n.file)).collect();
     let tests = nodes
         .iter()
-        .filter(|n| n.depth > 0 && is_test_symbol(&n.name, &n.file))
-        .map(|n| (n.name.clone(), n.file.clone()))
+        .zip(&flags)
+        .filter(|(n, t)| n.depth > 0 && **t)
+        .map(|(n, _)| (n.name.clone(), n.file.clone()))
         .collect();
     Impact {
         file: file.to_string(),
@@ -171,11 +199,26 @@ mod tests {
 
     fn node(name: &str, file: &str, depth: u32) -> TraceNode {
         TraceNode {
+            id: 0,
             name: name.into(),
             kind: "function".into(),
             file: file.into(),
+            line: 1,
             depth,
         }
+    }
+
+    fn by_name(n: &TraceNode) -> bool {
+        crate::test_symbols::is_test_symbol(&n.name, &n.file)
+    }
+
+    #[test]
+    fn new_range_is_in_new_file_coordinates() {
+        let old = "a\nb\nc\nd\n";
+        assert_eq!(new_range(old, "a\nB\nc\nd\n"), Some((2, 2)));
+        assert_eq!(new_range(old, "a\nb\nX\nY\nc\nd\n"), Some((3, 4)));
+        assert_eq!(new_range(old, "a\nd\n"), Some((2, 2)));
+        assert_eq!(new_range(old, old), None);
     }
 
     #[test]
@@ -225,7 +268,12 @@ mod tests {
             node("main", "crates/kode/src/main.rs", 2),
             node("test_end_to_end", "crates/kode/tests/e2e.rs", 3),
         ];
-        let i = summarize("crates/kode-context/src/catalog.rs", "fetch", &nodes);
+        let i = summarize(
+            "crates/kode-context/src/catalog.rs",
+            "fetch",
+            &nodes,
+            &mut by_name,
+        );
         assert_eq!(i.callers, 2); // depth-1, non-test
         assert_eq!(i.crates, 2); // kode, kode-context
         assert_eq!(i.tests.len(), 2);
@@ -240,6 +288,15 @@ mod tests {
                 "compile (crates/kode-context/src/compile.rs)"
             ]
         );
+    }
+
+    #[test]
+    fn summarize_uses_the_closure_for_inline_module_tests() {
+        let nodes = vec![node("checks", "crates/a/src/lib.rs", 1)];
+        let i = summarize("crates/a/src/lib.rs", "f", &nodes, &mut |n| {
+            n.name == "checks"
+        });
+        assert_eq!((i.callers, i.tests.len()), (0, 1));
     }
 
     #[test]

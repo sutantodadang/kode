@@ -63,11 +63,14 @@ pub struct ArchitectureSummary {
 /// A symbol row from zindeks `search_graph`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GraphSymbol {
+    /// Engine symbol id; stable within one index generation.
+    pub id: i64,
     pub name: String,
     pub kind: String,
     /// Repo-relative, forward slashes.
     pub path: String,
     pub line: u32,
+    pub line_end: u32,
     /// `in_degree + out_degree`; used to pick among same-named symbols.
     pub degree: u32,
 }
@@ -87,12 +90,14 @@ impl TraceDirection {
     }
 }
 
-/// One node of a zindeks `trace_call_path` BFS. The root has depth 0.
+/// One node of a call-graph BFS (roots excluded; depth starts at 1).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraceNode {
+    pub id: i64,
     pub name: String,
     pub kind: String,
     pub file: String,
+    pub line: u32,
     pub depth: u32,
 }
 

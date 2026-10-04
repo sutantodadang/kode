@@ -11,6 +11,7 @@ use kode_intel::{CodeIntelligence, TraceDirection};
 use kode_tools::{RequiredPermission, Result, Tool, ToolContext, ToolOutput};
 
 use crate::impact::{self, Impact};
+use crate::test_symbols::TestClassifier;
 
 /// Per-task impact state shared by every decorated tool.
 #[derive(Default, Clone)]
@@ -66,26 +67,53 @@ impl ImpactAwareTool {
         }
     }
 
-    /// Impacts for `range` (lines of the pre-edit file at `rel`).
+    /// Impacts for `range` (lines of the file at `rel`, in the coordinates
+    /// the index currently describes).
     async fn impacts(
         &self,
+        root: &Path,
         rel: &str,
         range: (u32, u32),
         depth: u32,
     ) -> std::result::Result<Vec<Impact>, String> {
+        let rel = index_path(root, rel);
         let outline = self
             .intel
-            .file_outline(rel)
+            .file_outline(&rel)
             .await
             .map_err(|e| e.to_string())?;
+        if outline.symbols.is_empty() && is_code_file(&rel) {
+            return Err(format!("no indexed symbols for {rel}"));
+        }
+        let mut classifier = TestClassifier::new(root);
         let mut out = Vec::new();
         for symbol in impact::changed_symbols(&outline, range) {
-            let nodes = self
+            let rows = self
                 .intel
-                .trace(&symbol, TraceDirection::Inbound, depth)
+                .exact_symbols(&symbol, Some(&rel))
                 .await
                 .map_err(|e| e.to_string())?;
-            out.push(impact::summarize(rel, &symbol, &nodes));
+            let overlapping: Vec<_> = rows
+                .iter()
+                .filter(|r| r.line <= range.1 && r.line_end >= range.0)
+                .collect();
+            let chosen: Vec<_> = if overlapping.is_empty() {
+                rows.iter().collect()
+            } else {
+                overlapping
+            };
+            if chosen.is_empty() {
+                continue;
+            }
+            let ids: Vec<i64> = chosen.iter().map(|r| r.id).collect();
+            let nodes = self
+                .intel
+                .trace_ids(&ids, TraceDirection::Inbound, depth)
+                .await
+                .map_err(|e| e.to_string())?;
+            out.push(impact::summarize(&rel, &symbol, &nodes, &mut |n| {
+                classifier.is_test(&n.name, &n.file, n.line)
+            }));
         }
         Ok(out)
     }
@@ -95,6 +123,32 @@ fn rel_path(args: &serde_json::Value) -> Option<String> {
     args.get("path")
         .and_then(serde_json::Value::as_str)
         .map(|p| p.replace('\\', "/"))
+}
+
+/// Repo-relative, `/`-separated path as the index spells it: absolute paths
+/// under `root` are made relative and leading `./` is dropped.
+fn index_path(root: &Path, raw: &str) -> String {
+    let raw = raw.replace('\\', "/");
+    let p = Path::new(&raw);
+    if p.is_absolute()
+        && let Ok(rel) = p.strip_prefix(root)
+    {
+        return rel.to_string_lossy().replace('\\', "/");
+    }
+    let mut out = raw.as_str();
+    while let Some(rest) = out.strip_prefix("./") {
+        out = rest;
+    }
+    out.to_string()
+}
+
+/// Whether `path` has an extension the indexer extracts symbols from.
+fn is_code_file(path: &str) -> bool {
+    const EXTS: &[&str] = &[
+        "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cc", "cpp", "hpp", "zig",
+    ];
+    path.rsplit_once('.')
+        .is_some_and(|(_, ext)| EXTS.contains(&ext))
 }
 
 fn read(root: &Path, rel: &str) -> Option<String> {
@@ -126,7 +180,11 @@ impl Tool for ImpactAwareTool {
         let old_string = args.get("old_string")?.as_str()?;
         let current = read(&ctx.workspace_root, &rel)?;
         let range = impact::range_of_substring(&current, old_string)?;
-        let impacts = self.impacts(&rel, range, 3).await.ok()?;
+        let _ = self.intel.refresh().await; // best effort: fresh outline
+        let impacts = self
+            .impacts(&ctx.workspace_root, &rel, range, 3)
+            .await
+            .ok()?;
         let rows: Vec<String> = impacts.iter().map(impact::row_text).collect();
         (!rows.is_empty()).then(|| rows.join("\n"))
     }
@@ -141,10 +199,16 @@ impl Tool for ImpactAwareTool {
         let Some(after) = read(&ctx.workspace_root, &rel) else {
             return Ok(output);
         };
-        let Some(range) = impact::changed_range(&before, &after) else {
+        // A refreshed index describes the new file; otherwise fall back to
+        // pre-edit coordinates.
+        let range = match self.intel.refresh().await {
+            Ok(()) => impact::new_range(&before, &after),
+            Err(_) => impact::changed_range(&before, &after),
+        };
+        let Some(range) = range else {
             return Ok(output);
         };
-        match self.impacts(&rel, range, 3).await {
+        match self.impacts(&ctx.workspace_root, &rel, range, 3).await {
             Ok(impacts) => {
                 for i in &impacts {
                     self.events.emit(KodeEvent::Impact {
@@ -167,7 +231,7 @@ impl Tool for ImpactAwareTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kode_intel::{FileOutline, MockCodeIntelligence, OutlineSymbol, TraceNode};
+    use kode_intel::{FileOutline, GraphSymbol, MockCodeIntelligence, OutlineSymbol, TraceNode};
     use kode_tools::tools::{ApplyPatch, WriteFile};
 
     fn workspace() -> std::path::PathBuf {
@@ -190,37 +254,56 @@ mod tests {
         }
     }
 
+    fn gsym(id: i64, name: &str, line: u32, line_end: u32) -> GraphSymbol {
+        GraphSymbol {
+            id,
+            name: name.into(),
+            kind: "function".into(),
+            path: "lib.rs".into(),
+            line,
+            line_end,
+            degree: 1,
+        }
+    }
+
+    fn osym(name: &str, line: u32, line_end: u32) -> OutlineSymbol {
+        OutlineSymbol {
+            name: name.into(),
+            kind: "function".into(),
+            line,
+            line_end,
+        }
+    }
+
+    fn caller_nodes() -> Vec<TraceNode> {
+        vec![
+            TraceNode {
+                id: 10,
+                name: "caller".into(),
+                kind: "function".into(),
+                file: "crates/b/src/x.rs".into(),
+                line: 1,
+                depth: 1,
+            },
+            TraceNode {
+                id: 11,
+                name: "test_fetch".into(),
+                kind: "function".into(),
+                file: "crates/a/src/lib.rs".into(),
+                line: 1,
+                depth: 1,
+            },
+        ]
+    }
+
     fn mock_with_callers() -> MockCodeIntelligence {
         MockCodeIntelligence {
             outline: FileOutline {
                 path: "lib.rs".into(),
-                symbols: vec![OutlineSymbol {
-                    name: "fetch".into(),
-                    kind: "function".into(),
-                    line: 1,
-                    line_end: 3,
-                }],
+                symbols: vec![osym("fetch", 1, 3)],
             },
-            trace_nodes: vec![
-                TraceNode {
-                    name: "fetch".into(),
-                    kind: "function".into(),
-                    file: "crates/a/src/lib.rs".into(),
-                    depth: 0,
-                },
-                TraceNode {
-                    name: "caller".into(),
-                    kind: "function".into(),
-                    file: "crates/b/src/x.rs".into(),
-                    depth: 1,
-                },
-                TraceNode {
-                    name: "test_fetch".into(),
-                    kind: "function".into(),
-                    file: "crates/a/src/lib.rs".into(),
-                    depth: 1,
-                },
-            ],
+            symbols: vec![gsym(1, "fetch", 1, 3)],
+            trace_nodes: caller_nodes(),
             ..Default::default()
         }
     }
@@ -344,5 +427,143 @@ mod tests {
             std::fs::read_to_string(root.join("lib.rs")).unwrap(),
             "fn fetch() {\n    1\n}\n"
         );
+    }
+
+    fn impact_symbols(rx: &mut tokio::sync::broadcast::Receiver<KodeEvent>) -> Vec<String> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|e| match e {
+                KodeEvent::Impact { symbol, .. } => Some(symbol),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn dot_slash_path_still_produces_impact() {
+        let root = workspace();
+        std::fs::write(root.join("lib.rs"), "fn fetch() {\n    1\n}\n").unwrap();
+        let bus = EventBus::new(16);
+        let mut rx = bus.subscribe();
+        let tool = ImpactAwareTool::new(
+            Arc::new(ApplyPatch),
+            Arc::new(mock_with_callers()),
+            bus,
+            ImpactLog::default(),
+        );
+        tool.execute(
+            serde_json::json!({"path": "./lib.rs", "old_string": "    1", "new_string": "    2"}),
+            &ctx(&root),
+        )
+        .await
+        .unwrap();
+        assert_eq!(impact_symbols(&mut rx), vec!["fetch"]);
+    }
+
+    fn three_fn_mock() -> MockCodeIntelligence {
+        MockCodeIntelligence {
+            outline: FileOutline {
+                path: "lib.rs".into(),
+                symbols: vec![osym("a", 5, 7), osym("b", 9, 11), osym("c", 13, 15)],
+            },
+            symbols: vec![
+                gsym(1, "a", 5, 7),
+                gsym(2, "b", 9, 11),
+                gsym(3, "c", 13, 15),
+            ],
+            trace_nodes: caller_nodes(),
+            ..Default::default()
+        }
+    }
+
+    const STALE_FILE: &str =
+        "// 1\n// 2\n// 3\n// 4\nfn a() {\n    1\n}\n\nfn b() {\n    2\n}\n\nfn c() {\n    3\n}\n";
+
+    #[tokio::test]
+    async fn refreshed_outline_matches_new_file_coordinates() {
+        let root = workspace();
+        std::fs::write(root.join("lib.rs"), STALE_FILE).unwrap();
+        let bus = EventBus::new(16);
+        let mut rx = bus.subscribe();
+        let tool = ImpactAwareTool::new(
+            Arc::new(ApplyPatch),
+            Arc::new(three_fn_mock()),
+            bus,
+            ImpactLog::default(),
+        );
+        tool.execute(
+            serde_json::json!({"path": "lib.rs", "old_string": "    2", "new_string": "    22"}),
+            &ctx(&root),
+        )
+        .await
+        .unwrap();
+        assert_eq!(impact_symbols(&mut rx), vec!["b"]);
+    }
+
+    #[tokio::test]
+    async fn refresh_failure_falls_back_to_before_coordinates() {
+        let root = workspace();
+        std::fs::write(root.join("lib.rs"), "fn fetch() {\n    1\n}\n").unwrap();
+        let bus = EventBus::new(16);
+        let mut rx = bus.subscribe();
+        let mock = MockCodeIntelligence {
+            refresh_error: Some("no refresh".into()),
+            ..mock_with_callers()
+        };
+        let tool = ImpactAwareTool::new(
+            Arc::new(ApplyPatch),
+            Arc::new(mock),
+            bus,
+            ImpactLog::default(),
+        );
+        tool.execute(
+            serde_json::json!({"path": "lib.rs", "old_string": "    1", "new_string": "    2"}),
+            &ctx(&root),
+        )
+        .await
+        .unwrap();
+        assert_eq!(impact_symbols(&mut rx), vec!["fetch"]);
+    }
+
+    #[tokio::test]
+    async fn empty_outline_for_code_file_notes_once() {
+        let root = workspace();
+        std::fs::write(root.join("lib.rs"), "a\nb\n").unwrap();
+        let bus = EventBus::new(8);
+        let mut rx = bus.subscribe();
+        let tool = ImpactAwareTool::new(
+            Arc::new(ApplyPatch),
+            Arc::new(MockCodeIntelligence::default()),
+            bus,
+            ImpactLog::default(),
+        );
+        for (old, new) in [("a", "c"), ("b", "d")] {
+            tool.execute(
+                serde_json::json!({"path": "lib.rs", "old_string": old, "new_string": new}),
+                &ctx(&root),
+            )
+            .await
+            .unwrap();
+        }
+        let notes: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|e| match e {
+                KodeEvent::Note { text } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            notes,
+            vec!["impact unavailable: no indexed symbols for lib.rs"]
+        );
+    }
+
+    #[test]
+    fn index_path_normalizes_dot_slash_and_absolute() {
+        let root = std::env::temp_dir().join("repo");
+        let root = root.as_path();
+        assert_eq!(index_path(root, "./a\\b.rs"), "a/b.rs");
+        assert_eq!(index_path(root, "././a.rs"), "a.rs");
+        let abs = root.join("src").join("a.rs");
+        assert_eq!(index_path(root, &abs.to_string_lossy()), "src/a.rs");
+        assert!(is_code_file("x.rs") && !is_code_file("README.md"));
     }
 }

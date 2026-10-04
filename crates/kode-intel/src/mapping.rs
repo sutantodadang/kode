@@ -258,54 +258,54 @@ pub(crate) fn architecture_from_value(v: &Value) -> ArchitectureSummary {
     }
 }
 
-pub(crate) fn symbols_from_value(v: &Value) -> Vec<GraphSymbol> {
-    v.as_array()
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|r| {
-                    let num = |k: &str| r.get(k).and_then(Value::as_u64).unwrap_or(0) as u32;
-                    Some(GraphSymbol {
-                        name: r.get("n")?.as_str()?.to_string(),
-                        kind: r.get("k").and_then(Value::as_str).unwrap_or("").to_string(),
-                        path: r
-                            .get("p")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .replace('\\', "/"),
-                        line: num("l"),
-                        degree: num("in_degree") + num("out_degree"),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+/// Rows of a `query_graph` payload: an array of row objects, or an
+/// `{"error": ".."}` object mapped to [`IntelError::Tool`].
+pub(crate) fn rows_from_value(v: &Value) -> Result<Vec<Value>> {
+    if let Some(rows) = v.as_array() {
+        return Ok(rows.clone());
+    }
+    if let Some(msg) = v.get("error").and_then(Value::as_str) {
+        return Err(IntelError::Tool(msg.to_string()));
+    }
+    Err(IntelError::Protocol(
+        "query_graph returned neither rows nor an error".to_string(),
+    ))
 }
 
-pub(crate) fn trace_from_value(v: &Value) -> Vec<TraceNode> {
-    v.get("nodes")
-        .and_then(Value::as_array)
-        .map(|nodes| {
-            nodes
-                .iter()
-                .filter_map(|n| {
-                    Some(TraceNode {
-                        name: n.get("name")?.as_str()?.to_string(),
-                        kind: n
-                            .get("kind")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                        file: n
-                            .get("file_path")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .replace('\\', "/"),
-                        depth: n.get("depth").and_then(Value::as_u64).unwrap_or(0) as u32,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+fn row_str(row: &Value, key: &str) -> String {
+    row.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn row_num(row: &Value, key: &str) -> u32 {
+    row.get(key).and_then(Value::as_u64).unwrap_or(0) as u32
+}
+
+/// Maps a `query_graph` symbol row (`id,name,kind,path,line_start,line_end,degree`).
+pub(crate) fn graph_symbol_from_row(row: &Value) -> Option<GraphSymbol> {
+    Some(GraphSymbol {
+        id: row.get("id")?.as_i64()?,
+        name: row.get("name")?.as_str()?.to_string(),
+        kind: row_str(row, "kind"),
+        path: row_str(row, "path").replace('\\', "/"),
+        line: row_num(row, "line_start"),
+        line_end: row_num(row, "line_end"),
+        degree: row_num(row, "degree"),
+    })
+}
+
+/// Maps a `query_graph` trace row (`id,name,kind,path,line_start`) at `depth`.
+pub(crate) fn trace_node_from_row(row: &Value, depth: u32) -> Option<TraceNode> {
+    Some(TraceNode {
+        id: row.get("id")?.as_i64()?,
+        name: row.get("name")?.as_str()?.to_string(),
+        kind: row_str(row, "kind"),
+        file: row_str(row, "path").replace('\\', "/"),
+        line: row_num(row, "line_start"),
+        depth,
+    })
 }
 
 #[cfg(test)]
@@ -392,37 +392,42 @@ mod tests {
     }
 
     #[test]
-    fn symbols_map_compact_search_graph_rows() {
-        let v: Value = serde_json::from_str(
-            r#"[{"id":1,"n":"append_turn","k":"function","l":169,"e":174,"p":"crates\\kode\\src\\session.rs","out_degree":1,"in_degree":12}]"#,
-        )
-        .unwrap();
-        let rows = symbols_from_value(&v);
+    fn rows_map_array_and_error_object() {
+        let rows = rows_from_value(&json!([{"id": 1}])).unwrap();
+        assert_eq!(rows.len(), 1);
+        let err = rows_from_value(&json!({"error": "bad sql"})).unwrap_err();
+        assert!(matches!(err, IntelError::Tool(m) if m == "bad sql"));
+        let err = rows_from_value(&json!("nope")).unwrap_err();
+        assert!(matches!(err, IntelError::Protocol(_)));
+    }
+
+    #[test]
+    fn graph_symbol_maps_row_and_normalizes_path() {
+        let row = json!({"id": 7, "name": "append_turn", "kind": "function",
+            "path": "crates\\kode\\src\\session.rs", "line_start": 169,
+            "line_end": 174, "degree": 13});
         assert_eq!(
-            rows,
-            vec![GraphSymbol {
+            graph_symbol_from_row(&row).unwrap(),
+            GraphSymbol {
+                id: 7,
                 name: "append_turn".into(),
                 kind: "function".into(),
                 path: "crates/kode/src/session.rs".into(),
                 line: 169,
+                line_end: 174,
                 degree: 13,
-            }]
+            }
         );
+        assert!(graph_symbol_from_row(&json!({"name": "x"})).is_none());
     }
 
     #[test]
-    fn trace_maps_nodes_with_depth() {
-        let v: Value = serde_json::from_str(
-            r#"{"has_cycle":false,"nodes":[
-                {"name":"append_turn","kind":"function","file_path":"crates\\kode\\src\\session.rs","depth":0},
-                {"name":"record_completed_turn","kind":"function","file_path":"crates\\kode\\src\\tui\\state.rs","depth":1}],
-              "edges":[]}"#,
-        )
-        .unwrap();
-        let nodes = trace_from_value(&v);
-        assert_eq!(nodes.len(), 2);
-        assert_eq!(nodes[1].name, "record_completed_turn");
-        assert_eq!(nodes[1].file, "crates/kode/src/tui/state.rs");
-        assert_eq!(nodes[1].depth, 1);
+    fn trace_node_maps_row_at_depth() {
+        let row = json!({"id": 9, "name": "record_completed_turn", "kind": "function",
+            "path": "crates\\kode\\src\\tui\\state.rs", "line_start": 40});
+        let n = trace_node_from_row(&row, 2).unwrap();
+        assert_eq!(n.id, 9);
+        assert_eq!(n.file, "crates/kode/src/tui/state.rs");
+        assert_eq!((n.line, n.depth), (40, 2));
     }
 }

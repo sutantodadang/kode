@@ -399,10 +399,11 @@ async fn answer_from_graph(
     intel: &dyn CodeIntelligence,
     query: crate::graph_answer::GraphQuery,
     task: &str,
+    root: &Path,
     events: &EventBus,
 ) -> Option<TaskOutcome> {
     let started = std::time::Instant::now();
-    match crate::graph_answer::answer(intel, query, task).await {
+    match crate::graph_answer::answer(intel, query, task, root).await {
         Ok(found) => {
             events.emit(KodeEvent::AgentStarted);
             for text in &found.facts {
@@ -483,7 +484,7 @@ async fn try_graph_answer(
             return None;
         }
     };
-    answer_from_graph(intel.as_ref(), query, &input.text, events).await
+    answer_from_graph(intel.as_ref(), query, &input.text, cwd, events).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1962,16 +1963,20 @@ mod graph_answer_pipeline_tests {
     async fn graph_answer_emits_facts_and_zero_usage() {
         let mock = kode_intel::MockCodeIntelligence {
             symbols: vec![kode_intel::GraphSymbol {
+                id: 1,
                 name: "append_turn".into(),
                 kind: "function".into(),
                 path: "s.rs".into(),
                 line: 1,
+                line_end: 3,
                 degree: 3,
             }],
             trace_nodes: vec![kode_intel::TraceNode {
+                id: 2,
                 name: "record".into(),
                 kind: "function".into(),
                 file: "t.rs".into(),
+                line: 1,
                 depth: 1,
             }],
             ..Default::default()
@@ -1982,6 +1987,7 @@ mod graph_answer_pipeline_tests {
             &mock,
             crate::graph_answer::GraphQuery::Callers,
             "who calls append_turn",
+            Path::new("."),
             &bus,
         )
         .await
@@ -2013,6 +2019,7 @@ mod graph_answer_pipeline_tests {
                 &mock,
                 crate::graph_answer::GraphQuery::Callers,
                 "who calls ghost",
+                Path::new("."),
                 &bus
             )
             .await
