@@ -414,6 +414,40 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
         // The TUI's CURRENT CHANGE rows already come from the git poll; the
         // ledger recorder (P0 Task 4) is what consumes this event.
         KodeEvent::ChangeSet { .. } => {}
+        KodeEvent::IndexStarted => {
+            state.indexing_since = Some(Instant::now());
+            state.index_line = Some(state.transcript.len());
+            let mut line =
+                TranscriptLine::new(Gutter::Zindeks, "◐ indexing this repo in the background");
+            line.born = Some(Instant::now());
+            state.transcript.push(line);
+        }
+        KodeEvent::IndexFinished {
+            files,
+            error,
+            elapsed_ms,
+        } => {
+            state.indexing_since = None;
+            let text = match (error, files) {
+                (Some(error), _) => format!("✗ index failed: {error}"),
+                (None, Some(files)) => format!(
+                    "✓ indexed {} files · {}s",
+                    crate::repo_map::thousands(files),
+                    elapsed_ms / 1000
+                ),
+                (None, None) => format!("✓ indexed · {}s", elapsed_ms / 1000),
+            };
+            match state
+                .index_line
+                .and_then(|row| state.transcript.get_mut(row))
+            {
+                Some(line) => line.text = text,
+                None => state
+                    .transcript
+                    .push(TranscriptLine::new(Gutter::Zindeks, text)),
+            }
+            state.transcript_cache = Default::default();
+        }
     }
 }
 

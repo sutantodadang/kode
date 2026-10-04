@@ -2392,6 +2392,7 @@ pub(crate) fn draw_picker(f: &mut ratatui::Frame, picker: &PickerState) {
         PickerKind::Provider => "select provider",
         PickerKind::Session => "resume session",
         PickerKind::Command => "commands",
+        PickerKind::Setup => "setup",
     };
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(

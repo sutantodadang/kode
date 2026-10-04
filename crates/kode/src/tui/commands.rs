@@ -212,31 +212,6 @@ pub fn provider_auth_state(
     }
 }
 
-/// Decides the startup hint (if any) shown once at TUI launch: a nudge to
-/// switch providers when the config is still on the `openai` default, no
-/// model has been explicitly chosen, no OpenAI credentials are available,
-/// but Kode's own credential store has something usable. Fires at most one
-/// hint — codex takes priority over opencode. Pure so the decision is
-/// unit-testable without touching the filesystem/env.
-pub(crate) fn startup_hint(
-    provider: &str,
-    model_set: bool,
-    env_key: bool,
-    codex_auth: bool,
-    opencode_any: bool,
-) -> Option<&'static str> {
-    if provider != "openai" || model_set || env_key {
-        return None;
-    }
-    if codex_auth {
-        Some("logged in via codex — run /provider codex to use it")
-    } else if opencode_any {
-        Some("opencode key found — run /provider opencode-go")
-    } else {
-        None
-    }
-}
-
 /// Whether Kode's own codex OAuth credentials file exists (`kode auth login
 /// codex`). Used only to power the `/provider` picker annotation and the
 /// startup hint — not a validity check of the tokens inside.
@@ -287,6 +262,56 @@ pub(crate) fn antigravity_auth_present() -> bool {
     kode_model::antigravity::default_auth_path()
         .map(|p| p.exists())
         .unwrap_or(false)
+}
+
+/// Whether `provider` has usable credentials (same sources the `/provider`
+/// picker annotates).
+pub(crate) fn provider_logged_in(provider: &str) -> bool {
+    !matches!(
+        provider_auth_state(
+            provider,
+            codex_auth_exists(),
+            &opencode_key_ids(),
+            openai_env_key_present(),
+            anthropic_auth_present(),
+            antigravity_auth_present(),
+        ),
+        "" | " · login required"
+    )
+}
+
+pub(crate) fn setup_card_item(card: crate::first_run::SetupCard, provider: &str) -> String {
+    use crate::first_run::SetupCard;
+    match card {
+        SetupCard::Provider => "choose a provider and model".to_string(),
+        SetupCard::Login => format!("log in to {provider} (leaves the TUI, opens your browser)"),
+        SetupCard::Engine => format!(
+            "download the code-graph engine (zindeks v{}, checksum-verified)",
+            crate::engine_assets::ZINDEKS_VERSION
+        ),
+        SetupCard::Index => "index this repo in the background".to_string(),
+    }
+}
+
+/// Shows one setup card through the picker overlay (Enter = do it, Esc =
+/// skip for this launch).
+pub(crate) fn open_setup_card(
+    state: &mut AppState,
+    card: crate::first_run::SetupCard,
+    provider: &str,
+    position: usize,
+    total: usize,
+) {
+    state.picker.request_id = state.picker.request_id.wrapping_add(1);
+    state.picker.open = true;
+    state.picker.kind = PickerKind::Setup;
+    state.picker.filter.clear();
+    state.picker.selected = 0;
+    state.picker.items = vec![setup_card_item(card, provider)];
+    state.picker.note = Some(format!(
+        "setup {position}/{total} · Enter to do it · Esc to skip"
+    ));
+    state.setup_card = Some(card);
 }
 
 /// Validates a reasoning-effort value against

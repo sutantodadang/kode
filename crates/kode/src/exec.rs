@@ -213,6 +213,11 @@ pub async fn run(
                                 );
                             }
                         }
+                        KodeEvent::IndexStarted => eprintln!("◆ indexing…"),
+                        KodeEvent::IndexFinished { error: Some(e), .. } => {
+                            eprintln!("◆ index failed: {e}")
+                        }
+                        KodeEvent::IndexFinished { .. } => eprintln!("◆ indexed"),
                         _ => {}
                     }
                 }

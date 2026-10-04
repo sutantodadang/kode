@@ -4,6 +4,7 @@ mod custom_commands;
 mod doctor;
 mod engine_assets;
 mod exec;
+mod first_run;
 mod index_cmd;
 mod intel_backend;
 mod intel_tools;

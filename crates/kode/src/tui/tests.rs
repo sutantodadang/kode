@@ -1830,44 +1830,6 @@ fn provider_auth_state_lmstudio_always_local() {
     );
 }
 
-// -- startup hint (pure fn) ---------------------------------------------
-
-#[test]
-fn startup_hint_fresh_with_codex_auth_shows_codex_hint() {
-    assert_eq!(
-        startup_hint("openai", false, false, true, false),
-        Some("logged in via codex — run /provider codex to use it")
-    );
-}
-
-#[test]
-fn startup_hint_provider_already_codex_is_none() {
-    assert_eq!(startup_hint("codex", false, false, true, false), None);
-}
-
-#[test]
-fn startup_hint_env_key_set_is_none() {
-    assert_eq!(startup_hint("openai", false, true, true, false), None);
-}
-
-#[test]
-fn startup_hint_nothing_is_none() {
-    assert_eq!(startup_hint("openai", false, false, false, false), None);
-}
-
-#[test]
-fn startup_hint_opencode_key_found_when_no_codex_auth() {
-    assert_eq!(
-        startup_hint("openai", false, false, false, true),
-        Some("opencode key found — run /provider opencode-go")
-    );
-}
-
-#[test]
-fn startup_hint_model_already_set_is_none() {
-    assert_eq!(startup_hint("openai", true, false, true, false), None);
-}
-
 #[test]
 fn validate_effort_accepts_known_values() {
     for v in kode_core::config::VALID_EFFORTS {
@@ -4666,6 +4628,104 @@ fn kode_label_renders_bold_without_gutter() {
 fn parses_map_and_index_commands() {
     assert_eq!(parse_slash_command("/map"), Some(SlashCommand::Map));
     assert_eq!(parse_slash_command("/index"), Some(SlashCommand::Index));
+}
+
+#[test]
+fn index_started_then_finished_updates_one_row_in_place() {
+    let mut s = state();
+    apply_event(&mut s, KodeEvent::IndexStarted);
+    let row = s.index_line.expect("row index recorded");
+    assert!(s.transcript[row].text.contains("indexing"));
+    assert!(s.indexing_since.is_some());
+    apply_event(
+        &mut s,
+        KodeEvent::IndexFinished {
+            files: Some(1830),
+            error: None,
+            elapsed_ms: 22_000,
+        },
+    );
+    assert_eq!(s.transcript[row].text, "✓ indexed 1,830 files · 22s");
+    assert!(s.indexing_since.is_none());
+}
+
+#[test]
+fn index_failure_is_shown_not_hidden() {
+    let mut s = state();
+    apply_event(&mut s, KodeEvent::IndexStarted);
+    apply_event(
+        &mut s,
+        KodeEvent::IndexFinished {
+            files: None,
+            error: Some("disk full".into()),
+            elapsed_ms: 900,
+        },
+    );
+    let row = s.index_line.unwrap();
+    assert_eq!(s.transcript[row].text, "✗ index failed: disk full");
+}
+
+#[test]
+fn submitting_while_indexing_notes_graph_warming() {
+    let mut s = state();
+    apply_event(&mut s, KodeEvent::IndexStarted);
+    push_graph_warming_note(&mut s);
+    assert!(
+        s.transcript
+            .iter()
+            .any(|l| l.text == "graph warming — this task runs without code-graph facts")
+    );
+    // Not indexing: no note.
+    let mut idle = state();
+    push_graph_warming_note(&mut idle);
+    assert!(
+        !idle
+            .transcript
+            .iter()
+            .any(|l| l.text.starts_with("graph warming"))
+    );
+}
+
+#[test]
+fn setup_card_items_say_exactly_what_happens() {
+    use crate::first_run::SetupCard;
+    assert_eq!(
+        setup_card_item(SetupCard::Provider, "openai"),
+        "choose a provider and model"
+    );
+    assert_eq!(
+        setup_card_item(SetupCard::Login, "codex"),
+        "log in to codex (leaves the TUI, opens your browser)"
+    );
+    assert!(
+        setup_card_item(SetupCard::Engine, "codex").starts_with("download the code-graph engine")
+    );
+    assert_eq!(
+        setup_card_item(SetupCard::Index, "codex"),
+        "index this repo in the background"
+    );
+}
+
+#[test]
+fn open_setup_card_uses_the_picker_with_a_skip_hint() {
+    let mut s = state();
+    open_setup_card(&mut s, crate::first_run::SetupCard::Index, "codex", 3, 4);
+    assert!(s.picker.open);
+    assert_eq!(s.picker.kind, PickerKind::Setup);
+    assert_eq!(
+        s.picker.items,
+        vec!["index this repo in the background".to_string()]
+    );
+    assert_eq!(
+        s.picker.note.as_deref(),
+        Some("setup 3/4 · Enter to do it · Esc to skip")
+    );
+    assert_eq!(s.setup_card, Some(crate::first_run::SetupCard::Index));
+}
+
+#[test]
+fn lmstudio_counts_as_logged_in() {
+    assert!(provider_logged_in("lmstudio"));
 }
 
 #[test]

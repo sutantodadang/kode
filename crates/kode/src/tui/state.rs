@@ -362,6 +362,7 @@ pub enum PickerKind {
     Provider,
     Session,
     Command,
+    Setup,
 }
 
 /// State of the `/model`/`/provider` picker overlay. `items` holds the
@@ -505,6 +506,16 @@ pub struct AppState {
     /// Collects the in-flight task's provenance ledger; taken into the
     /// persisted `Turn` by `record_completed_turn`.
     pub(crate) ledger_recorder: crate::ledger::LedgerRecorder,
+    /// Set while a background index runs; drives the "graph warming" note.
+    pub(crate) indexing_since: Option<Instant>,
+    /// Transcript row of the latest indexing line, updated in place.
+    pub(crate) index_line: Option<usize>,
+    /// Setup cards the user skipped this launch (Esc).
+    pub(crate) setup_skipped: std::collections::HashSet<crate::first_run::SetupCard>,
+    /// Startup probe result: is this repo indexed? `None` until it answers.
+    pub(crate) repo_indexed: Option<bool>,
+    /// The setup card currently shown in the picker.
+    pub(crate) setup_card: Option<crate::first_run::SetupCard>,
     /// Stable receipt for the most recently completed run. Cleared as soon
     /// as the user begins composing the next instruction.
     pub completion: Option<CompletionReceipt>,
@@ -632,6 +643,11 @@ impl AppState {
             runtime: Arc::new(crate::session_runtime::SessionRuntime::new()),
             pending_task: None,
             ledger_recorder: Default::default(),
+            indexing_since: None,
+            index_line: None,
+            setup_skipped: std::collections::HashSet::new(),
+            repo_indexed: None,
+            setup_card: None,
             completion: None,
             last_error: None,
             shortcuts_open: false,
@@ -1102,6 +1118,17 @@ pub(crate) fn user_input_transcript_lines(input: &UserInput) -> Vec<TranscriptLi
 /// Persists the in-flight task (if any) as a completed `session::Turn`: both
 /// to disk (creating the session lazily on first write) and into
 /// `state.history` for the next task's model replay. No-op when
+/// Called when a task is submitted: while a background index runs, the
+/// task cannot use the graph, so say so once instead of silently degrading.
+pub(crate) fn push_graph_warming_note(state: &mut AppState) {
+    if state.indexing_since.is_some() {
+        state.transcript.push(TranscriptLine::new(
+            Gutter::Note,
+            "graph warming — this task runs without code-graph facts",
+        ));
+    }
+}
+
 /// `pending_task` is `None` (nothing was in flight — e.g. a stray event).
 /// Store I/O failures are surfaced as transcript Notes, never fatal.
 pub(crate) fn record_completed_turn(

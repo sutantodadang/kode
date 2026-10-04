@@ -34,6 +34,7 @@ use super::events::{apply_event, flush_model_stream};
 use super::state::*;
 use super::theme;
 use crate::custom_commands;
+use crate::first_run::SetupCard;
 use crate::pipeline;
 use crate::team_memory;
 
@@ -387,6 +388,74 @@ pub(crate) fn detect_branch(cwd: &Path) -> Option<String> {
     }
 }
 
+/// Leaves the alternate screen so a CLI-interactive flow (browser login,
+/// download output) can use the real terminal, then restores the TUI —
+/// also when the flow fails, so the caller can report the error in the
+/// transcript.
+async fn with_terminal_suspended<T>(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    stderr_guard: &mut Option<TuiStderrGuard>,
+    flow: impl Future<Output = T>,
+) -> io::Result<T> {
+    disable_raw_mode()?;
+    execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
+    *stderr_guard = None; // restores the real stderr for prompts
+    let out = flow.await;
+    *stderr_guard = Some(TuiStderrGuard::redirect()?);
+    enable_raw_mode()?;
+    execute!(
+        std::io::stdout(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
+    terminal.clear()?;
+    Ok(out)
+}
+
+fn setup_facts(state: &AppState, config: &KodeConfig, cwd: &Path) -> crate::first_run::SetupFacts {
+    crate::first_run::SetupFacts {
+        model_configured: !config.model.model.is_empty(),
+        provider_logged_in: provider_logged_in(&config.model.provider),
+        zindeks_enabled: config.zindeks.enabled,
+        engine_installed: crate::engine_assets::zindeks_library(&config.zindeks).is_ok(),
+        repo_indexed: state.repo_indexed,
+        index_prompt: kode_core::kode_home_dir()
+            .and_then(|home| crate::first_run::load_index_prompt(&home, cwd)),
+    }
+}
+
+/// Shows the next applicable setup card when nothing else is on screen.
+fn maybe_show_setup_card(state: &mut AppState, config: &KodeConfig, cwd: &Path) {
+    if state.picker.open || state.running || !state.pending.is_empty() {
+        return;
+    }
+    let facts = setup_facts(state, config, cwd);
+    let Some(card) = crate::first_run::next_card(&facts, &state.setup_skipped) else {
+        state.setup_card = None;
+        return;
+    };
+    let mut remaining = state.setup_skipped.clone();
+    let mut total = 0;
+    while let Some(c) = crate::first_run::next_card(&facts, &remaining) {
+        remaining.insert(c);
+        total += 1;
+    }
+    let position = state.setup_skipped.len() + 1;
+    open_setup_card(
+        state,
+        card,
+        &config.model.provider,
+        position,
+        position + total - 1,
+    );
+}
+
 /// Spawns a non-blocking `git status`/`git diff --numstat` poll
 /// (`kode_context::git::repo_state`), sending the result back over `tx`.
 /// Called lazily — TUI start and after each task completes — never on a
@@ -408,6 +477,73 @@ fn spawn_repo_map(state: &AppState, config: &KodeConfig, cwd: &Path, events: &Ev
     tokio::spawn(async move {
         for ev in crate::repo_map::map_events(&runtime, &cfg, &root).await {
             events.emit(ev);
+        }
+    });
+}
+
+/// Indexes the repo on a dedicated engine (so running tasks are never
+/// queued behind it), then drops the session's cached engine so the next
+/// task binds the fresh index, and shows the repo map.
+fn spawn_background_index(
+    state: &mut AppState,
+    config: &KodeConfig,
+    cwd: &Path,
+    events: &EventBus,
+) {
+    if state.indexing_since.is_some() {
+        state.transcript.push(TranscriptLine::new(
+            Gutter::Note,
+            "indexing is already running",
+        ));
+        return;
+    }
+    if !config.zindeks.enabled {
+        state.transcript.push(TranscriptLine::new(
+            Gutter::Note,
+            "zindeks is disabled in config — enable [zindeks] to index",
+        ));
+        return;
+    }
+    events.emit(KodeEvent::IndexStarted);
+    let runtime = state.runtime.clone();
+    let cfg = config.zindeks.clone();
+    let root = cwd.to_path_buf();
+    let events = events.clone();
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let result: anyhow::Result<Option<u64>> = async {
+            let backend = crate::intel_backend::connect(&cfg, &root)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("no code-intelligence backend is enabled"))?;
+            backend.index_repository().await?;
+            Ok(backend.health().await.ok().map(|h| h.documents))
+        }
+        .await;
+        runtime.forget_intel().await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match result {
+            Ok(files) => {
+                if let Some(home) = kode_core::kode_home_dir() {
+                    let _ = crate::first_run::save_index_prompt(
+                        &home,
+                        &root,
+                        crate::first_run::IndexPrompt::Accepted,
+                    );
+                }
+                events.emit(KodeEvent::IndexFinished {
+                    files,
+                    error: None,
+                    elapsed_ms,
+                });
+                for ev in crate::repo_map::map_events(&runtime, &cfg, &root).await {
+                    events.emit(ev);
+                }
+            }
+            Err(e) => events.emit(KodeEvent::IndexFinished {
+                files: None,
+                error: Some(e.to_string()),
+                elapsed_ms,
+            }),
         }
     });
 }
@@ -477,6 +613,7 @@ pub(crate) fn submit_task(
 ) -> SubmittedTask {
     let plan_mode = state.plan_mode;
     state.start_new_task(task.clone(), plan_mode);
+    push_graph_warming_note(state);
     if echo_user {
         push_user_transcript(state, &task);
     }
@@ -553,7 +690,7 @@ fn record_failed_turn(
 pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyhow::Result<()> {
     let mut config = KodeConfig::load(cwd).unwrap_or_default();
 
-    let _stderr_guard = TuiStderrGuard::redirect()?;
+    let mut stderr_guard = Some(TuiStderrGuard::redirect()?);
 
     enable_raw_mode()?;
     execute!(
@@ -599,18 +736,6 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
         }
     }
 
-    if let Some(hint) = startup_hint(
-        &config.model.provider,
-        !config.model.model.is_empty(),
-        openai_env_key_present(),
-        codex_auth_exists(),
-        !opencode_key_ids().is_empty(),
-    ) {
-        state
-            .transcript
-            .push(TranscriptLine::new(Gutter::Note, hint));
-    }
-
     if continue_ {
         match crate::session::latest(cwd) {
             Some(id) => {
@@ -634,6 +759,32 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
 
     let (git_tx, mut git_rx) = mpsc::unbounded_channel::<RepoState>();
     spawn_git_poll(cwd.to_path_buf(), git_tx.clone());
+
+    let (indexed_tx, mut indexed_rx) = mpsc::unbounded_channel::<Option<bool>>();
+    if config.zindeks.enabled && crate::engine_assets::zindeks_library(&config.zindeks).is_ok() {
+        let runtime = state.runtime.clone();
+        let cfg = config.zindeks.clone();
+        let root = cwd.to_path_buf();
+        tokio::spawn(async move {
+            let answer = match runtime.intel(&cfg, &root).await {
+                Ok(Some(handle)) => match handle.backend.ensure_bound().await {
+                    Ok(()) => Some(true),
+                    Err(kode_intel::IntelError::NotIndexed(_)) => {
+                        // Never keep an unbound engine: the pipeline assumes
+                        // a reused handle is bound.
+                        runtime.forget_intel().await;
+                        Some(false)
+                    }
+                    Err(_) => {
+                        runtime.forget_intel().await;
+                        None
+                    }
+                },
+                _ => None,
+            };
+            let _ = indexed_tx.send(answer);
+        });
+    }
 
     let events = EventBus::new(256);
     let mut event_rx = events.subscribe();
@@ -744,14 +895,80 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                                     }
                                                 } else if name == "/map" {
                                                     spawn_repo_map(&state, &config, cwd, &events);
+                                                } else if name == "/index" {
+                                                    spawn_background_index(&mut state, &config, cwd, &events);
                                                 } else if let Some(command) = parse_slash_command(name) {
                                                     handle_slash_command(&mut state, cwd, &mut config, &picker_tx, command);
                                                 }
                                             }
                                         }
+                                        PickerKind::Setup => {
+                                            state.picker.open = false;
+                                            match state.setup_card.take() {
+                                                Some(SetupCard::Provider) => open_provider_picker(&mut state),
+                                                Some(SetupCard::Login) => {
+                                                    let provider = config.model.provider.clone();
+                                                    let outcome = with_terminal_suspended(
+                                                        &mut terminal,
+                                                        &mut stderr_guard,
+                                                        crate::auth::login(&provider),
+                                                    ).await;
+                                                    mouse_captured = true;
+                                                    state.select_mode = false;
+                                                    let text = match outcome {
+                                                        Ok(Ok(())) => format!("logged in to {provider}"),
+                                                        Ok(Err(e)) => format!("login failed: {e}"),
+                                                        Err(e) => format!("terminal restore failed: {e}"),
+                                                    };
+                                                    state.transcript.push(TranscriptLine::new(Gutter::Note, text));
+                                                    state.setup_skipped.insert(SetupCard::Login);
+                                                }
+                                                Some(SetupCard::Engine) => {
+                                                    let cfg = config.zindeks.clone();
+                                                    let outcome = with_terminal_suspended(
+                                                        &mut terminal,
+                                                        &mut stderr_guard,
+                                                        crate::setup::install_zindeks(&cfg),
+                                                    ).await;
+                                                    mouse_captured = true;
+                                                    state.select_mode = false;
+                                                    let text = match outcome {
+                                                        Ok(Ok(())) => "code-graph engine installed".to_string(),
+                                                        Ok(Err(e)) => format!("engine download failed: {e}"),
+                                                        Err(e) => format!("terminal restore failed: {e}"),
+                                                    };
+                                                    state.transcript.push(TranscriptLine::new(Gutter::Note, text));
+                                                    state.setup_skipped.insert(SetupCard::Engine);
+                                                    state.repo_indexed = Some(false); // freshly installed engine has no index
+                                                }
+                                                Some(SetupCard::Index) => {
+                                                    state.setup_skipped.insert(SetupCard::Index);
+                                                    spawn_background_index(&mut state, &config, cwd, &events);
+                                                }
+                                                None => {}
+                                            }
+                                        }
                                     }
                                 }
                                 PickerOutcome::Cancel => {
+                                    if state.picker.kind == PickerKind::Setup
+                                        && let Some(card) = state.setup_card
+                                    {
+                                        state.setup_skipped.insert(card);
+                                        if card == SetupCard::Index
+                                            && let Some(home) = kode_core::kode_home_dir()
+                                            && let Err(e) = crate::first_run::save_index_prompt(
+                                                &home,
+                                                cwd,
+                                                crate::first_run::IndexPrompt::Declined,
+                                            )
+                                        {
+                                            state.transcript.push(TranscriptLine::new(
+                                                Gutter::Note,
+                                                format!("could not remember index choice: {e}"),
+                                            ));
+                                        }
+                                    }
                                     state.picker.open = false;
                                 }
                                 PickerOutcome::Continue => {}
@@ -809,6 +1026,10 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                     }
                                     if matches!(command.as_ref(), Some(SlashCommand::Map)) {
                                         spawn_repo_map(&state, &config, cwd, &events);
+                                        continue 'outer;
+                                    }
+                                    if matches!(command.as_ref(), Some(SlashCommand::Index)) {
+                                        spawn_background_index(&mut state, &config, cwd, &events);
                                         continue 'outer;
                                     }
                                     if let Some(cmd) = command {
@@ -978,6 +1199,12 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                 }
             }
 
+            indexed = indexed_rx.recv() => {
+                if let Some(answer) = indexed {
+                    state.repo_indexed = answer;
+                }
+            }
+
             _ = ui_tick.tick() => {
                 // Also the render-tick clock for the knowledge-band
                 // dim→normal fade (item 3) — a new evidence row is dim for
@@ -1002,6 +1229,8 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                 mouse_captured = true;
             }
         }
+
+        maybe_show_setup_card(&mut state, &config, cwd);
 
         terminal.draw(|f| {
             draw(f, &mut state, cwd);
