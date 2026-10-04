@@ -274,10 +274,8 @@ pub fn post_pr_comment(body: &str, gh: GhRunner<'_>) -> Result<(), String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!(
-        "kode-receipt-{}-{unique}.md",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("kode-receipt-{}-{unique}.md", std::process::id()));
     std::fs::write(&path, body).map_err(|e| format!("not posted: cannot write temp file: {e}"))?;
     let path_text = path.to_string_lossy().to_string();
     let result = gh(&["pr", "comment", "--body-file", &path_text]);

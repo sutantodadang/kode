@@ -1389,7 +1389,8 @@ async fn emit_change_set(
                     removed: row.deleted,
                 })
                 .collect();
-            events.emit(KodeEvent::ChangeSet { files });
+            let reverted = kode_context::git::reverted_paths(before, &after);
+            events.emit(KodeEvent::ChangeSet { files, reverted });
         }
         _ => events.emit(KodeEvent::Note {
             text: "changed files not recorded: git unavailable or not a repository".to_string(),
