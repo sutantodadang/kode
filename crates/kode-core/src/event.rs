@@ -216,6 +216,14 @@ pub enum KodeEvent {
         latency_ms: u64,
         text: String,
     },
+    /// Blast radius of one edited symbol, from the call graph.
+    Impact {
+        file: String,
+        symbol: String,
+        callers: u32,
+        crates: u32,
+        tests: u32,
+    },
 }
 
 /// Broadcast bus for `KodeEvent`s.

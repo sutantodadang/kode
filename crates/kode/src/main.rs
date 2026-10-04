@@ -6,6 +6,8 @@ mod engine_assets;
 mod exec;
 mod first_run;
 mod graph_answer;
+mod impact;
+mod impact_tool;
 mod index_cmd;
 mod intel_backend;
 mod intel_tools;

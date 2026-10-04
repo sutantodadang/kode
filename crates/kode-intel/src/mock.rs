@@ -16,6 +16,8 @@ pub struct MockCodeIntelligence {
     pub context_error: Option<String>,
     pub search_results: Vec<CodeSearchResult>,
     pub outline: FileOutline,
+    /// When set, `file_outline` returns `Err(Unavailable)` with this message.
+    pub outline_error: Option<String>,
     /// When set, `architecture` returns it; otherwise `Err(Unavailable)`.
     pub architecture: Option<ArchitectureSummary>,
     pub symbols: Vec<GraphSymbol>,
@@ -43,6 +45,7 @@ impl Default for MockCodeIntelligence {
                 path: String::new(),
                 symbols: Vec::new(),
             },
+            outline_error: None,
             architecture: None,
             symbols: Vec::new(),
             trace_nodes: Vec::new(),
@@ -68,6 +71,9 @@ impl CodeIntelligence for MockCodeIntelligence {
     }
 
     async fn file_outline(&self, _path: &str) -> Result<FileOutline> {
+        if let Some(message) = &self.outline_error {
+            return Err(IntelError::Unavailable(message.clone()));
+        }
         Ok(self.outline.clone())
     }
 

@@ -511,6 +511,19 @@ impl Default for UiConfig {
     }
 }
 
+/// How graph-selected tests run before the full suite.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TargetedMode {
+    /// Targeted tests first (fail fast), then the full suite.
+    #[default]
+    First,
+    /// Targeted tests only; the full test step is reported Skipped.
+    Only,
+    /// No targeted step.
+    Off,
+}
+
 /// Post-edit verification policy. An empty `steps` list enables automatic,
 /// monorepo-aware detection; any explicit steps replace auto-detection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -522,6 +535,8 @@ pub struct VerifyConfig {
     pub fail_fast: bool,
     #[serde(default)]
     pub steps: Vec<VerifyStepConfig>,
+    #[serde(default)]
+    pub targeted: TargetedMode,
 }
 
 impl Default for VerifyConfig {
@@ -530,6 +545,7 @@ impl Default for VerifyConfig {
             timeout_seconds: default_verify_timeout_seconds(),
             fail_fast: default_verify_fail_fast(),
             steps: Vec::new(),
+            targeted: TargetedMode::default(),
         }
     }
 }
@@ -1015,6 +1031,13 @@ effort = "high"
         assert_eq!(RouterConfig::default().graph_threshold, 0.8);
         let cfg: KodeConfig = toml::from_str("[router]\ngraph_threshold = 0.9\n").unwrap();
         assert_eq!(cfg.router.graph_threshold, 0.9);
+    }
+
+    #[test]
+    fn verify_targeted_defaults_to_first_and_parses() {
+        assert_eq!(VerifyConfig::default().targeted, TargetedMode::First);
+        let cfg: KodeConfig = toml::from_str("[verify]\ntargeted = \"only\"\n").unwrap();
+        assert_eq!(cfg.verify.targeted, TargetedMode::Only);
     }
 
     #[test]

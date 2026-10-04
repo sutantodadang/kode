@@ -463,6 +463,20 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             state.response_buf = text;
             state.graph_offer = state.pending_task.clone();
         }
+        KodeEvent::Impact {
+            symbol,
+            callers,
+            crates,
+            tests,
+            ..
+        } => {
+            let mut line = TranscriptLine::new(
+                Gutter::Zindeks,
+                crate::impact::row_text_parts(&symbol, callers, crates, tests),
+            );
+            line.born = Some(Instant::now());
+            state.transcript.push(line);
+        }
     }
 }
 

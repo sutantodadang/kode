@@ -134,13 +134,21 @@ impl TaskOutcome {
 struct VerificationService<'a> {
     root: &'a Path,
     config: &'a kode_core::config::VerifyConfig,
+    tests: Vec<(String, String)>,
     cancel: &'a CancellationToken,
 }
 
 impl VerificationService<'_> {
     async fn run(&self) -> kode_verify::VerificationReport {
         let profile = kode_verify::detect_with_config(self.root, self.config);
-        kode_verify::run_verification(self.root, &profile, self.cancel).await
+        kode_verify::run_with_targets(
+            self.root,
+            &profile,
+            &self.tests,
+            self.config.targeted,
+            self.cancel,
+        )
+        .await
     }
 }
 
@@ -639,6 +647,21 @@ async fn execute_task(
     }
     register_memory_tools(&mut registry, &memory, repository.clone());
 
+    let impact_log = crate::impact_tool::ImpactLog::default();
+    if let Some(code_intel) = &intel {
+        for inner in [
+            Arc::new(kode_tools::tools::ApplyPatch) as Arc<dyn kode_tools::Tool>,
+            Arc::new(kode_tools::tools::WriteFile),
+        ] {
+            registry.replace(Arc::new(crate::impact_tool::ImpactAwareTool::new(
+                inner,
+                code_intel.clone(),
+                events.clone(),
+                impact_log.clone(),
+            )));
+        }
+    }
+
     if agent_config.subagents.enabled {
         let mut child_registry = ToolRegistry::with_subagent_builtins();
         register_code_intelligence_tools(&mut child_registry, &intel);
@@ -848,6 +871,7 @@ async fn execute_task(
         let verification_service = VerificationService {
             root: cwd,
             config: &config.verify,
+            tests: impact_log.covering_tests(),
             cancel: &ctx.cancel,
         };
         let (report, verdict) = run_verification_phase(&verification_service, &events).await;
@@ -915,8 +939,13 @@ async fn execute_task(
             let mut retry_report = report;
 
             if mutated_any {
-                let (report, verdict2) =
-                    run_verification_phase(&verification_service, &events).await;
+                let repair_service = VerificationService {
+                    root: cwd,
+                    config: &config.verify,
+                    tests: impact_log.covering_tests(),
+                    cancel: &ctx.cancel,
+                };
+                let (report, verdict2) = run_verification_phase(&repair_service, &events).await;
                 retry_report = report;
                 verification = verification_status(verdict2);
             }

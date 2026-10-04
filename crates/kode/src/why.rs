@@ -42,8 +42,14 @@ pub fn why_lines(turn: &Turn, number: usize) -> Vec<String> {
         out.push(" no ledger recorded for this turn".to_string());
     } else {
         let mut route = Vec::new();
-        let (mut graph, mut memory, mut git, mut verify, mut cost) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut graph, mut memory, mut git, mut impact, mut verify, mut cost) = (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
         for entry in &turn.ledger {
             match entry {
                 LedgerEntry::Route { answers } => {
@@ -84,6 +90,15 @@ pub fn why_lines(turn: &Turn, number: usize) -> Vec<String> {
                         .iter()
                         .map(|f| format!("{} +{} −{}", f.path, f.added, f.removed)),
                 ),
+                LedgerEntry::Impact {
+                    symbol,
+                    callers,
+                    crates,
+                    tests,
+                    ..
+                } => impact.push(format!(
+                    "{symbol} ← {callers} callers, {crates} crates, {tests} tests"
+                )),
                 LedgerEntry::Verify {
                     name,
                     outcome,
@@ -111,6 +126,7 @@ pub fn why_lines(turn: &Turn, number: usize) -> Vec<String> {
         section(&mut out, "GRAPH", graph);
         section(&mut out, "MEMORY", memory);
         section(&mut out, "GIT", git);
+        section(&mut out, "IMPACT", impact);
         section(&mut out, "VERIFY", verify);
         section(&mut out, "COST", cost);
     }

@@ -1,8 +1,10 @@
 mod detect;
 mod run;
+mod targeted;
 
 pub use detect::{detect, detect_with_config};
 pub use run::run_verification;
+pub use targeted::{is_test_step, run_with_targets, targeted_steps};
 
 use std::path::PathBuf;
 use std::time::Duration;

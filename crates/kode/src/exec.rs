@@ -226,6 +226,14 @@ pub async fn run(
                             eprintln!("— graph answer · 0 tokens · {latency_ms}ms");
                             response_buf.push_str(&text);
                         }
+                        KodeEvent::Impact {
+                            symbol,
+                            callers,
+                            tests,
+                            ..
+                        } => {
+                            eprintln!("◆ impact {symbol}: {callers} callers, {tests} tests")
+                        }
                         _ => {}
                     }
                 }

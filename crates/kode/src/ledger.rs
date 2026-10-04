@@ -85,6 +85,13 @@ pub enum LedgerEntry {
         symbol: String,
         latency_ms: u64,
     },
+    Impact {
+        file: String,
+        symbol: String,
+        callers: u32,
+        crates: u32,
+        tests: u32,
+    },
     Verify {
         name: String,
         outcome: VerifyOutcome,
@@ -158,6 +165,19 @@ impl LedgerRecorder {
                 query: query.clone(),
                 symbol: symbol.clone(),
                 latency_ms: *latency_ms,
+            }),
+            KodeEvent::Impact {
+                file,
+                symbol,
+                callers,
+                crates,
+                tests,
+            } => self.entries.push(LedgerEntry::Impact {
+                file: file.clone(),
+                symbol: symbol.clone(),
+                callers: *callers,
+                crates: *crates,
+                tests: *tests,
             }),
             KodeEvent::VerifyStep {
                 name,
@@ -352,6 +372,29 @@ mod tests {
                 query: "callers".into(),
                 symbol: "append_turn".into(),
                 latency_ms: 12
+            }]
+        );
+    }
+
+    #[test]
+    fn impact_is_recorded() {
+        let mut r = LedgerRecorder::default();
+        r.begin();
+        r.observe(&KodeEvent::Impact {
+            file: "a.rs".into(),
+            symbol: "fetch".into(),
+            callers: 4,
+            crates: 2,
+            tests: 3,
+        });
+        assert_eq!(
+            r.take(),
+            vec![LedgerEntry::Impact {
+                file: "a.rs".into(),
+                symbol: "fetch".into(),
+                callers: 4,
+                crates: 2,
+                tests: 3
             }]
         );
     }
