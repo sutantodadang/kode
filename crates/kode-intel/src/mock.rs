@@ -1,6 +1,9 @@
 use crate::CodeIntelligence;
 use crate::error::{IntelError, Result};
-use crate::types::{CodeContext, CodeContextRequest, CodeSearchResult, FileOutline, IntelHealth};
+use crate::types::{
+    ArchitectureSummary, CodeContext, CodeContextRequest, CodeSearchResult, FileOutline,
+    IntelHealth,
+};
 
 /// A canned [`CodeIntelligence`] implementation for tests. Defaults to an
 /// empty-but-healthy backend; override the fields to script specific
@@ -13,6 +16,8 @@ pub struct MockCodeIntelligence {
     pub context_error: Option<String>,
     pub search_results: Vec<CodeSearchResult>,
     pub outline: FileOutline,
+    /// When set, `architecture` returns it; otherwise `Err(Unavailable)`.
+    pub architecture: Option<ArchitectureSummary>,
 }
 
 impl Default for MockCodeIntelligence {
@@ -36,6 +41,7 @@ impl Default for MockCodeIntelligence {
                 path: String::new(),
                 symbols: Vec::new(),
             },
+            architecture: None,
         }
     }
 }
@@ -59,5 +65,11 @@ impl CodeIntelligence for MockCodeIntelligence {
 
     async fn file_outline(&self, _path: &str) -> Result<FileOutline> {
         Ok(self.outline.clone())
+    }
+
+    async fn architecture(&self, _limit: u32) -> Result<ArchitectureSummary> {
+        self.architecture
+            .clone()
+            .ok_or_else(|| IntelError::Unavailable("no architecture scripted".to_string()))
     }
 }

@@ -9,7 +9,8 @@ pub use embedded::EmbeddedZindeks;
 pub use error::{IntelError, Result};
 pub use mock::MockCodeIntelligence;
 pub use types::{
-    CodeContext, CodeContextRequest, CodeSearchResult, FileOutline, IntelHealth, OutlineSymbol,
+    ArchSymbol, ArchitectureSummary, CodeContext, CodeContextRequest, CodeSearchResult,
+    FileOutline, IntelHealth, OutlineSymbol,
 };
 
 /// Domain-level access to a local code intelligence backend (zindeks).
@@ -29,6 +30,14 @@ pub trait CodeIntelligence: Send + Sync {
 
     /// Symbol outline for a single file.
     async fn file_outline(&self, path: &str) -> Result<FileOutline>;
+
+    /// Repo-wide shape: totals plus entry points and fan-out/fan-in leaders,
+    /// at most `limit` per list.
+    async fn architecture(&self, _limit: u32) -> Result<ArchitectureSummary> {
+        Err(IntelError::Tool(
+            "architecture is not supported by this backend".to_string(),
+        ))
+    }
 
     /// Bind the selected repository for this session without performing a
     /// first-time index. Backends with nothing to bind may leave this default.

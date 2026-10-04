@@ -33,7 +33,10 @@ use crate::CodeIntelligence;
 use crate::error::{IntelError, Result};
 use crate::ffi::{self, Symbols, ZindeksBuffer, ZindeksHandle};
 use crate::mapping;
-use crate::types::{CodeContext, CodeContextRequest, CodeSearchResult, FileOutline, IntelHealth};
+use crate::types::{
+    ArchitectureSummary, CodeContext, CodeContextRequest, CodeSearchResult, FileOutline,
+    IntelHealth,
+};
 
 /// Stack size for the embedded engine thread. The Zig indexer/parser recurses
 /// deeply; the default thread stack is far too small and the engine traps.
@@ -269,6 +272,15 @@ impl CodeIntelligence for EmbeddedZindeks {
             &mapping::parse_tool_json(&text)?,
             path,
         ))
+    }
+
+    async fn architecture(&self, limit: u32) -> Result<ArchitectureSummary> {
+        let text = self
+            .tool_call_text("get_architecture", json!({"limit": limit}))
+            .await?;
+        Ok(mapping::architecture_from_value(&mapping::parse_tool_json(
+            &text,
+        )?))
     }
 
     async fn ensure_bound(&self) -> Result<()> {

@@ -38,6 +38,28 @@ pub struct FileOutline {
     pub symbols: Vec<OutlineSymbol>,
 }
 
+/// One ranked symbol from zindeks `get_architecture`. `degree` is fan-out
+/// or fan-in depending on the list it sits in (0 for entry points).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArchSymbol {
+    pub name: String,
+    pub kind: String,
+    /// Repo-relative, forward slashes.
+    pub file: String,
+    pub degree: u32,
+}
+
+/// Whole-repo shape from zindeks `get_architecture`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ArchitectureSummary {
+    pub total_files: u64,
+    pub total_symbols: u64,
+    pub total_edges: u64,
+    pub entry_points: Vec<ArchSymbol>,
+    pub high_fan_out: Vec<ArchSymbol>,
+    pub high_fan_in: Vec<ArchSymbol>,
+}
+
 /// zindeks server health snapshot.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IntelHealth {

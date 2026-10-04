@@ -9,7 +9,10 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::error::{IntelError, Result};
-use crate::types::{CodeContext, CodeSearchResult, FileOutline, IntelHealth, OutlineSymbol};
+use crate::types::{
+    ArchSymbol, ArchitectureSummary, CodeContext, CodeSearchResult, FileOutline, IntelHealth,
+    OutlineSymbol,
+};
 
 /// Normalizes a filesystem path for cross-plane comparison (`\` vs `/`, case,
 /// trailing separators). Used to match a bound root against `list_projects`.
@@ -212,6 +215,49 @@ pub(crate) fn outline_from_value(v: &Value, requested_path: &str) -> FileOutline
     FileOutline { path, symbols }
 }
 
+/// Maps a `get_architecture` payload. Missing sections map to empty lists;
+/// paths are normalized to forward slashes for display.
+pub(crate) fn architecture_from_value(v: &Value) -> ArchitectureSummary {
+    let list = |key: &str, degree_key: Option<&str>| -> Vec<ArchSymbol> {
+        v.get(key)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        Some(ArchSymbol {
+                            name: item.get("name")?.as_str()?.to_string(),
+                            kind: item
+                                .get("kind")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                            file: item
+                                .get("file")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .replace('\\', "/"),
+                            degree: degree_key
+                                .and_then(|k| item.get(k))
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0) as u32,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let total = |key: &str| v.get(key).and_then(Value::as_u64).unwrap_or(0);
+    ArchitectureSummary {
+        total_files: total("total_files"),
+        total_symbols: total("total_symbols"),
+        total_edges: total("total_edges"),
+        entry_points: list("entry_points", None),
+        high_fan_out: list("high_fan_out", Some("fan_out")),
+        high_fan_in: list("high_fan_in", Some("fan_in")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,5 +312,32 @@ mod tests {
         });
         let err = extract_tool_text(&resp, Path::new("/repo")).unwrap_err();
         assert!(matches!(err, IntelError::NotIndexed(_)));
+    }
+
+    #[test]
+    fn architecture_maps_totals_and_ranked_symbols() {
+        let v: Value = serde_json::from_str(
+            r#"{"total_files":132,"total_symbols":2624,"total_edges":6029,
+                "entry_points":[{"name":"main","kind":"function","file":"crates\\kode\\src\\main.rs"}],
+                "high_fan_out":[{"name":"execute_task","kind":"function","file":"crates\\kode\\src\\pipeline.rs","fan_out":81}],
+                "high_fan_in":[{"name":"apply_event","kind":"function","file":"crates\\kode\\src\\tui\\events.rs","fan_in":104}]}"#,
+        )
+        .unwrap();
+        let a = architecture_from_value(&v);
+        assert_eq!(
+            (a.total_files, a.total_symbols, a.total_edges),
+            (132, 2624, 6029)
+        );
+        assert_eq!(a.entry_points[0].name, "main");
+        assert_eq!(a.entry_points[0].file, "crates/kode/src/main.rs");
+        assert_eq!(a.high_fan_out[0].degree, 81);
+        assert_eq!(a.high_fan_in[0].degree, 104);
+    }
+
+    #[test]
+    fn architecture_tolerates_missing_sections() {
+        let a = architecture_from_value(&serde_json::json!({}));
+        assert_eq!(a.total_files, 0);
+        assert!(a.high_fan_in.is_empty());
     }
 }
