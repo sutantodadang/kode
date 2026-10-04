@@ -31,6 +31,15 @@ impl ToolRegistry {
         self.tools.push(tool);
     }
 
+    /// Replaces the tool with the same name in place (keeping the order
+    /// the model sees, which keeps prompt caches warm), or appends it.
+    pub fn replace(&mut self, tool: Arc<dyn Tool>) {
+        match self.tools.iter_mut().find(|t| t.name() == tool.name()) {
+            Some(slot) => *slot = tool,
+            None => self.tools.push(tool),
+        }
+    }
+
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.iter().find(|t| t.name() == name).cloned()
     }
@@ -149,7 +158,11 @@ impl ToolRuntime {
                 )));
             }
             Decision::Ask => {
-                let summary = format!("{name} {args}");
+                let mut summary = format!("{name} {args}");
+                if let Some(note) = tool.permission_note(&args, ctx).await {
+                    summary.push('\n');
+                    summary.push_str(&note);
+                }
                 if !self.handler.confirm(&summary).await {
                     return Err(ToolError::Denied(format!("{name} denied by user")));
                 }
@@ -192,6 +205,74 @@ mod tests {
             workspace_root: std::env::temp_dir(),
             cancel: kode_core::CancellationToken::new(),
         }
+    }
+
+    struct Noted;
+
+    #[async_trait::async_trait]
+    impl Tool for Noted {
+        fn name(&self) -> &str {
+            "write_file"
+        }
+        fn description(&self) -> &str {
+            "noted"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn required_permission(&self) -> crate::RequiredPermission {
+            crate::RequiredPermission::Mutating
+        }
+        async fn permission_note(
+            &self,
+            _args: &serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Option<String> {
+            Some("impact: f ← 2 callers".into())
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolOutput> {
+            Ok(ToolOutput {
+                content: "ok".into(),
+            })
+        }
+    }
+
+    struct RecordingHandler(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl PermissionHandler for RecordingHandler {
+        async fn confirm(&self, summary: &str) -> bool {
+            self.0.lock().unwrap().push(summary.to_string());
+            true
+        }
+    }
+
+    #[test]
+    fn replace_keeps_position_and_swaps_the_tool() {
+        let mut registry = ToolRegistry::with_builtins();
+        let before: Vec<String> = registry.specs().into_iter().map(|s| s.name).collect();
+        registry.replace(Arc::new(Noted));
+        let after: Vec<String> = registry.specs().into_iter().map(|s| s.name).collect();
+        assert_eq!(before, after);
+        assert_eq!(registry.get("write_file").unwrap().description(), "noted");
+    }
+
+    #[tokio::test]
+    async fn permission_note_is_added_to_the_prompt() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(Noted));
+        let handler = Arc::new(RecordingHandler(std::sync::Mutex::new(vec![])));
+        let runtime = ToolRuntime::new(registry, PermissionMode::Ask, handler.clone());
+        runtime
+            .execute("write_file", serde_json::json!({"path": "a"}), &ctx())
+            .await
+            .unwrap();
+        let prompts = handler.0.lock().unwrap();
+        assert!(prompts[0].ends_with("\nimpact: f ← 2 callers"));
     }
 
     #[tokio::test]

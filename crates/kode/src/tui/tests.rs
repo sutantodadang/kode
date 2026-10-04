@@ -218,6 +218,31 @@ fn permission_at_60_columns_shows_action_scope_and_choices() {
 }
 
 #[test]
+fn permission_note_second_line_is_rendered() {
+    let mut s = state();
+    let (tx, _rx) = oneshot::channel();
+    s.push_permission(PermReq {
+        summary: "apply_patch {…}\nimpact · fetch ← 1 caller, 1 crate, 1 test".into(),
+        responder: tx,
+    });
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| draw(frame, &mut s, std::path::Path::new(".")))
+        .unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(
+        screen.contains("impact · fetch ← 1 caller, 1 crate, 1 test"),
+        "{screen}"
+    );
+}
+
+#[test]
 fn long_permission_action_keeps_scope_visible_at_60_columns() {
     let mut s = state();
     let (tx, _rx) = oneshot::channel();

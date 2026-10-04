@@ -1415,25 +1415,26 @@ fn context_receipt_line(state: &AppState) -> Option<Line<'static>> {
 pub(crate) fn focus_surface_lines(state: &AppState) -> Vec<Line<'static>> {
     let bold = Style::default().add_modifier(Modifier::BOLD);
     if let Some(permission) = state.pending.front() {
-        return vec![
-            Line::from(Span::styled(
-                " PERMISSION",
-                Style::default()
-                    .fg(theme::WARN)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(format!(" {}", permission.summary), bold)),
-            Line::from(vec![
-                Span::styled(" Scope  ", Style::default().fg(theme::MUTED)),
-                Span::raw("this invocation only"),
-            ]),
-            Line::from(vec![
-                Span::styled(" [A]", bold),
-                Span::raw(" Allow once   "),
-                Span::styled("[D]", bold),
-                Span::raw(" Deny"),
-            ]),
-        ];
+        let mut lines = vec![Line::from(Span::styled(
+            " PERMISSION",
+            Style::default()
+                .fg(theme::WARN)
+                .add_modifier(Modifier::BOLD),
+        ))];
+        for line in permission.summary.lines() {
+            lines.push(Line::from(Span::styled(format!(" {line}"), bold)));
+        }
+        lines.push(Line::from(vec![
+            Span::styled(" Scope  ", Style::default().fg(theme::MUTED)),
+            Span::raw("this invocation only"),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(" [A]", bold),
+            Span::raw(" Allow once   "),
+            Span::styled("[D]", bold),
+            Span::raw(" Deny"),
+        ]));
+        return lines;
     }
 
     if state.running {
