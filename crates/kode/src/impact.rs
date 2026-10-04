@@ -157,6 +157,12 @@ pub fn row_text_parts(symbol: &str, callers: u32, crates: u32, tests: u32) -> St
     )
 }
 
+/// Shown instead of a trace when `name` is shared by `count` symbols: the
+/// engine cannot attribute cross-file calls to any one of them.
+pub fn ambiguous_text(name: &str, count: usize) -> String {
+    format!("impact · {name} — {count} symbols share this name; callers not traced")
+}
+
 pub fn row_text(i: &Impact) -> String {
     row_text_parts(&i.symbol, i.callers, i.crates, i.tests.len() as u32)
 }
