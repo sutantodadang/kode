@@ -80,6 +80,11 @@ pub enum LedgerEntry {
     Change {
         files: Vec<ChangeRecord>,
     },
+    GraphAnswer {
+        query: String,
+        symbol: String,
+        latency_ms: u64,
+    },
     Verify {
         name: String,
         outcome: VerifyOutcome,
@@ -143,6 +148,16 @@ impl LedgerRecorder {
                         removed: f.removed,
                     })
                     .collect(),
+            }),
+            KodeEvent::GraphAnswered {
+                query,
+                symbol,
+                latency_ms,
+                ..
+            } => self.entries.push(LedgerEntry::GraphAnswer {
+                query: query.clone(),
+                symbol: symbol.clone(),
+                latency_ms: *latency_ms,
             }),
             KodeEvent::VerifyStep {
                 name,
@@ -319,6 +334,26 @@ mod tests {
             text: "after".into(),
         });
         assert!(r.take().is_empty());
+    }
+
+    #[test]
+    fn graph_answered_is_recorded() {
+        let mut r = LedgerRecorder::default();
+        r.begin();
+        r.observe(&KodeEvent::GraphAnswered {
+            query: "callers".into(),
+            symbol: "append_turn".into(),
+            latency_ms: 12,
+            text: "…".into(),
+        });
+        assert_eq!(
+            r.take(),
+            vec![LedgerEntry::GraphAnswer {
+                query: "callers".into(),
+                symbol: "append_turn".into(),
+                latency_ms: 12
+            }]
+        );
     }
 
     #[test]

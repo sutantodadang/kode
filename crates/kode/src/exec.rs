@@ -41,6 +41,7 @@ pub async fn run(
     continue_session: bool,
     plan_mode: bool,
     image_paths: &[std::path::PathBuf],
+    no_graph_answer: bool,
 ) -> anyhow::Result<()> {
     let mut config = KodeConfig::load(cwd)?;
     if let Some(model) = model_override {
@@ -253,6 +254,7 @@ pub async fn run(
         None,
         Some(pipeline::new_cache_key()),
         &runtime,
+        !no_graph_answer,
     )
     .await;
 

@@ -290,6 +290,7 @@ pub async fn run_task(
         steering,
         None,
         &runtime,
+        true,
     )
     .await
 }
@@ -307,24 +308,36 @@ pub async fn run_task_with_input(
     steering: Option<mpsc::UnboundedReceiver<UserInput>>,
     cache_key: Option<String>,
     runtime: &SessionRuntime,
+    allow_graph_answer: bool,
 ) -> anyhow::Result<TaskOutcome> {
     let routed = crate::routing::route_task(input, cwd, config, plan_mode, &events, &cancel).await;
-    let result = execute_task(
-        input,
-        cwd,
-        &routed.applied.config,
-        events.clone(),
-        handler,
-        cancel,
-        history,
-        routed.applied.plan_mode,
-        steering,
-        config,
-        routed.reranker,
-        cache_key,
-        runtime,
-    )
-    .await;
+    let graph = match (&routed.decision, allow_graph_answer) {
+        (Some(decision), true) => {
+            try_graph_answer(decision, input, cwd, config, runtime, &events).await
+        }
+        _ => None,
+    };
+    let result = match graph {
+        Some(outcome) => Ok(outcome),
+        None => {
+            execute_task(
+                input,
+                cwd,
+                &routed.applied.config,
+                events.clone(),
+                handler,
+                cancel,
+                history,
+                routed.applied.plan_mode,
+                steering,
+                config,
+                routed.reranker,
+                cache_key,
+                runtime,
+            )
+            .await
+        }
+    };
     if let Some(decision) = &routed.decision
         && let Some(text) = crate::routing::log_route(
             cwd,
@@ -370,6 +383,99 @@ pub async fn run_task_with_input(
         }
     }
     result
+}
+
+/// Runs one graph lookup and reports it as a finished task. `None` (after
+/// a sourced note) means the caller must use the model.
+async fn answer_from_graph(
+    intel: &dyn CodeIntelligence,
+    query: crate::graph_answer::GraphQuery,
+    task: &str,
+    events: &EventBus,
+) -> Option<TaskOutcome> {
+    let started = std::time::Instant::now();
+    match crate::graph_answer::answer(intel, query, task).await {
+        Ok(found) => {
+            events.emit(KodeEvent::AgentStarted);
+            for text in &found.facts {
+                events.emit(KodeEvent::SourcedNote {
+                    text: text.clone(),
+                    source: NoteSource::Zindeks,
+                });
+            }
+            events.emit(KodeEvent::TaskProgress {
+                step: TaskStep::Understand,
+                done: true,
+            });
+            events.emit(KodeEvent::GraphAnswered {
+                query: found.query.as_str().to_string(),
+                symbol: found.symbol.clone(),
+                latency_ms: started.elapsed().as_millis() as u64,
+                text: found.text,
+            });
+            events.emit(KodeEvent::TaskFinished {
+                iterations: 0,
+                tool_calls: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_tokens: Some(0),
+            });
+            Some(TaskOutcome {
+                status: TaskStatus::Completed,
+                mutated: false,
+                verification: VerificationStatus::NotNeeded,
+                repair_attempted: false,
+                iterations: 0,
+                tool_calls: 0,
+                usage: Usage::default(),
+            })
+        }
+        Err(reason) => {
+            events.emit(KodeEvent::SourcedNote {
+                text: format!("graph couldn't answer: {reason}; asking model"),
+                source: NoteSource::Zindeks,
+            });
+            None
+        }
+    }
+}
+
+/// Graph path for a routed task, or `None` for the model path.
+async fn try_graph_answer(
+    decision: &kode_local::route::RouteDecision,
+    input: &UserInput,
+    cwd: &Path,
+    config: &KodeConfig,
+    runtime: &SessionRuntime,
+    events: &EventBus,
+) -> Option<TaskOutcome> {
+    let query = crate::graph_answer::wants_graph(decision, config.router.graph_threshold)?;
+    if !input.images.is_empty() {
+        return None; // images need a model
+    }
+    let intel = match runtime.intel(&config.zindeks, cwd).await {
+        Ok(Some(handle)) => {
+            if (handle.fresh || !handle.backend.watching())
+                && let Err(e) = handle.backend.ensure_bound().await
+            {
+                runtime.forget_intel().await;
+                events.emit(KodeEvent::SourcedNote {
+                    text: format!("graph couldn't answer: {e}; asking model"),
+                    source: NoteSource::Zindeks,
+                });
+                return None;
+            }
+            handle.backend
+        }
+        _ => {
+            events.emit(KodeEvent::SourcedNote {
+                text: "graph couldn't answer: code intelligence unavailable; asking model".into(),
+                source: NoteSource::Zindeks,
+            });
+            return None;
+        }
+    };
+    answer_from_graph(intel.as_ref(), query, &input.text, events).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1814,6 +1920,85 @@ mod change_set_tests {
         match rx.recv().await.unwrap() {
             KodeEvent::Note { text } => assert!(text.contains("changed files not recorded")),
             other => panic!("expected Note, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod graph_answer_pipeline_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn graph_answer_emits_facts_and_zero_usage() {
+        let mock = kode_intel::MockCodeIntelligence {
+            symbols: vec![kode_intel::GraphSymbol {
+                name: "append_turn".into(),
+                kind: "function".into(),
+                path: "s.rs".into(),
+                line: 1,
+                degree: 3,
+            }],
+            trace_nodes: vec![kode_intel::TraceNode {
+                name: "record".into(),
+                kind: "function".into(),
+                file: "t.rs".into(),
+                depth: 1,
+            }],
+            ..Default::default()
+        };
+        let bus = EventBus::new(32);
+        let mut rx = bus.subscribe();
+        let outcome = answer_from_graph(
+            &mock,
+            crate::graph_answer::GraphQuery::Callers,
+            "who calls append_turn",
+            &bus,
+        )
+        .await
+        .expect("answered");
+        assert_eq!(outcome.usage.input_tokens, 0);
+        assert!(!outcome.mutated);
+        let mut saw_fact = false;
+        let mut saw_answered = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                KodeEvent::SourcedNote {
+                    text,
+                    source: NoteSource::Zindeks,
+                } if text.contains("record") => saw_fact = true,
+                KodeEvent::GraphAnswered { query, .. } => saw_answered = query == "callers",
+                _ => {}
+            }
+        }
+        assert!(saw_fact && saw_answered);
+    }
+
+    #[tokio::test]
+    async fn graph_miss_emits_sourced_fallback_note() {
+        let mock = kode_intel::MockCodeIntelligence::default();
+        let bus = EventBus::new(8);
+        let mut rx = bus.subscribe();
+        assert!(
+            answer_from_graph(
+                &mock,
+                crate::graph_answer::GraphQuery::Callers,
+                "who calls ghost",
+                &bus
+            )
+            .await
+            .is_none()
+        );
+        match rx.try_recv().unwrap() {
+            KodeEvent::SourcedNote {
+                text,
+                source: NoteSource::Zindeks,
+            } => {
+                assert_eq!(
+                    text,
+                    "graph couldn't answer: no known symbol in the prompt; asking model"
+                )
+            }
+            other => panic!("unexpected {other:?}"),
         }
     }
 }

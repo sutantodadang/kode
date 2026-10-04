@@ -5,6 +5,7 @@ mod doctor;
 mod engine_assets;
 mod exec;
 mod first_run;
+mod graph_answer;
 mod index_cmd;
 mod intel_backend;
 mod intel_tools;
@@ -79,6 +80,9 @@ enum Command {
         /// Attach an image file to the task. May be repeated.
         #[arg(long = "image", value_name = "PATH")]
         images: Vec<std::path::PathBuf>,
+        /// Always use the model, never answer from the code graph alone.
+        #[arg(long)]
+        no_graph_answer: bool,
     },
     /// List available models for the configured provider.
     Models,
@@ -242,6 +246,7 @@ async fn main() -> anyhow::Result<()> {
             continue_,
             plan,
             images,
+            no_graph_answer,
         }) => {
             if let Some(e) = &effort
                 && !kode_core::config::VALID_EFFORTS.contains(&e.as_str())
@@ -252,7 +257,18 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             let cwd = std::env::current_dir()?;
-            exec::run(&task, &cwd, token, model, effort, continue_, plan, &images).await?;
+            exec::run(
+                &task,
+                &cwd,
+                token,
+                model,
+                effort,
+                continue_,
+                plan,
+                &images,
+                no_graph_answer,
+            )
+            .await?;
         }
         Some(Command::Models) => {
             let cwd = std::env::current_dir()?;

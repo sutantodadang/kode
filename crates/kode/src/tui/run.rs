@@ -656,6 +656,7 @@ pub(crate) fn submit_task(
             Some(steering_rx),
             Some(task_cache_key),
             &task_runtime,
+            true,
         ))
         .await
         {
