@@ -1142,9 +1142,12 @@ pub(crate) struct MotionCtx {
 }
 
 struct CachedTranscriptLine {
+    /// Copy of the rendered source, kept only so tests can check that every
+    /// in-place edit called `touch_transcript`.
+    #[cfg(test)]
     source: TranscriptLine,
-    /// False while the line was rendered inside its animation window; such an
-    /// entry is re-rendered once more after the window closes.
+    /// False while the line was rendered inside its animation window (tests).
+    #[cfg(test)]
     settled: bool,
     entries: Vec<(Line<'static>, Option<usize>, [u16; 2])>,
 }
@@ -1255,7 +1258,9 @@ impl TranscriptCache {
             }
         }
         let cached = CachedTranscriptLine {
+            #[cfg(test)]
             source: source.clone(),
+            #[cfg(test)]
             settled: !animating,
             entries: entries
                 .into_iter()
