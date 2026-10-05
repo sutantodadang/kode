@@ -12,11 +12,10 @@ use unicode_width::UnicodeWidthStr;
 
 use kode_core::event::TaskStep;
 
-use super::commands::{BUILTIN_COMMAND_NAMES, picker_filtered_items, slash_hint_items};
+use super::commands::{picker_filtered_items, slash_hint_items};
 use super::markdown;
 use super::state::*;
 use super::theme;
-use crate::custom_commands;
 
 /// Renders an 8-cell (by default) meter string: `■` for filled cells,
 /// `□` for empty ones. `budget == 0` yields an all-empty meter (no
@@ -1902,7 +1901,7 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
         && state.image_attachments.is_empty()
         && state.input.starts_with('/')
     {
-        let custom = custom_commands::discover(cwd, BUILTIN_COMMAND_NAMES);
+        let custom = state.custom_commands(cwd);
         slash_hint_items(&state.input, &custom)
     } else {
         Vec::new()

@@ -5133,3 +5133,24 @@ fn streamed_code_fence_state_survives_chunks() {
     assert!(!app.current_stream.contains('\n'));
     assert_stream_matches_whole_text(&["```rust\nfn a() {", "}\n", "```\nafter\n"]);
 }
+
+#[test]
+fn custom_commands_are_cached_for_two_seconds() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("kode-custom-cache-{nanos}"));
+    let cmds = dir.join(".kode").join("commands");
+    std::fs::create_dir_all(&cmds).unwrap();
+    let mut app = state();
+    let first = app.custom_commands(&dir);
+    std::fs::write(cmds.join("zzcachecmd.md"), "body").unwrap();
+    let second = app.custom_commands(&dir);
+    assert_eq!(first, second, "cached list reused within 2 s");
+    assert!(!second.iter().any(|c| c.name == "zzcachecmd"));
+    app.custom_commands_cache = None;
+    let third = app.custom_commands(&dir);
+    assert!(third.iter().any(|c| c.name == "zzcachecmd"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

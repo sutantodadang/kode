@@ -398,6 +398,9 @@ pub struct AppState {
     /// Lowest transcript index edited in place since the last draw
     /// (`usize::MAX` = nothing dirty). See `touch_transcript`.
     pub(crate) transcript_dirty_from: usize,
+    /// Discovered custom commands with the time they were read; see
+    /// `AppState::custom_commands`.
+    pub(crate) custom_commands_cache: Option<(Instant, Vec<crate::custom_commands::CustomCommand>)>,
     pub current_stream: String,
     /// True once complete lines were moved out of `current_stream`; the tail
     /// after the last newline is then still a pending piece (see
@@ -610,6 +613,23 @@ pub struct TranscriptHit {
 }
 
 impl AppState {
+    /// Custom commands under `.kode/commands` and `~/.kode/commands`,
+    /// refreshed at most every 2 s so the `/` hint menu does not re-read
+    /// command files every frame.
+    pub(crate) fn custom_commands(
+        &mut self,
+        cwd: &Path,
+    ) -> Vec<crate::custom_commands::CustomCommand> {
+        if let Some((at, cached)) = &self.custom_commands_cache
+            && at.elapsed() < Duration::from_secs(2)
+        {
+            return cached.clone();
+        }
+        let fresh = crate::custom_commands::discover(cwd, super::commands::BUILTIN_COMMAND_NAMES);
+        self.custom_commands_cache = Some((Instant::now(), fresh.clone()));
+        fresh
+    }
+
     /// Marks the transcript line at `index` as edited in place so the render
     /// cache re-renders it. Every IN-PLACE edit of an existing transcript line
     /// must call this (pushes are detected by length).
@@ -622,6 +642,7 @@ impl AppState {
             transcript: Vec::new(),
             transcript_cache: Default::default(),
             transcript_dirty_from: usize::MAX,
+            custom_commands_cache: None,
             current_stream: String::new(),
             stream_tail_open: false,
             status: StatusInfo::new(provider, model, effort),

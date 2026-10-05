@@ -1779,7 +1779,7 @@ pub(crate) fn handle_key(
         && state.image_attachments.is_empty()
         && state.input.starts_with('/')
     {
-        let custom = custom_commands::discover(cwd, BUILTIN_COMMAND_NAMES);
+        let custom = state.custom_commands(cwd);
         slash_hint_items(&state.input, &custom).len()
     } else {
         0
@@ -1803,7 +1803,7 @@ pub(crate) fn handle_key(
             }
         }
         KeyCode::Tab if hint_count > 0 => {
-            let custom = custom_commands::discover(cwd, BUILTIN_COMMAND_NAMES);
+            let custom = state.custom_commands(cwd);
             let items = slash_hint_items(&state.input, &custom);
             let (name, _) = items[state.slash_selected.min(items.len() - 1)].clone();
             state.input = format!("{name} ");
