@@ -395,7 +395,6 @@ pub(crate) fn detect_branch(cwd: &Path) -> Option<String> {
 /// transcript.
 async fn with_terminal_suspended<T>(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    stderr_guard: &mut Option<TuiStderrGuard>,
     flow: impl Future<Output = T>,
 ) -> io::Result<T> {
     // Mouse capture first: on Windows, DisableMouseCapture restores the console
@@ -408,9 +407,9 @@ async fn with_terminal_suspended<T>(
         LeaveAlternateScreen
     )?;
     disable_raw_mode()?;
-    *stderr_guard = None; // restores the real stderr for prompts
+    // stderr stays redirected: suspended flows prompt on stdout, and in-process
+    // engines (zindeks watcher logs) must not write into the prompt.
     let out = flow.await;
-    *stderr_guard = Some(TuiStderrGuard::redirect()?);
     enable_raw_mode()?;
     execute!(
         std::io::stdout(),
@@ -866,7 +865,7 @@ fn record_failed_turn(
 pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyhow::Result<()> {
     let mut config = KodeConfig::load(cwd).unwrap_or_default();
 
-    let mut stderr_guard = Some(TuiStderrGuard::redirect()?);
+    let _stderr_guard = TuiStderrGuard::redirect()?;
 
     enable_raw_mode()?;
     execute!(
@@ -1104,7 +1103,6 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                                     let provider = config.model.provider.clone();
                                                     let outcome = with_terminal_suspended(
                                                         &mut terminal,
-                                                        &mut stderr_guard,
                                                         crate::auth::login(&provider),
                                                     ).await;
                                                     mouse_captured = true;
@@ -1121,7 +1119,6 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                                     let cfg = config.zindeks.clone();
                                                     let outcome = with_terminal_suspended(
                                                         &mut terminal,
-                                                        &mut stderr_guard,
                                                         crate::setup::install_zindeks(&cfg),
                                                     ).await;
                                                     mouse_captured = true;
