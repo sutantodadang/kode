@@ -232,17 +232,36 @@ pub enum KodeEvent {
 #[derive(Clone)]
 pub struct EventBus {
     sender: broadcast::Sender<KodeEvent>,
+    /// Unbounded per-consumer queues that never drop events; clones share it.
+    lossless: std::sync::Arc<std::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<KodeEvent>>>>,
 }
 
 impl EventBus {
     pub fn new(capacity: usize) -> Self {
         let (sender, _) = broadcast::channel(capacity);
-        Self { sender }
+        Self {
+            sender,
+            lossless: std::sync::Arc::default(),
+        }
     }
 
     /// Emits an event. Ignores the error when there are no subscribers.
     pub fn emit(&self, event: KodeEvent) {
-        let _ = self.sender.send(event);
+        let _ = self.sender.send(event.clone());
+        if let Ok(mut senders) = self.lossless.lock() {
+            senders.retain(|tx| tx.send(event.clone()).is_ok());
+        }
+    }
+
+    /// Unbounded receiver that never drops events; for the one consumer that
+    /// must see every event (TUI, exec printer). Memory is bounded by what the
+    /// pipeline emits.
+    pub fn subscribe_lossless(&self) -> tokio::sync::mpsc::UnboundedReceiver<KodeEvent> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        if let Ok(mut senders) = self.lossless.lock() {
+            senders.push(tx);
+        }
+        rx
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<KodeEvent> {
@@ -261,6 +280,33 @@ mod tests {
         bus.emit(KodeEvent::AgentStarted);
         let event = rx.recv().await.unwrap();
         assert!(matches!(event, KodeEvent::AgentStarted));
+    }
+
+    #[tokio::test]
+    async fn lossless_subscriber_receives_every_event_in_order() {
+        let bus = EventBus::new(8);
+        let mut rx = bus.subscribe_lossless();
+        for i in 0..1000 {
+            bus.emit(KodeEvent::ModelToken {
+                text: i.to_string(),
+            });
+        }
+        for i in 0..1000 {
+            match rx.recv().await.unwrap() {
+                KodeEvent::ModelToken { text } => assert_eq!(text, i.to_string()),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn dropped_lossless_receiver_is_pruned() {
+        let bus = EventBus::new(8);
+        let rx = bus.subscribe_lossless();
+        drop(rx);
+        bus.emit(KodeEvent::AgentStarted);
+        assert!(bus.lossless.lock().unwrap().is_empty());
+        bus.emit(KodeEvent::AgentStarted);
     }
 
     #[test]

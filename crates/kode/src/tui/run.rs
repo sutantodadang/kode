@@ -964,7 +964,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
     }
 
     let events = EventBus::new(256);
-    let mut event_rx = events.subscribe();
+    let mut event_rx = events.subscribe_lossless();
 
     let mut key_events = EventStream::new();
     let mut pending_terminal_events = VecDeque::new();
@@ -1366,8 +1366,8 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
             }
 
             ev = event_rx.recv() => {
-                match ev {
-                    Ok(ev) => {
+                {
+                    if let Some(ev) = ev {
                         let finished_tool_calls = match &ev {
                             KodeEvent::TaskFinished { tool_calls, .. } => Some(*tool_calls),
                             _ => None,
@@ -1460,12 +1460,6 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                             }
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        apply_event(&mut state, KodeEvent::Note {
-                            text: format!("event stream lagged — {n} events dropped"),
-                        });
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
                 }
             }
 
