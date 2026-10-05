@@ -1366,8 +1366,11 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
             }
 
             ev = event_rx.recv() => {
-                {
-                    if let Some(ev) = ev {
+                if let Some(mut ev) = ev {
+                    // Cap per iteration so key presses stay responsive under
+                    // a flood; the rest is handled on the next iteration.
+                    let mut drained = 0usize;
+                    loop {
                         let finished_tool_calls = match &ev {
                             KodeEvent::TaskFinished { tool_calls, .. } => Some(*tool_calls),
                             _ => None,
@@ -1458,6 +1461,14 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                 current_cancel = Some(submitted.cancel);
                                 current_steering = Some(submitted.steering);
                             }
+                        }
+                        drained += 1;
+                        if drained >= 1024 {
+                            break;
+                        }
+                        match event_rx.try_recv() {
+                            Ok(next) => ev = next,
+                            Err(_) => break,
                         }
                     }
                 }
