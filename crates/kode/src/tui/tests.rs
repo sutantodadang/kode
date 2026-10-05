@@ -5066,3 +5066,70 @@ fn transcript_cache_panics_on_untouched_in_place_edit() {
     transcript[0].text = "sneaky".to_string();
     cache.update(&transcript, 80, plain_ctx(), usize::MAX);
 }
+
+fn finish_task(app: &mut AppState) {
+    apply_event(
+        app,
+        KodeEvent::TaskFinished {
+            iterations: 1,
+            tool_calls: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: None,
+        },
+    );
+}
+
+/// Feeds `tokens` through the streaming path and checks the result equals
+/// pushing the whole text through `push_stream_lines` once (the old behavior).
+fn assert_stream_matches_whole_text(tokens: &[&str]) -> AppState {
+    let full: String = tokens.concat();
+    let mut expected = state();
+    push_stream_lines(&mut expected, &full);
+
+    let mut actual = state();
+    for token in tokens {
+        apply_event(
+            &mut actual,
+            KodeEvent::ModelToken {
+                text: (*token).to_string(),
+            },
+        );
+        assert!(
+            !actual.current_stream.contains('\n'),
+            "current_stream kept a complete line"
+        );
+    }
+    finish_task(&mut actual);
+    assert_eq!(actual.last_response, full);
+    assert!(actual.transcript.len() >= expected.transcript.len());
+    for (i, line) in expected.transcript.iter().enumerate() {
+        assert!(actual.transcript[i] == *line, "transcript line {i} differs");
+    }
+    assert_eq!(actual.md_in_code_block, expected.md_in_code_block);
+    actual
+}
+
+#[test]
+fn streamed_lines_match_whole_text_flush() {
+    let actual = assert_stream_matches_whole_text(&["a\nb", "\n\nc", "d\n"]);
+    assert_eq!(actual.last_response, "a\nb\n\ncd\n");
+    assert_stream_matches_whole_text(&["a\nb ", "\n\nc", "d\n"]);
+    assert_stream_matches_whole_text(&["one ", "two\n", "three ", "\n"]);
+}
+
+#[test]
+fn streamed_code_fence_state_survives_chunks() {
+    let mut app = state();
+    for token in ["```rust\nfn a() {", "}\n", "x "] {
+        apply_event(
+            &mut app,
+            KodeEvent::ModelToken {
+                text: token.to_string(),
+            },
+        );
+    }
+    assert!(app.md_in_code_block, "fence opened in an earlier chunk");
+    assert!(!app.current_stream.contains('\n'));
+    assert_stream_matches_whole_text(&["```rust\nfn a() {", "}\n", "```\nafter\n"]);
+}

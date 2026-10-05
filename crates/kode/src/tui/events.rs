@@ -16,38 +16,63 @@ pub(crate) fn flush_model_stream(state: &mut AppState) {
     }
     state.stream_last_flush = None;
 
-    if !state.current_stream.is_empty() {
+    // `stream_tail_open`: complete lines were already moved out of
+    // `current_stream`, so the (possibly empty) tail after the last `\n` is
+    // still a pending piece and must be pushed even when empty.
+    if !state.current_stream.is_empty() || state.stream_tail_open {
         let text = std::mem::take(&mut state.current_stream);
+        state.stream_tail_open = false;
         state.response_buf.push_str(&text);
-        for line in text.split('\n') {
-            if line.is_empty() {
-                state.transcript.push(TranscriptLine::new(Gutter::None, ""));
-            } else {
-                if !state.reply_label_shown {
-                    state.reply_label_shown = true;
-                    if !matches!(state.transcript.last(), Some(l) if l.gutter == Gutter::None && l.text.is_empty())
-                    {
-                        state.transcript.push(TranscriptLine::new(Gutter::None, ""));
-                    }
-                    state
-                        .transcript
-                        .push(TranscriptLine::new(Gutter::Reply, "KODE"));
-                }
-                let rendered = markdown::render_line(line, &mut state.md_in_code_block);
-                if rendered.kind == markdown::MdKind::Heading
-                    && !matches!(state.transcript.last(), Some(l) if matches!(l.gutter, Gutter::None | Gutter::Reply))
+        push_stream_lines(state, &text);
+    }
+}
+
+/// Splits `text` on `\n` and pushes each piece into the transcript: the KODE
+/// reply label before the first prose line, blank spacing around headings,
+/// and markdown-rendered prose lines.
+pub(crate) fn push_stream_lines(state: &mut AppState, text: &str) {
+    for line in text.split('\n') {
+        if line.is_empty() {
+            state.transcript.push(TranscriptLine::new(Gutter::None, ""));
+        } else {
+            if !state.reply_label_shown {
+                state.reply_label_shown = true;
+                if !matches!(state.transcript.last(), Some(l) if l.gutter == Gutter::None && l.text.is_empty())
                 {
                     state.transcript.push(TranscriptLine::new(Gutter::None, ""));
                 }
-                state.transcript.push(TranscriptLine::markdown(
-                    Gutter::Prose,
-                    line,
-                    rendered.kind,
-                    rendered.spans,
-                ));
+                state
+                    .transcript
+                    .push(TranscriptLine::new(Gutter::Reply, "KODE"));
             }
+            let rendered = markdown::render_line(line, &mut state.md_in_code_block);
+            if rendered.kind == markdown::MdKind::Heading
+                && !matches!(state.transcript.last(), Some(l) if matches!(l.gutter, Gutter::None | Gutter::Reply))
+            {
+                state.transcript.push(TranscriptLine::new(Gutter::None, ""));
+            }
+            state.transcript.push(TranscriptLine::markdown(
+                Gutter::Prose,
+                line,
+                rendered.kind,
+                rendered.spans,
+            ));
         }
     }
+}
+
+/// Moves every complete (newline-terminated) line of `current_stream` into
+/// the transcript, keeping only the unfinished tail. Keeps the live stream
+/// region (re-rendered each frame) to a single partial line.
+pub(crate) fn flush_complete_stream_lines(state: &mut AppState) {
+    let Some(pos) = state.current_stream.rfind('\n') else {
+        return;
+    };
+    let complete = state.current_stream[..=pos].to_string();
+    state.current_stream.drain(..=pos);
+    state.response_buf.push_str(&complete);
+    push_stream_lines(state, &complete[..pos]);
+    state.stream_tail_open = true;
 }
 
 /// Applies one `KodeEvent` to `state`. Any accumulated `current_stream` text
@@ -101,6 +126,7 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
                 let pending = std::mem::take(&mut state.stream_pending);
                 state.current_stream.push_str(&pending);
                 state.stream_last_flush = None;
+                flush_complete_stream_lines(state);
             }
         }
         KodeEvent::ToolRequested { .. } => {}

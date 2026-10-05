@@ -399,6 +399,10 @@ pub struct AppState {
     /// (`usize::MAX` = nothing dirty). See `touch_transcript`.
     pub(crate) transcript_dirty_from: usize,
     pub current_stream: String,
+    /// True once complete lines were moved out of `current_stream`; the tail
+    /// after the last newline is then still a pending piece (see
+    /// `flush_model_stream`).
+    pub(crate) stream_tail_open: bool,
     pub status: StatusInfo,
     pub running: bool,
     /// Whether the active pipeline currently has an agent receiver ready for
@@ -619,6 +623,7 @@ impl AppState {
             transcript_cache: Default::default(),
             transcript_dirty_from: usize::MAX,
             current_stream: String::new(),
+            stream_tail_open: false,
             status: StatusInfo::new(provider, model, effort),
             running: false,
             steering_active: false,
@@ -1252,6 +1257,7 @@ pub(crate) fn restore_session(state: &mut AppState, cwd: &Path, id: &str) -> boo
             state.index_line = None;
             state.history.clear();
             state.current_stream.clear();
+            state.stream_tail_open = false;
             state.stream_pending.clear();
             state.stream_last_flush = None;
             state.completion = None;
