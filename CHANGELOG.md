@@ -53,6 +53,11 @@ minor versions may contain breaking changes).
   router-questions version changed. Team datasets and published team models
   from the older three-question version are not comparable and must be
   re-collected.
+- zindeks engine pinned to v0.10.4, which links cross-file calls to symbols
+  whose name is shared (e.g. `new`); earlier releases dropped them
+  (sutantodadang/zindeks#10). Run `kode setup` to install it. Blast radius
+  now traces shared names like any other symbol, and graph answers trace the
+  most connected symbol of a shared name and say so in the answer.
 
 ## [0.5.0 – 0.5.6] - 2026-09-27 to 2026-10-01
 

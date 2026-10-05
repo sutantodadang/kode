@@ -88,12 +88,15 @@ impl CodeIntelligence for MockCodeIntelligence {
 
     async fn exact_symbols(&self, name: &str, path: Option<&str>) -> Result<Vec<GraphSymbol>> {
         let path = path.map(|p| p.replace('\\', "/").trim_start_matches("./").to_string());
-        Ok(self
+        let mut rows: Vec<GraphSymbol> = self
             .symbols
             .iter()
             .filter(|s| s.name == name && path.as_ref().is_none_or(|p| &s.path == p))
             .cloned()
-            .collect())
+            .collect();
+        // Same order the trait promises: most connected first, then path.
+        rows.sort_by(|a, b| b.degree.cmp(&a.degree).then_with(|| a.path.cmp(&b.path)));
+        Ok(rows)
     }
 
     async fn trace_ids(

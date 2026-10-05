@@ -173,12 +173,17 @@ pub async fn answer(
     let (name, rows) = resolve_symbol(intel, &candidates(task))
         .await
         .ok_or_else(|| "no known symbol in the prompt".to_string())?;
-    if query != GraphQuery::Definition && rows.len() > 1 {
-        return Err(format!(
-            "`{name}` names {} symbols; ask about one by file",
+    // Rows come most-connected first. For a shared name, trace that one and
+    // say so in the heading rather than guessing silently.
+    let scope = if rows.len() > 1 {
+        format!(
+            "{}; 1 of {} symbols named {name}, the most connected",
+            rows[0].path,
             rows.len()
-        ));
-    }
+        )
+    } else {
+        rows[0].path.clone()
+    };
     let (facts, heading) = match query {
         GraphQuery::Definition => {
             let mut facts: Vec<String> = rows
@@ -215,13 +220,12 @@ pub async fn answer(
             (
                 facts,
                 format!(
-                    "{} of {name} ({}):",
+                    "{} of {name} ({scope}):",
                     if direction == TraceDirection::Inbound {
                         "Callers"
                     } else {
                         "Callees"
                     },
-                    rows[0].path
                 ),
             )
         }
@@ -263,10 +267,7 @@ pub async fn answer(
             if tests > 0 {
                 facts.push(format!("covered by {tests} tests"));
             }
-            (
-                facts,
-                format!("Changing {name} ({}) affects:", rows[0].path),
-            )
+            (facts, format!("Changing {name} ({scope}) affects:"))
         }
         GraphQuery::Structure => unreachable!("handled above"),
     };
@@ -427,7 +428,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ambiguous_symbol_falls_back_for_callers_but_lists_definitions() {
+    async fn shared_name_traces_the_most_connected_symbol_and_says_so() {
         let mock = MockCodeIntelligence {
             symbols: vec![
                 sym(1, "new", "crates/a.rs", 3),
@@ -436,15 +437,22 @@ mod tests {
             trace_nodes: vec![tnode(3, "x", "y.rs", 1, 1)],
             ..Default::default()
         };
-        let err = answer(
+        let a = answer(
             &mock,
             GraphQuery::Callers,
             "who calls `new`",
             Path::new("."),
         )
         .await
-        .unwrap_err();
-        assert!(err.contains("names 2 symbols"), "{err}");
+        .unwrap();
+        assert!(
+            a.text.starts_with(
+                "Callers of new (crates/b.rs; 1 of 2 symbols named new, the most connected):"
+            ),
+            "{}",
+            a.text
+        );
+        assert_eq!(a.facts, vec!["new ← x (y.rs)"]);
         let def = answer(
             &mock,
             GraphQuery::Definition,

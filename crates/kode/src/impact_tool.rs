@@ -75,7 +75,7 @@ impl ImpactAwareTool {
         rel: &str,
         range: (u32, u32),
         depth: u32,
-    ) -> std::result::Result<Found, String> {
+    ) -> std::result::Result<Vec<Impact>, String> {
         let rel = index_path(root, rel);
         let outline = self
             .intel
@@ -86,20 +86,11 @@ impl ImpactAwareTool {
             return Err(format!("no indexed symbols for {rel}"));
         }
         let mut classifier = TestClassifier::new(root);
-        let mut out = Found::default();
+        let mut out = Vec::new();
+        // Shared names (`new`, `run`) are traced like any other: the edited
+        // symbol is picked by file and line, and zindeks >= 0.10.4 links
+        // cross-file calls to the right one (zindeks#10).
         for symbol in impact::changed_symbols(&outline, range) {
-            // The engine drops cross-file call edges to names it cannot
-            // resolve uniquely, so a shared name would trace as "0 callers".
-            let everywhere = self
-                .intel
-                .exact_symbols(&symbol, None)
-                .await
-                .map_err(|e| e.to_string())?
-                .len();
-            if everywhere > 1 {
-                out.ambiguous.push((symbol, everywhere));
-                continue;
-            }
             let rows = self
                 .intel
                 .exact_symbols(&symbol, Some(&rel))
@@ -123,21 +114,12 @@ impl ImpactAwareTool {
                 .trace_ids(&ids, TraceDirection::Inbound, depth)
                 .await
                 .map_err(|e| e.to_string())?;
-            out.impacts
-                .push(impact::summarize(&rel, &symbol, &nodes, &mut |n| {
-                    classifier.is_test(&n.name, &n.file, n.line)
-                }));
+            out.push(impact::summarize(&rel, &symbol, &nodes, &mut |n| {
+                classifier.is_test(&n.name, &n.file, n.line)
+            }));
         }
         Ok(out)
     }
-}
-
-/// What one edit's blast radius came to: traced symbols, plus names shared
-/// by several symbols (`(name, count)`), which are reported, not traced.
-#[derive(Default)]
-struct Found {
-    impacts: Vec<Impact>,
-    ambiguous: Vec<(String, usize)>,
 }
 
 fn rel_path(args: &serde_json::Value) -> Option<String> {
@@ -202,21 +184,11 @@ impl Tool for ImpactAwareTool {
         let current = read(&ctx.workspace_root, &rel)?;
         let range = impact::range_of_substring(&current, old_string)?;
         let _ = self.intel.refresh().await; // best effort: fresh outline
-        let found = self
+        let impacts = self
             .impacts(&ctx.workspace_root, &rel, range, 3)
             .await
             .ok()?;
-        let rows: Vec<String> = found
-            .impacts
-            .iter()
-            .map(impact::row_text)
-            .chain(
-                found
-                    .ambiguous
-                    .iter()
-                    .map(|(name, n)| impact::ambiguous_text(name, *n)),
-            )
-            .collect();
+        let rows: Vec<String> = impacts.iter().map(impact::row_text).collect();
         (!rows.is_empty()).then(|| rows.join("\n"))
     }
 
@@ -240,12 +212,7 @@ impl Tool for ImpactAwareTool {
             return Ok(output);
         };
         match self.impacts(&ctx.workspace_root, &rel, range, 3).await {
-            Ok(Found { impacts, ambiguous }) => {
-                for (name, n) in &ambiguous {
-                    let text = impact::ambiguous_text(name, *n);
-                    output.content.push_str(&format!("\n\n{text}"));
-                    self.events.emit(KodeEvent::Note { text });
-                }
+            Ok(impacts) => {
                 for i in &impacts {
                     self.events.emit(KodeEvent::Impact {
                         file: i.file.clone(),
@@ -345,7 +312,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_name_is_reported_not_traced_as_zero_callers() {
+    async fn shared_name_traces_the_edited_symbol() {
         let root = workspace();
         std::fs::write(root.join("lib.rs"), "fn fetch() {\n    1\n}\n").unwrap();
         let mut other = gsym(2, "fetch", 10, 12);
@@ -369,16 +336,17 @@ mod tests {
             )
             .await
             .unwrap();
-        let text = "impact · fetch — 2 symbols share this name; callers not traced";
-        assert!(out.content.contains(text), "{}", out.content);
+        assert!(
+            out.content
+                .contains("impact: fetch has 1 caller across 1 crate:"),
+            "{}",
+            out.content
+        );
         let events: Vec<KodeEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, KodeEvent::Note { text: t } if t == text))
-        );
-        assert!(
-            !events.iter().any(|e| matches!(e, KodeEvent::Impact { .. })),
+            events.iter().any(
+                |e| matches!(e, KodeEvent::Impact { symbol, callers: 1, .. } if symbol == "fetch")
+            ),
             "{events:?}"
         );
     }
