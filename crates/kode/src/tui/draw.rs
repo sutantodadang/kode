@@ -1196,7 +1196,9 @@ impl TranscriptCache {
             }
         }
         self.animating = still_animating;
-        #[cfg(debug_assertions)]
+        // Test-only (not debug_assertions): the full compare is exactly the
+        // per-frame cost this cache avoids, and dev builds should stay fast.
+        #[cfg(test)]
         for (i, cached) in self.lines.iter().enumerate() {
             if cached.settled {
                 assert!(
