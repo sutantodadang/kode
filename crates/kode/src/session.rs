@@ -18,6 +18,10 @@ pub struct Turn {
     pub images: Vec<ImageAttachment>,
     pub response: String,
     pub tool_calls: u32,
+    /// What the agent knew, decided, changed and verified this turn.
+    /// Empty for turns written before ledgers existed.
+    #[serde(default)]
+    pub ledger: Vec<crate::ledger::LedgerEntry>,
 }
 
 /// Listing row for the `/resume` picker.
@@ -173,6 +177,55 @@ pub fn append_turn(cwd: &Path, id: &str, turn: &Turn) -> std::io::Result<()> {
     writeln!(f, "{}", serde_json::to_string(turn)?)
 }
 
+/// Rewrites the last valid turn line in place (temp file + rename), e.g.
+/// to record a memory saved after the turn finished. Every other line is
+/// kept byte-for-byte.
+pub fn amend_last_turn(cwd: &Path, id: &str, f: impl FnOnce(&mut Turn)) -> std::io::Result<()> {
+    let path = session_path(cwd, id);
+    let text = fs::read_to_string(&path)?;
+    let lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let index = (1..lines.len())
+        .rev()
+        .find(|&i| serde_json::from_str::<Turn>(&lines[i]).is_ok())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no turn to amend"))?;
+    rewrite_line(&path, lines, index, f)
+}
+
+/// Rewrites the `index`-th (0-based) line that parses as a [`Turn`], same
+/// temp file + rename as [`amend_last_turn`]. `NotFound` when the session
+/// has fewer turns.
+pub fn amend_turn(
+    cwd: &Path,
+    id: &str,
+    index: usize,
+    f: impl FnOnce(&mut Turn),
+) -> std::io::Result<()> {
+    let path = session_path(cwd, id);
+    let text = fs::read_to_string(&path)?;
+    let lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let line = (1..lines.len())
+        .filter(|&i| serde_json::from_str::<Turn>(&lines[i]).is_ok())
+        .nth(index)
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no such turn to amend")
+        })?;
+    rewrite_line(&path, lines, line, f)
+}
+
+fn rewrite_line(
+    path: &Path,
+    mut lines: Vec<String>,
+    index: usize,
+    f: impl FnOnce(&mut Turn),
+) -> std::io::Result<()> {
+    let mut turn: Turn = serde_json::from_str(&lines[index])?;
+    f(&mut turn);
+    lines[index] = serde_json::to_string(&turn)?;
+    let tmp = path.with_extension("jsonl.tmp");
+    fs::write(&tmp, lines.join("\n") + "\n")?;
+    fs::rename(&tmp, path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +256,7 @@ mod tests {
             images: Vec::new(),
             response: format!("answer to {task}"),
             tool_calls: 1,
+            ledger: Vec::new(),
         }
     }
 
@@ -283,5 +337,100 @@ mod tests {
         assert_eq!(&id[8..9], "-");
         assert!(rfc.ends_with('Z'));
         assert_eq!(rfc.len(), 20);
+    }
+
+    #[test]
+    fn amend_last_turn_only_touches_last_turn() {
+        let cwd = temp_cwd();
+        let id = create(&cwd, "codex", "m").unwrap();
+        append_turn(&cwd, &id, &turn("first")).unwrap();
+        let path = cwd
+            .join(".kode")
+            .join("sessions")
+            .join(format!("{id}.jsonl"));
+        {
+            let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(f, "{{not json").unwrap();
+        }
+        append_turn(&cwd, &id, &turn("last")).unwrap();
+        {
+            let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(f).unwrap(); // trailing blank line
+        }
+        let before = fs::read_to_string(&path).unwrap();
+        amend_last_turn(&cwd, &id, |t| {
+            t.ledger.push(crate::ledger::LedgerEntry::Memory {
+                id: "m1".into(),
+                text: "x".into(),
+                team: false,
+            })
+        })
+        .unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        let (b, a): (Vec<_>, Vec<_>) = (before.lines().collect(), after.lines().collect());
+        assert_eq!(b[..3], a[..3]); // header, first, corrupt line unchanged
+        let (turns, corrupt) = load(&cwd, &id).unwrap();
+        assert_eq!(corrupt, 1);
+        assert_eq!(turns[1].task, "last");
+        assert_eq!(turns[1].ledger.len(), 1);
+    }
+
+    #[test]
+    fn amend_turn_targets_indexed_turn_and_rejects_out_of_range() {
+        let cwd = temp_cwd();
+        let id = create(&cwd, "codex", "m").unwrap();
+        append_turn(&cwd, &id, &turn("first")).unwrap();
+        let path = cwd
+            .join(".kode")
+            .join("sessions")
+            .join(format!("{id}.jsonl"));
+        {
+            let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(f, "{{not json").unwrap();
+        }
+        append_turn(&cwd, &id, &turn("second")).unwrap();
+        amend_turn(&cwd, &id, 0, |t| {
+            t.ledger.push(crate::ledger::LedgerEntry::Memory {
+                id: "m1".into(),
+                text: "x".into(),
+                team: false,
+            })
+        })
+        .unwrap();
+        let (turns, corrupt) = load(&cwd, &id).unwrap();
+        assert_eq!(corrupt, 1);
+        assert_eq!(turns[0].ledger.len(), 1);
+        assert!(turns[1].ledger.is_empty());
+        let err = amend_turn(&cwd, &id, 2, |_| {}).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn old_turn_lines_load_with_empty_ledger() {
+        let cwd = temp_cwd();
+        let id = create(&cwd, "codex", "m").unwrap();
+        let path = cwd
+            .join(".kode")
+            .join("sessions")
+            .join(format!("{id}.jsonl"));
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        // A turn written before the ledger field existed.
+        writeln!(
+            f,
+            r#"{{"ts":"2026-08-17T00:00:00Z","task":"old","response":"r","tool_calls":0}}"#
+        )
+        .unwrap();
+        let mut new_turn = turn("new");
+        new_turn.ledger = vec![crate::ledger::LedgerEntry::Usage {
+            input: 1,
+            output: 2,
+            cached: None,
+        }];
+        append_turn(&cwd, &id, &new_turn).unwrap();
+
+        let (turns, corrupt) = load(&cwd, &id).unwrap();
+        assert_eq!(corrupt, 0);
+        assert!(turns[0].ledger.is_empty());
+        assert_eq!(turns[1].ledger, new_turn.ledger);
     }
 }

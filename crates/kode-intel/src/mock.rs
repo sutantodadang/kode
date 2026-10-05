@@ -1,6 +1,9 @@
 use crate::CodeIntelligence;
 use crate::error::{IntelError, Result};
-use crate::types::{CodeContext, CodeContextRequest, CodeSearchResult, FileOutline, IntelHealth};
+use crate::types::{
+    ArchitectureSummary, CodeContext, CodeContextRequest, CodeSearchResult, FileOutline,
+    GraphSymbol, IntelHealth, TraceNode,
+};
 
 /// A canned [`CodeIntelligence`] implementation for tests. Defaults to an
 /// empty-but-healthy backend; override the fields to script specific
@@ -13,6 +16,14 @@ pub struct MockCodeIntelligence {
     pub context_error: Option<String>,
     pub search_results: Vec<CodeSearchResult>,
     pub outline: FileOutline,
+    /// When set, `file_outline` returns `Err(Unavailable)` with this message.
+    pub outline_error: Option<String>,
+    /// When set, `architecture` returns it; otherwise `Err(Unavailable)`.
+    pub architecture: Option<ArchitectureSummary>,
+    pub symbols: Vec<GraphSymbol>,
+    pub trace_nodes: Vec<TraceNode>,
+    /// When set, `refresh` returns `Err(Unavailable)` with this message.
+    pub refresh_error: Option<String>,
 }
 
 impl Default for MockCodeIntelligence {
@@ -36,6 +47,11 @@ impl Default for MockCodeIntelligence {
                 path: String::new(),
                 symbols: Vec::new(),
             },
+            outline_error: None,
+            architecture: None,
+            symbols: Vec::new(),
+            trace_nodes: Vec::new(),
+            refresh_error: None,
         }
     }
 }
@@ -58,6 +74,49 @@ impl CodeIntelligence for MockCodeIntelligence {
     }
 
     async fn file_outline(&self, _path: &str) -> Result<FileOutline> {
+        if let Some(message) = &self.outline_error {
+            return Err(IntelError::Unavailable(message.clone()));
+        }
         Ok(self.outline.clone())
+    }
+
+    async fn architecture(&self, _limit: u32) -> Result<ArchitectureSummary> {
+        self.architecture
+            .clone()
+            .ok_or_else(|| IntelError::Unavailable("no architecture scripted".to_string()))
+    }
+
+    async fn exact_symbols(&self, name: &str, path: Option<&str>) -> Result<Vec<GraphSymbol>> {
+        let path = path.map(|p| p.replace('\\', "/").trim_start_matches("./").to_string());
+        let mut rows: Vec<GraphSymbol> = self
+            .symbols
+            .iter()
+            .filter(|s| s.name == name && path.as_ref().is_none_or(|p| &s.path == p))
+            .cloned()
+            .collect();
+        // Same order the trait promises: most connected first, then path.
+        rows.sort_by(|a, b| b.degree.cmp(&a.degree).then_with(|| a.path.cmp(&b.path)));
+        Ok(rows)
+    }
+
+    async fn trace_ids(
+        &self,
+        _ids: &[i64],
+        _direction: crate::types::TraceDirection,
+        depth: u32,
+    ) -> Result<Vec<TraceNode>> {
+        Ok(self
+            .trace_nodes
+            .iter()
+            .filter(|n| n.depth >= 1 && n.depth <= depth)
+            .cloned()
+            .collect())
+    }
+
+    async fn refresh(&self) -> Result<()> {
+        match &self.refresh_error {
+            Some(message) => Err(IntelError::Unavailable(message.clone())),
+            None => Ok(()),
+        }
     }
 }

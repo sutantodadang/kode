@@ -34,7 +34,6 @@ pub async fn run(
     }
 
     let context = gather_context(cwd).await;
-    let author = git_output(cwd, &["config", "user.name"]).await;
     let summary = truncate_summary(text, 100);
 
     let memory = NewMemory {
@@ -52,23 +51,56 @@ pub async fn run(
         None => anyhow::bail!("memory is disabled in config — enable [ingat] to remember"),
     };
 
-    match backend.remember(&memory).await {
-        Ok(id) => {
-            println!("remembered ({}): {id}", kind.as_kebab());
-            if team {
-                let entry = WireEntry::new(&memory, author);
-                team_memory::share(cwd, &entry)?;
-                println!(
-                    "shared with team: {}",
-                    team_memory::team_file_path(cwd).display()
-                );
-            }
-            Ok(())
-        }
+    let id = save_memory(cwd, backend.as_ref(), &memory).await?;
+    println!("remembered ({}): {id}", kind.as_kebab());
+    if team {
+        println!(
+            "shared with team: {}",
+            team_memory::team_file_path(cwd).display()
+        );
+    }
+    Ok(())
+}
+
+/// Writes `memory` to Ingat and, when `memory.team`, appends it to the
+/// git-tracked team file. Returns the memory id.
+pub async fn save_memory(
+    cwd: &Path,
+    backend: &dyn kode_memory::EngineeringMemory,
+    memory: &NewMemory,
+) -> anyhow::Result<String> {
+    let id = match backend.remember(memory).await {
+        Ok(id) => id,
         Err(kode_memory::MemoryError::Unavailable(msg)) => {
             anyhow::bail!("memory store unavailable: {msg}")
         }
-        Err(err) => Err(anyhow::anyhow!(err)),
+        Err(err) => return Err(anyhow::anyhow!(err)),
+    };
+    if memory.team {
+        let author = git_output(cwd, &["config", "user.name"]).await;
+        team_memory::share(cwd, &WireEntry::new(memory, author))?;
+    }
+    Ok(id)
+}
+
+/// Builds a user-approved `NewMemory` from a proposed draft.
+pub fn proposed_memory(
+    proposal: &crate::memory_proposal::Proposal,
+    repository: Option<String>,
+    team: bool,
+) -> NewMemory {
+    NewMemory {
+        kind: proposal.kind,
+        summary: truncate_summary(&proposal.text, 100),
+        body: proposal.text.clone(),
+        tags: vec!["kode:proposed".to_string()],
+        provenance: Provenance::ExplicitUser,
+        context: MemoryContext {
+            repository,
+            files: proposal.files.clone(),
+            ..Default::default()
+        },
+        team,
     }
 }
 
@@ -195,5 +227,19 @@ mod tests {
     fn truncate_summary_is_char_safe() {
         assert_eq!(truncate_summary("hello world", 5), "hello");
         assert_eq!(truncate_summary("hi", 5), "hi");
+    }
+
+    #[test]
+    fn proposed_memory_is_user_approved_and_tagged() {
+        let p = crate::memory_proposal::Proposal {
+            kind: kode_memory::MemoryKind::KnownIssue,
+            text: "Run tests serially on Windows; ports clash".into(),
+            files: vec!["tests/e2e.rs".into()],
+        };
+        let m = proposed_memory(&p, Some("kode".into()), true);
+        assert_eq!(m.provenance, kode_memory::Provenance::ExplicitUser);
+        assert_eq!(m.tags, vec!["kode:proposed".to_string()]);
+        assert!(m.team);
+        assert_eq!(m.context.files, vec!["tests/e2e.rs".to_string()]);
     }
 }

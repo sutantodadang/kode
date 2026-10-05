@@ -12,8 +12,8 @@ use kode_core::config::ZindeksConfig;
 
 /// Explicit development override for the embedded zindeks library.
 pub const DYLIB_ENV: &str = "KODE_ZINDEKS_DYLIB";
-pub const ZINDEKS_VERSION: &str = "0.10.3";
-pub const ZINDEKS_REVISION: &str = "418da3ff065e956509b0e6746e9c17075d920c19";
+pub const ZINDEKS_VERSION: &str = "0.10.4";
+pub const ZINDEKS_REVISION: &str = "a860491eaee9334869d96e1e25bb341396e99866";
 
 /// Platform file name of the zindeks shared library.
 pub fn dylib_file_name() -> &'static str {

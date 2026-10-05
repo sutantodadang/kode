@@ -96,7 +96,9 @@ mod tests {
 
     const VALID: &str = r#"{"tier":{"light":0.1,"standard":0.3,"heavy":0.6},
         "effort":{"low":0.2,"medium":0.5,"high":0.3},
-        "plan":{"plan":0.7,"direct":0.3}}"#;
+        "plan":{"plan":0.7,"direct":0.3},
+        "answer":{"graph":0.3,"model":0.7},
+        "graph_query":{"definition":0.4,"callers":0.2,"callees":0.2,"impact":0.1,"structure":0.1}}"#;
 
     fn summary() -> TaskSummary {
         TaskSummary {
@@ -116,7 +118,21 @@ mod tests {
         assert!(p.contains("12 tool calls"));
         assert!(p.contains("repair attempted: true"));
         for key in [
-            "light", "standard", "heavy", "low", "medium", "high", "plan", "direct",
+            "light",
+            "standard",
+            "heavy",
+            "low",
+            "medium",
+            "high",
+            "plan",
+            "direct",
+            "graph",
+            "model",
+            "definition",
+            "callers",
+            "callees",
+            "impact",
+            "structure",
         ] {
             assert!(p.contains(&format!("\"{key}\"")), "missing {key}");
         }
@@ -127,6 +143,7 @@ mod tests {
         let m = parse_teacher(VALID).unwrap();
         assert_eq!(m["tier"], vec![0.1, 0.3, 0.6]);
         assert_eq!(m["plan"], vec![0.7, 0.3]);
+        assert_eq!(m["graph_query"], vec![0.4, 0.2, 0.2, 0.1, 0.1]);
     }
 
     #[test]

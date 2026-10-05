@@ -82,6 +82,9 @@ Run an agentic task against the configured model, non-interactively.
 | `--effort <EFFORT>` | Override reasoning effort for this run only. One of: `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`. |
 | `-c`, `--continue` | Send prior session turns as history and append this task to that session, instead of starting fresh. |
 | `--plan` | Plan first: the model produces a numbered plan (no tools) and Kode asks `execute this plan? [y/N]` before running the task. Answering `N` exits without running it. |
+| `--no-graph-answer` | Always use the model, never answer a structural question from the code graph alone. Use it when a script needs a consistent output shape. |
+| `--propose-memory` | After the task, draft a memory if a memorable moment occurred; print `◇ remember? "…"` to stderr. |
+| `--save-memory` | Save the drafted memory (personal) without asking. Requires `--propose-memory`. |
 | `--image <PATH>` | Attach a PNG, JPEG, GIF, or WebP image. Repeat the flag to attach more than one image. |
 
 Examples:
@@ -96,6 +99,10 @@ kode exec --image before.png --image after.png "compare these screens"
 ```
 
 `TASK` may also be a custom slash command (`/name [args]`) — see [howto-custom-commands.md](./howto-custom-commands.md). It's expanded from its `.md` template before the task runs; an unrecognized `/name` fails with an error listing the commands discovered in `.kode/commands/` and `~/.kode/commands/`.
+
+Every `kode exec` run saves its turn to `.kode/sessions/` (previously only with `-c`/`--continue`), so `kode receipt` and session history work after headless and CI runs.
+
+When the local router is confident a prompt is a pure structural lookup (where something is defined, who calls it, what it calls, what depends on it, how the repo is organized), Kode answers from the code graph with zero model tokens: facts print as plain lines and a final `graph answer · 0 tokens` line. In the TUI the same answer shows `╰▶ graph · <kind> · 0 tokens · Nms`, and Enter re-asks the model with the graph answer included as context. `--no-graph-answer` forces the model path.
 
 ```
 kode exec "/review the auth module"
@@ -123,6 +130,38 @@ Build or refresh the code-intelligence index for the repository in the current d
 
 ```
 kode index
+```
+
+## `kode receipt`
+
+Print a shareable receipt built only from persisted session data (never file contents, diffs, or tool output). Defaults to the latest session and all its turns.
+
+| Flag | Description |
+|---|---|
+| `--session <ID>` | Session id (default: latest). |
+| `--turn <N>` | 1-based turn number (default: all turns). |
+| `--pr` | Add the markdown as a comment on the current branch's pull request via `gh`. Never edits the PR body; if `gh` is missing, unauthenticated, or no PR exists, the markdown is printed with the reason and the command still exits 0. |
+| `--trailer` | Print git trailers instead of markdown, ready for `git commit --trailer` (Kode never commits). |
+| `--include-personal` | Include personal (non-team) memories; team memories are included by default. |
+
+```
+kode receipt
+kode receipt --turn 2
+kode receipt --pr
+kode receipt --trailer
+```
+
+## `kode onboard`
+
+Zero-token tour for someone new to the repo: the code map (entry points, hot symbols), `start here` rows, and team memories grouped as decisions, conventions, known issues, and rejected approaches. Without an index it shows the `/index` hint and memory only; without team memory it shows the map only.
+
+| Flag | Description |
+|---|---|
+| `--explain` | Also ask the model to narrate the tour (costs tokens; the output is labeled model-written and its token cost is shown). |
+
+```
+kode onboard
+kode onboard --explain
 ```
 
 ## `kode doctor`
@@ -229,6 +268,12 @@ Available inside the interactive `kode` TUI, with a live hint menu as you type `
 | `/plan` | Toggle plan mode: the next task produces a plan first and waits for your approval. Session-only. |
 | `/image <path>` | Attach a PNG, JPEG, GIF, or WebP image to the next message. You can also paste or drag an image path into the composer. |
 | `/router [key=value…]` | Show the last local-router decision, or correct it (`/router tier=heavy`). See [howto-router-training.md](./howto-router-training.md). |
+| `/map` | Show a zero-token repo map (totals, core orchestrators, hot symbols) from the code graph. |
+| `/index` | Build or refresh the code index in the background; tasks submitted while it runs say `graph warming`. |
+| `/why [N]` | Show where a turn's answer came from (route, graph/memory/git facts, changes, checks, cost) from its persisted ledger. Defaults to the last turn. |
+| `/remember [--team] <text>` | Save an engineering memory directly; `--team` shares it via `.kode/memory/team.jsonl`. |
+| `/receipt [all]` | Copy a shareable receipt for the last turn (or the whole session) to the clipboard. |
+| `/onboard` | Zero-token tour of this repo: code map, team decisions, start points. |
 | `/help` | Show available commands and shortcuts. |
 | `/exit` | Exit Kode. |
 | `/name [args]` | Custom command — expands the `.kode/commands/name.md` or `~/.kode/commands/name.md` template and submits it as a task. See [howto-custom-commands.md](./howto-custom-commands.md). |

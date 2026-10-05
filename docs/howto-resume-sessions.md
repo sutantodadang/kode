@@ -4,6 +4,8 @@
 
 Kode writes completed turns to `.kode/sessions/<id>.jsonl`, one file per session, inside the repo you're working in. Each line is one completed turn: the task you gave and the agent's final answer. Kode does not persist tool call traffic (no file reads, no shell output, no intermediate tool results) and never writes credentials into a session file. Sessions are plain JSONL, so they're readable with any text tool and safe to `.gitignore`.
 
+Each turn also stores a per-turn **ledger**: the facts the agent knew (zindeks/Ingat/git), the routing decision, changed files, verification results, and token usage. This is what `/why`, memory proposals, and `kode receipt` read. Sessions written before ledgers existed load unchanged, with an empty ledger for those turns.
+
 ## Resume the latest session
 
 From the shell, before launching the TUI or `exec`:

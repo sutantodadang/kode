@@ -46,22 +46,22 @@ jobs:
           - name: linux-x86_64
             os: ubuntu-latest
             asset: zindeks-ffi-linux-x86_64.tar.gz
-            sha: ad375454785c4250db529b26c2e1632f1d4c2cffe79022be3407a6b5807aecd2
+            sha: 4a622c9eb3c1bceb342a4dfae94eaac6555ff0c019dd3a449b9c8a4ffe9360bf
             lib: libzindeks.so
           - name: linux-aarch64
             os: ubuntu-24.04-arm
             asset: zindeks-ffi-linux-aarch64.tar.gz
-            sha: d1affcc9c70063373138c9810b8fad4d621c53f09313a3097f69766cf34b8c26
+            sha: 631689363a4193e2f589b859e9e9f383e5317df7833cd0a9cce83cf736489463
             lib: libzindeks.so
           - name: windows-x86_64
             os: windows-latest
             asset: zindeks-ffi-windows-x86_64.tar.gz
-            sha: a40c922774dc7b579eae095d7080075fd508d6c01cfe5dae06aaeb7dbd2b885b
+            sha: 55f272353de5c4b216173711a5c506549cbf6fb635dc37b2882fdde379dc6bbe
             lib: zindeks.dll
           - name: macos-aarch64
             os: macos-latest
             asset: zindeks-ffi-macos-aarch64.tar.gz
-            sha: 8b5a02a46f4f36f53d1a307ab275511d21ecfa36ddad1a07d096323d849d3c33
+            sha: 506542cdc0b714dbc77fb4fdab3058ba637266733dbd094f392e0804535f5226
             lib: libzindeks.dylib
     steps:
       - uses: actions/checkout@v4
@@ -81,7 +81,7 @@ jobs:
           tmp="$RUNNER_TEMP"
           if command -v cygpath >/dev/null 2>&1; then tmp=$(cygpath -u "$RUNNER_TEMP"); fi
           mkdir -p "$tmp/zindeks"
-          url="https://github.com/sutantodadang/zindeks/releases/download/v0.10.3/${ASSET}"
+          url="https://github.com/sutantodadang/zindeks/releases/download/v0.10.4/${ASSET}"
           curl -fsSL "$url" -o "$tmp/zindeks/${ASSET}"
           echo "${SHA}  $tmp/zindeks/${ASSET}" | sha256sum -c -
           tar -xzf "$tmp/zindeks/${ASSET}" -C "$tmp/zindeks"

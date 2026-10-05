@@ -44,6 +44,15 @@ pub trait Tool: Send + Sync {
     fn output_mutated(&self, _output: &ToolOutput) -> bool {
         self.required_permission() == RequiredPermission::Mutating
     }
+    /// Extra context shown in the permission prompt before this call runs
+    /// (e.g. the blast radius of an edit). `None` adds nothing.
+    async fn permission_note(
+        &self,
+        _args: &serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Option<String> {
+        None
+    }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput>;
 }
 

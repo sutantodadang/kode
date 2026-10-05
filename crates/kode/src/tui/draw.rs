@@ -1415,25 +1415,26 @@ fn context_receipt_line(state: &AppState) -> Option<Line<'static>> {
 pub(crate) fn focus_surface_lines(state: &AppState) -> Vec<Line<'static>> {
     let bold = Style::default().add_modifier(Modifier::BOLD);
     if let Some(permission) = state.pending.front() {
-        return vec![
-            Line::from(Span::styled(
-                " PERMISSION",
-                Style::default()
-                    .fg(theme::WARN)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(format!(" {}", permission.summary), bold)),
-            Line::from(vec![
-                Span::styled(" Scope  ", Style::default().fg(theme::MUTED)),
-                Span::raw("this invocation only"),
-            ]),
-            Line::from(vec![
-                Span::styled(" [A]", bold),
-                Span::raw(" Allow once   "),
-                Span::styled("[D]", bold),
-                Span::raw(" Deny"),
-            ]),
-        ];
+        let mut lines = vec![Line::from(Span::styled(
+            " PERMISSION",
+            Style::default()
+                .fg(theme::WARN)
+                .add_modifier(Modifier::BOLD),
+        ))];
+        for line in permission.summary.lines() {
+            lines.push(Line::from(Span::styled(format!(" {line}"), bold)));
+        }
+        lines.push(Line::from(vec![
+            Span::styled(" Scope  ", Style::default().fg(theme::MUTED)),
+            Span::raw("this invocation only"),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(" [A]", bold),
+            Span::raw(" Allow once   "),
+            Span::styled("[D]", bold),
+            Span::raw(" Deny"),
+        ]));
+        return lines;
     }
 
     if state.running {
@@ -1633,6 +1634,20 @@ pub(crate) fn now_line(state: &AppState, width: u16) -> Line<'static> {
             }
             .to_string(),
         );
+    } else if state.graph_offer.is_some()
+        && state.completion.is_some()
+        && !state.composer_has_content()
+    {
+        left.push(glyph_bold("✓ ".to_string(), theme::OK));
+        left.push(Span::styled(
+            "done · graph answer",
+            Style::default().fg(theme::OK),
+        ));
+        right = Some("Enter ask model anyway · Esc done".to_string());
+    } else if state.memory_offer.is_some() && !state.composer_has_content() {
+        left.push(glyph_bold("◇".to_string(), theme::I));
+        left.push(Span::styled(" remember?", Style::default().fg(theme::I)));
+        right = Some("Enter save · Tab team · Ctrl+E edit · Esc skip".to_string());
     } else if let Some(error) = &state.last_error {
         let prefix = "✗ stopped · ";
         let room = w.saturating_sub(1 + prefix.chars().count());
@@ -1791,6 +1806,23 @@ fn draw_sheet(f: &mut ratatui::Frame, lines: Vec<Line<'static>>) {
     let popup = centered_overlay(f.area(), 72, height);
     f.render_widget(Clear, popup);
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), popup);
+}
+
+/// Fits `/why` into the screen: keeps the header and the "Esc closes"
+/// footer, and marks how many middle rows were cut.
+pub(crate) fn why_sheet_lines(lines: &[String], max_rows: usize) -> Vec<Line<'static>> {
+    let styled = |s: &str| Line::from(s.to_string());
+    if lines.len() <= max_rows || max_rows < 4 {
+        return lines.iter().map(|l| styled(l)).collect();
+    }
+    let keep_top = max_rows - 2;
+    let mut out: Vec<Line<'static>> = lines[..keep_top].iter().map(|l| styled(l)).collect();
+    out.push(styled(&format!(
+        " … {} more rows (enlarge the terminal)",
+        lines.len() - keep_top - 1
+    )));
+    out.push(styled(lines.last().unwrap()));
+    out
 }
 
 pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
@@ -2060,7 +2092,10 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
 
     draw_input(f, input_area, state);
 
-    if state.picker.open {
+    if let Some(lines) = &state.why_lines {
+        let max_rows = f.area().height.saturating_sub(4) as usize;
+        draw_sheet(f, why_sheet_lines(lines, max_rows));
+    } else if state.picker.open {
         draw_picker(f, &state.picker);
     } else if state.shortcuts_open {
         draw_sheet(f, shortcut_sheet_lines(state));
@@ -2392,6 +2427,7 @@ pub(crate) fn draw_picker(f: &mut ratatui::Frame, picker: &PickerState) {
         PickerKind::Provider => "select provider",
         PickerKind::Session => "resume session",
         PickerKind::Command => "commands",
+        PickerKind::Setup => "setup",
     };
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(

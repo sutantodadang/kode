@@ -61,6 +61,14 @@ pub fn router_summary(answers: &[RouteAnswer]) -> String {
     format!("router: {}", parts.join(" · "))
 }
 
+/// One file's line delta for a task, relative to `HEAD`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChange {
+    pub path: String,
+    pub added: u32,
+    pub removed: u32,
+}
+
 /// Events emitted during an agent run.
 #[derive(Debug, Clone)]
 pub enum KodeEvent {
@@ -183,6 +191,40 @@ pub enum KodeEvent {
     TaskProgress {
         step: TaskStep,
         done: bool,
+    },
+    /// Files whose diff against `HEAD` moved during the task, from git.
+    /// Emitted once per task after the agent loop (and any repair), only
+    /// when the task mutated files and both git snapshots succeeded.
+    ChangeSet {
+        files: Vec<FileChange>,
+        /// Files that had uncommitted changes at task start and now match `HEAD`.
+        reverted: Vec<String>,
+    },
+    /// Background indexing started (TUI first run or `/index`). The engine
+    /// reports no per-file progress, so only start and finish exist.
+    IndexStarted,
+    /// Background indexing ended. `files` is the indexed document count
+    /// when the health check answered; `error` is set on failure.
+    IndexFinished {
+        files: Option<u64>,
+        error: Option<String>,
+        elapsed_ms: u64,
+    },
+    /// The task was answered from the code graph with zero model tokens.
+    /// `text` is the plain-text answer (stored as the turn's response).
+    GraphAnswered {
+        query: String,
+        symbol: String,
+        latency_ms: u64,
+        text: String,
+    },
+    /// Blast radius of one edited symbol, from the call graph.
+    Impact {
+        file: String,
+        symbol: String,
+        callers: u32,
+        crates: u32,
+        tests: u32,
     },
 }
 

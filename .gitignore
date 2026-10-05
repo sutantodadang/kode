@@ -6,3 +6,6 @@ docs/superpowers/
 .gstack/
 .remember/
 .kode-design-preview.html
+# Nested git worktrees are full repo copies; indexing them makes every
+# symbol name ambiguous (sutantodadang/zindeks#10).
+.claude/worktrees/
