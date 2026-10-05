@@ -59,6 +59,12 @@ minor versions may contain breaking changes).
   now traces shared names like any other symbol, and graph answers trace the
   most connected symbol of a shared name and say so in the answer.
 
+### Fixed
+
+- Windows: the login prompt opened from the TUI (setup card) ignored typed
+  input — the console was left in raw mode, so keys did not echo and Enter
+  never submitted.
+
 ## [0.5.0 – 0.5.6] - 2026-09-27 to 2026-10-01
 
 ### Added

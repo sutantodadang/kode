@@ -76,13 +76,14 @@ pub(crate) struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
+        // Same order as with_terminal_suspended: mouse capture before raw mode.
         let _ = execute!(
             std::io::stdout(),
             DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
+        let _ = disable_raw_mode();
     }
 }
 
@@ -397,13 +398,16 @@ async fn with_terminal_suspended<T>(
     stderr_guard: &mut Option<TuiStderrGuard>,
     flow: impl Future<Output = T>,
 ) -> io::Result<T> {
-    disable_raw_mode()?;
+    // Mouse capture first: on Windows, DisableMouseCapture restores the console
+    // mode saved when capture was enabled — raw mode — so it must run before
+    // disable_raw_mode, or the prompt is left without line input and echo.
     execute!(
         std::io::stdout(),
         DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen
     )?;
+    disable_raw_mode()?;
     *stderr_guard = None; // restores the real stderr for prompts
     let out = flow.await;
     *stderr_guard = Some(TuiStderrGuard::redirect()?);
