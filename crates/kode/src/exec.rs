@@ -6,7 +6,6 @@ use kode_core::CancellationToken;
 use kode_core::config::KodeConfig;
 use kode_core::event::{EventBus, KodeEvent, router_summary};
 use kode_tools::permission::PermissionHandler;
-use tokio::sync::broadcast::error::RecvError;
 
 use crate::custom_commands;
 use crate::pipeline;
@@ -119,7 +118,7 @@ pub async fn run(
     }
 
     let events = EventBus::new(256);
-    let mut rx = events.subscribe();
+    let mut rx = events.subscribe_lossless();
 
     let printer = tokio::spawn(async move {
         // Mirrors how the TUI's `AppState.response_buf` accumulates flushed
@@ -129,9 +128,9 @@ pub async fn run(
         let mut final_tool_calls: u32 = 0;
         let mut recorder = crate::ledger::LedgerRecorder::default();
         recorder.begin();
-        loop {
-            match rx.recv().await {
-                Ok(ev) => {
+        while let Some(ev) = rx.recv().await {
+            {
+                {
                     recorder.observe(&ev);
                     match ev {
                         KodeEvent::ModelToken { text } => {
@@ -239,13 +238,6 @@ pub async fn run(
                         }
                         _ => {}
                     }
-                }
-                Err(RecvError::Closed) => break,
-                Err(RecvError::Lagged(n)) => {
-                    eprintln!("{}", lagged_note(n));
-                    // The broadcast channel dropped events out from under a
-                    // slow receiver — keep printing rather than treating a
-                    // lag as a stream close.
                 }
             }
         }
@@ -402,13 +394,6 @@ fn session_for_run(
     }
 }
 
-/// Message printed when the event printer falls behind and the broadcast
-/// channel drops events (`RecvError::Lagged`). Factored out so the message
-/// is unit-testable without driving an actual broadcast channel.
-fn lagged_note(n: u64) -> String {
-    format!("◆ event stream lagged — {n} events dropped")
-}
-
 /// Resolves a `/`-prefixed TASK into its expanded custom-command prompt by
 /// looking it up against commands discovered under `.kode/commands` and
 /// `~/.kode/commands`. Errors (never panics) when the name doesn't match
@@ -444,11 +429,6 @@ fn resolve_custom_task(task: &str, cwd: &Path) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn lagged_note_reports_dropped_count() {
-        assert_eq!(lagged_note(7), "◆ event stream lagged — 7 events dropped");
-    }
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()

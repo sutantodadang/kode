@@ -111,11 +111,18 @@ fn transcript_cache_tracks_edits_expansion_stream_resize_and_clear() {
     app.transcript.push(tool);
     for step in 0..6 {
         match step {
-            1 => app.transcript[0].text = "other".to_string(),
-            2 => app.transcript[1].expanded = true,
+            1 => {
+                app.transcript[0].text = "other".to_string();
+                app.touch_transcript(0);
+            }
+            2 => {
+                app.transcript[1].expanded = true;
+                app.touch_transcript(1);
+            }
             3 => {
                 app.current_stream = "streaming now".to_string();
                 app.transcript[1].tool_ok = Some(false);
+                app.touch_transcript(1);
             }
             5 => app.transcript.clear(),
             _ => {}
@@ -4402,9 +4409,14 @@ fn transcript_cache_settles_after_animation_window() {
     };
     let mut cache = TranscriptCache::default();
     let render = |cache: &TranscriptCache| line_text(cache.probe(0).unwrap().0);
-    cache.update(&transcript, 100, ctx(now));
+    cache.update(&transcript, 100, ctx(now), usize::MAX);
     assert!(!render(&cache).contains("index refreshed"));
-    cache.update(&transcript, 100, ctx(now + Duration::from_secs(1)));
+    cache.update(
+        &transcript,
+        100,
+        ctx(now + Duration::from_secs(1)),
+        usize::MAX,
+    );
     assert!(render(&cache).contains("index refreshed"));
     assert!(cache.probe(0).unwrap().1);
 }
@@ -4992,4 +5004,153 @@ fn completed_turn_carries_the_recorded_ledger() {
             .iter()
             .any(|e| matches!(e, crate::ledger::LedgerEntry::Usage { .. }))
     );
+}
+
+fn plain_ctx() -> MotionCtx {
+    MotionCtx {
+        now: Instant::now(),
+        reduced_motion: false,
+        epoch: 0,
+        trace_from: None,
+    }
+}
+
+#[test]
+fn transcript_cache_appending_renders_only_the_new_line() {
+    let mut transcript = vec![
+        TranscriptLine::new(Gutter::Note, "one"),
+        TranscriptLine::new(Gutter::Note, "two"),
+    ];
+    let mut cache = TranscriptCache::default();
+    cache.update(&transcript, 80, plain_ctx(), usize::MAX);
+    assert_eq!(cache.render_count, 2);
+    transcript.push(TranscriptLine::new(Gutter::Note, "three"));
+    cache.update(&transcript, 80, plain_ctx(), usize::MAX);
+    assert_eq!(cache.render_count, 3);
+    assert!(line_text(cache.probe(2).unwrap().0).contains("three"));
+    assert_eq!(cache.probe_source(0).unwrap().text, "one");
+}
+
+#[test]
+fn transcript_cache_touched_edit_updates_render() {
+    let mut transcript = vec![
+        TranscriptLine::new(Gutter::Note, "one"),
+        TranscriptLine::new(Gutter::Note, "two"),
+    ];
+    let mut cache = TranscriptCache::default();
+    cache.update(&transcript, 80, plain_ctx(), usize::MAX);
+    transcript[1].text = "changed".to_string();
+    cache.update(&transcript, 80, plain_ctx(), 1);
+    assert_eq!(cache.render_count, 3);
+    assert!(line_text(cache.probe(1).unwrap().0).contains("changed"));
+}
+
+#[test]
+fn transcript_cache_width_change_rebuilds_everything() {
+    let transcript = vec![
+        TranscriptLine::new(Gutter::Note, "one"),
+        TranscriptLine::new(Gutter::Note, "two"),
+    ];
+    let mut cache = TranscriptCache::default();
+    cache.update(&transcript, 80, plain_ctx(), usize::MAX);
+    cache.update(&transcript, 40, plain_ctx(), usize::MAX);
+    assert_eq!(cache.render_count, 4);
+}
+
+#[test]
+#[should_panic(expected = "without touch_transcript")]
+fn transcript_cache_panics_on_untouched_in_place_edit() {
+    let mut transcript = vec![TranscriptLine::new(Gutter::Note, "one")];
+    let mut cache = TranscriptCache::default();
+    cache.update(&transcript, 80, plain_ctx(), usize::MAX);
+    transcript[0].text = "sneaky".to_string();
+    cache.update(&transcript, 80, plain_ctx(), usize::MAX);
+}
+
+fn finish_task(app: &mut AppState) {
+    apply_event(
+        app,
+        KodeEvent::TaskFinished {
+            iterations: 1,
+            tool_calls: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: None,
+        },
+    );
+}
+
+/// Feeds `tokens` through the streaming path and checks the result equals
+/// pushing the whole text through `push_stream_lines` once (the old behavior).
+fn assert_stream_matches_whole_text(tokens: &[&str]) -> AppState {
+    let full: String = tokens.concat();
+    let mut expected = state();
+    push_stream_lines(&mut expected, &full);
+
+    let mut actual = state();
+    for token in tokens {
+        apply_event(
+            &mut actual,
+            KodeEvent::ModelToken {
+                text: (*token).to_string(),
+            },
+        );
+        assert!(
+            !actual.current_stream.contains('\n'),
+            "current_stream kept a complete line"
+        );
+    }
+    finish_task(&mut actual);
+    assert_eq!(actual.last_response, full);
+    assert!(actual.transcript.len() >= expected.transcript.len());
+    for (i, line) in expected.transcript.iter().enumerate() {
+        assert!(actual.transcript[i] == *line, "transcript line {i} differs");
+    }
+    assert_eq!(actual.md_in_code_block, expected.md_in_code_block);
+    actual
+}
+
+#[test]
+fn streamed_lines_match_whole_text_flush() {
+    let actual = assert_stream_matches_whole_text(&["a\nb", "\n\nc", "d\n"]);
+    assert_eq!(actual.last_response, "a\nb\n\ncd\n");
+    assert_stream_matches_whole_text(&["a\nb ", "\n\nc", "d\n"]);
+    assert_stream_matches_whole_text(&["one ", "two\n", "three ", "\n"]);
+}
+
+#[test]
+fn streamed_code_fence_state_survives_chunks() {
+    let mut app = state();
+    for token in ["```rust\nfn a() {", "}\n", "x "] {
+        apply_event(
+            &mut app,
+            KodeEvent::ModelToken {
+                text: token.to_string(),
+            },
+        );
+    }
+    assert!(app.md_in_code_block, "fence opened in an earlier chunk");
+    assert!(!app.current_stream.contains('\n'));
+    assert_stream_matches_whole_text(&["```rust\nfn a() {", "}\n", "```\nafter\n"]);
+}
+
+#[test]
+fn custom_commands_are_cached_for_two_seconds() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("kode-custom-cache-{nanos}"));
+    let cmds = dir.join(".kode").join("commands");
+    std::fs::create_dir_all(&cmds).unwrap();
+    let mut app = state();
+    let first = app.custom_commands(&dir);
+    std::fs::write(cmds.join("zzcachecmd.md"), "body").unwrap();
+    let second = app.custom_commands(&dir);
+    assert_eq!(first, second, "cached list reused within 2 s");
+    assert!(!second.iter().any(|c| c.name == "zzcachecmd"));
+    app.custom_commands_cache = None;
+    let third = app.custom_commands(&dir);
+    assert!(third.iter().any(|c| c.name == "zzcachecmd"));
+    let _ = std::fs::remove_dir_all(&dir);
 }

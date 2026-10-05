@@ -76,13 +76,14 @@ pub(crate) struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
+        // Same order as with_terminal_suspended: mouse capture before raw mode.
         let _ = execute!(
             std::io::stdout(),
             DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
+        let _ = disable_raw_mode();
     }
 }
 
@@ -394,19 +395,21 @@ pub(crate) fn detect_branch(cwd: &Path) -> Option<String> {
 /// transcript.
 async fn with_terminal_suspended<T>(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    stderr_guard: &mut Option<TuiStderrGuard>,
     flow: impl Future<Output = T>,
 ) -> io::Result<T> {
-    disable_raw_mode()?;
+    // Mouse capture first: on Windows, DisableMouseCapture restores the console
+    // mode saved when capture was enabled — raw mode — so it must run before
+    // disable_raw_mode, or the prompt is left without line input and echo.
     execute!(
         std::io::stdout(),
         DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen
     )?;
-    *stderr_guard = None; // restores the real stderr for prompts
+    disable_raw_mode()?;
+    // stderr stays redirected: suspended flows prompt on stdout, and in-process
+    // engines (zindeks watcher logs) must not write into the prompt.
     let out = flow.await;
-    *stderr_guard = Some(TuiStderrGuard::redirect()?);
     enable_raw_mode()?;
     execute!(
         std::io::stdout(),
@@ -862,7 +865,7 @@ fn record_failed_turn(
 pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyhow::Result<()> {
     let mut config = KodeConfig::load(cwd).unwrap_or_default();
 
-    let mut stderr_guard = Some(TuiStderrGuard::redirect()?);
+    let _stderr_guard = TuiStderrGuard::redirect()?;
 
     enable_raw_mode()?;
     execute!(
@@ -937,6 +940,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
     spawn_git_poll(cwd.to_path_buf(), git_tx.clone());
 
     let (indexed_tx, mut indexed_rx) = mpsc::unbounded_channel::<Option<bool>>();
+    let mut indexed_probe_done = false;
     if config.zindeks.enabled && crate::engine_assets::zindeks_library(&config.zindeks).is_ok() {
         let runtime = state.runtime.clone();
         let cfg = config.zindeks.clone();
@@ -963,7 +967,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
     }
 
     let events = EventBus::new(256);
-    let mut event_rx = events.subscribe();
+    let mut event_rx = events.subscribe_lossless();
 
     let mut key_events = EventStream::new();
     let mut pending_terminal_events = VecDeque::new();
@@ -1002,6 +1006,8 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
     // picker closed by a handler that `continue 'outer`s still marks the
     // setup facts dirty.
     let mut picker_was_open = state.picker.open;
+    // Redraw only when something changed; idle ticks skip the frame.
+    let mut needs_draw = true;
     'outer: loop {
         if picker_was_open && !state.picker.open {
             state.setup_dirty = true;
@@ -1012,6 +1018,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
             biased;
 
             maybe_key = next_terminal_event(&mut key_events, &mut pending_terminal_events) => {
+                needs_draw = true;
                 match maybe_key {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                         if state.running
@@ -1096,7 +1103,6 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                                     let provider = config.model.provider.clone();
                                                     let outcome = with_terminal_suspended(
                                                         &mut terminal,
-                                                        &mut stderr_guard,
                                                         crate::auth::login(&provider),
                                                     ).await;
                                                     mouse_captured = true;
@@ -1113,7 +1119,6 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                                     let cfg = config.zindeks.clone();
                                                     let outcome = with_terminal_suspended(
                                                         &mut terminal,
-                                                        &mut stderr_guard,
                                                         crate::setup::install_zindeks(&cfg),
                                                     ).await;
                                                     mouse_captured = true;
@@ -1365,8 +1370,12 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
             }
 
             ev = event_rx.recv() => {
-                match ev {
-                    Ok(ev) => {
+                needs_draw = true;
+                if let Some(mut ev) = ev {
+                    // Cap per iteration so key presses stay responsive under
+                    // a flood; the rest is handled on the next iteration.
+                    let mut drained = 0usize;
+                    loop {
                         let finished_tool_calls = match &ev {
                             KodeEvent::TaskFinished { tool_calls, .. } => Some(*tool_calls),
                             _ => None,
@@ -1458,35 +1467,45 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                                 current_steering = Some(submitted.steering);
                             }
                         }
+                        drained += 1;
+                        if drained >= 1024 {
+                            break;
+                        }
+                        match event_rx.try_recv() {
+                            Ok(next) => ev = next,
+                            Err(_) => break,
+                        }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        apply_event(&mut state, KodeEvent::Note {
-                            text: format!("event stream lagged — {n} events dropped"),
-                        });
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
                 }
             }
 
             perm = perm_rx.recv() => {
+                needs_draw = true;
                 if let Some((summary, responder)) = perm {
                     state.push_permission(PermReq { summary, responder });
                 }
             }
 
             loaded = picker_rx.recv() => {
+                needs_draw = true;
                 if let Some(loaded) = loaded {
                     apply_picker_loaded(&mut state, loaded);
                 }
             }
 
             repo = git_rx.recv() => {
+                needs_draw = true;
                 if let Some(repo) = repo {
                     apply_repo_state(&mut state, repo);
                 }
             }
 
-            indexed = indexed_rx.recv() => {
+            // One-shot: the probe sends once and drops its sender. A closed
+            // channel's `recv()` is always ready, so without this guard the
+            // arm would fire on every poll and spin the loop.
+            indexed = indexed_rx.recv(), if !indexed_probe_done => {
+                needs_draw = true;
+                indexed_probe_done = true;
                 if let Some(answer) = indexed {
                     state.repo_indexed = answer;
                     state.setup_dirty = true;
@@ -1494,12 +1513,14 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
             }
 
             proposal = memory_rx.recv() => {
+                needs_draw = true;
                 if let Some(proposal) = proposal {
                     offer_memory(&mut state, proposal);
                 }
             }
 
             saved = memory_saved_rx.recv() => {
+                needs_draw = true;
                 if let Some(result) = saved {
                     let text = match &result {
                         Ok(m) if m.team => "m ● saved · team".to_string(),
@@ -1536,10 +1557,12 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                 // its first 2 of these ~100ms ticks.
                 state.render_tick = state.render_tick.wrapping_add(1);
                 motion_tick_update(&mut state, Instant::now());
+                needs_draw |= tick_needs_draw(&state, animating);
             }
 
             _ = motion_tick.tick(), if animating => {
                 motion_tick_update(&mut state, Instant::now());
+                needs_draw |= tick_needs_draw(&state, animating);
             }
         }
 
@@ -1555,12 +1578,15 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
             }
         }
 
-        maybe_show_setup_card(&mut state, &config, cwd);
+        if needs_draw {
+            maybe_show_setup_card(&mut state, &config, cwd);
 
-        terminal.draw(|f| {
-            draw(f, &mut state, cwd);
-            theme::adapt(f.buffer_mut(), palette);
-        })?;
+            terminal.draw(|f| {
+                draw(f, &mut state, cwd);
+                theme::adapt(f.buffer_mut(), palette);
+            })?;
+            needs_draw = false;
+        }
     }
 
     if let Some(child) = current_cancel {
@@ -1569,6 +1595,12 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
     cancel.cancel();
 
     Ok(())
+}
+
+/// Whether a UI/motion tick warrants a redraw: only while something on
+/// screen is time-driven (a run, an animation, an armed exit, an index probe).
+fn tick_needs_draw(state: &AppState, animating: bool) -> bool {
+    state.running || animating || state.exit_armed_at.is_some() || state.indexing_since.is_some()
 }
 
 /// True while any Kode Benang animation can be in flight: a run is active, a
@@ -1748,7 +1780,7 @@ pub(crate) fn handle_key(
         && state.image_attachments.is_empty()
         && state.input.starts_with('/')
     {
-        let custom = custom_commands::discover(cwd, BUILTIN_COMMAND_NAMES);
+        let custom = state.custom_commands(cwd);
         slash_hint_items(&state.input, &custom).len()
     } else {
         0
@@ -1772,7 +1804,7 @@ pub(crate) fn handle_key(
             }
         }
         KeyCode::Tab if hint_count > 0 => {
-            let custom = custom_commands::discover(cwd, BUILTIN_COMMAND_NAMES);
+            let custom = state.custom_commands(cwd);
             let items = slash_hint_items(&state.input, &custom);
             let (name, _) = items[state.slash_selected.min(items.len() - 1)].clone();
             state.input = format!("{name} ");
@@ -1878,6 +1910,7 @@ pub(crate) fn handle_mouse(state: &mut AppState, mouse: crossterm::event::MouseE
                 && let Some(line) = state.transcript.get_mut(idx)
             {
                 line.expanded = !line.expanded;
+                state.touch_transcript(idx);
             }
         }
     }

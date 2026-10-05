@@ -12,11 +12,10 @@ use unicode_width::UnicodeWidthStr;
 
 use kode_core::event::TaskStep;
 
-use super::commands::{BUILTIN_COMMAND_NAMES, picker_filtered_items, slash_hint_items};
+use super::commands::{picker_filtered_items, slash_hint_items};
 use super::markdown;
 use super::state::*;
 use super::theme;
-use crate::custom_commands;
 
 /// Renders an 8-cell (by default) meter string: `■` for filled cells,
 /// `□` for empty ones. `budget == 0` yields an all-empty meter (no
@@ -1123,6 +1122,11 @@ pub(crate) struct TranscriptCache {
     width: u16,
     epoch: u64,
     lines: Vec<CachedTranscriptLine>,
+    /// Indices whose last render was inside the animation window (not settled).
+    animating: Vec<usize>,
+    /// Number of `render_line` calls so far (test-only instrumentation).
+    #[cfg(test)]
+    pub(crate) render_count: usize,
 }
 
 /// Motion inputs for one transcript render pass (see `TranscriptCache::update`).
@@ -1138,14 +1142,23 @@ pub(crate) struct MotionCtx {
 }
 
 struct CachedTranscriptLine {
+    /// Copy of the rendered source, kept only so tests can check that every
+    /// in-place edit called `touch_transcript`.
+    #[cfg(test)]
     source: TranscriptLine,
-    /// False while the line was rendered inside its animation window; such an
-    /// entry is re-rendered once more after the window closes.
+    /// False while the line was rendered inside its animation window (tests).
+    #[cfg(test)]
     settled: bool,
     entries: Vec<(Line<'static>, Option<usize>, [u16; 2])>,
 }
 
 impl TranscriptCache {
+    /// Cached source of the line at `index` (tests).
+    #[cfg(test)]
+    pub(crate) fn probe_source(&self, index: usize) -> Option<&TranscriptLine> {
+        self.lines.get(index).map(|cached| &cached.source)
+    }
+
     /// First rendered row and settled flag of the cached line at `index`.
     #[cfg(test)]
     pub(crate) fn probe(&self, index: usize) -> Option<(&Line<'static>, bool)> {
@@ -1153,75 +1166,119 @@ impl TranscriptCache {
         Some((&cached.entries.first()?.0, cached.settled))
     }
 
-    pub(crate) fn update(&mut self, transcript: &[TranscriptLine], width: u16, ctx: MotionCtx) {
-        // ponytail: linear equality scan; revision counters if very long
-        // histories make this scan dominate rendering.
-        if self.width != width || self.epoch != ctx.epoch {
+    /// Incrementally refreshes the cache. `dirty_from` is the lowest index of
+    /// an in-place edited transcript line (`AppState::transcript_dirty_from`,
+    /// `usize::MAX` when none); appended lines are detected by length and
+    /// still-animating lines are re-rendered every pass. No other line is
+    /// scanned or compared.
+    pub(crate) fn update(
+        &mut self,
+        transcript: &[TranscriptLine],
+        width: u16,
+        ctx: MotionCtx,
+        dirty_from: usize,
+    ) {
+        if self.width != width || self.epoch != ctx.epoch || transcript.len() < self.lines.len() {
             self.lines.clear();
+            self.animating.clear();
             self.width = width;
             self.epoch = ctx.epoch;
         }
-        self.lines.truncate(transcript.len());
-        for (index, source) in transcript.iter().enumerate() {
-            let animating = line_animating(source.born, ctx.now, ctx.reduced_motion);
-            if !animating
-                && self
-                    .lines
-                    .get(index)
-                    .is_some_and(|cached| cached.settled && cached.source == *source)
-            {
-                continue;
-            }
-            let header = !source.tool_children.is_empty();
-            let trace_bold = ctx.trace_from.is_some_and(|start| index >= start);
-            let wrap_width = width.saturating_sub(1);
-            let main = transcript_line_at(source, width, ctx.now, ctx.reduced_motion, trace_bold);
-            let mut entries: Vec<(Line<'static>, Option<usize>)> =
-                wrap_transcript_line(source, main, wrap_width)
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, row)| {
-                        (
-                            row,
-                            if i == 0 {
-                                header.then_some(index)
-                            } else {
-                                None
-                            },
-                        )
-                    })
-                    .collect();
-            if header && source.expanded {
-                for child in &source.tool_children {
-                    let child_line = TranscriptLine::new(Gutter::Tool, format!("  {child}"));
-                    let rendered = transcript_line_to_ratatui(&child_line, width);
-                    entries.extend(
-                        wrap_transcript_line(&child_line, rendered, wrap_width)
-                            .into_iter()
-                            .map(|row| (row, None)),
-                    );
-                }
-            }
-            let cached = CachedTranscriptLine {
-                source: source.clone(),
-                settled: !animating,
-                entries: entries
-                    .into_iter()
-                    .map(|(line, index)| {
-                        let rows = [
-                            line_rows(&line, width),
-                            line_rows(&line, width.saturating_sub(1)),
-                        ];
-                        (line, index, rows)
-                    })
-                    .collect(),
-            };
-            if index < self.lines.len() {
-                self.lines[index] = cached;
-            } else {
-                self.lines.push(cached);
+        let start = dirty_from.min(self.lines.len());
+        let mut todo: Vec<usize> = (start..transcript.len()).collect();
+        todo.extend(
+            self.animating
+                .iter()
+                .copied()
+                .filter(|&i| i < start && i < transcript.len()),
+        );
+        let mut still_animating = Vec::new();
+        for index in todo {
+            if self.render_line(transcript, index, width, ctx) {
+                still_animating.push(index);
             }
         }
+        self.animating = still_animating;
+        // Test-only (not debug_assertions): the full compare is exactly the
+        // per-frame cost this cache avoids, and dev builds should stay fast.
+        #[cfg(test)]
+        for (i, cached) in self.lines.iter().enumerate() {
+            if cached.settled {
+                assert!(
+                    cached.source == transcript[i],
+                    "transcript line {i} mutated in place without touch_transcript"
+                );
+            }
+        }
+    }
+
+    /// Renders `transcript[index]` into the cache; returns whether it was
+    /// still inside its animation window.
+    fn render_line(
+        &mut self,
+        transcript: &[TranscriptLine],
+        index: usize,
+        width: u16,
+        ctx: MotionCtx,
+    ) -> bool {
+        #[cfg(test)]
+        {
+            self.render_count += 1;
+        }
+        let source = &transcript[index];
+        let animating = line_animating(source.born, ctx.now, ctx.reduced_motion);
+        let header = !source.tool_children.is_empty();
+        let trace_bold = ctx.trace_from.is_some_and(|start| index >= start);
+        let wrap_width = width.saturating_sub(1);
+        let main = transcript_line_at(source, width, ctx.now, ctx.reduced_motion, trace_bold);
+        let mut entries: Vec<(Line<'static>, Option<usize>)> =
+            wrap_transcript_line(source, main, wrap_width)
+                .into_iter()
+                .enumerate()
+                .map(|(i, row)| {
+                    (
+                        row,
+                        if i == 0 {
+                            header.then_some(index)
+                        } else {
+                            None
+                        },
+                    )
+                })
+                .collect();
+        if header && source.expanded {
+            for child in &source.tool_children {
+                let child_line = TranscriptLine::new(Gutter::Tool, format!("  {child}"));
+                let rendered = transcript_line_to_ratatui(&child_line, width);
+                entries.extend(
+                    wrap_transcript_line(&child_line, rendered, wrap_width)
+                        .into_iter()
+                        .map(|row| (row, None)),
+                );
+            }
+        }
+        let cached = CachedTranscriptLine {
+            #[cfg(test)]
+            source: source.clone(),
+            #[cfg(test)]
+            settled: !animating,
+            entries: entries
+                .into_iter()
+                .map(|(line, index)| {
+                    let rows = [
+                        line_rows(&line, width),
+                        line_rows(&line, width.saturating_sub(1)),
+                    ];
+                    (line, index, rows)
+                })
+                .collect(),
+        };
+        if index < self.lines.len() {
+            self.lines[index] = cached;
+        } else {
+            self.lines.push(cached);
+        }
+        animating
     }
 }
 
@@ -1851,7 +1908,7 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
         && state.image_attachments.is_empty()
         && state.input.starts_with('/')
     {
-        let custom = custom_commands::discover(cwd, BUILTIN_COMMAND_NAMES);
+        let custom = state.custom_commands(cwd);
         slash_hint_items(&state.input, &custom)
     } else {
         Vec::new()
@@ -1936,7 +1993,9 @@ pub(crate) fn draw(f: &mut ratatui::Frame, state: &mut AppState, cwd: &Path) {
                 epoch: state.style_epoch,
                 trace_from: state.trace_back.map(|_| state.run_transcript_start),
             },
+            state.transcript_dirty_from,
         );
+        state.transcript_dirty_from = usize::MAX;
         let mut extra = Vec::new();
         if show_empty_state(&state.transcript, state.running) {
             extra.extend(empty_state_lines(state, transcript_area.width));
