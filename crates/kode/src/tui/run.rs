@@ -937,6 +937,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
     spawn_git_poll(cwd.to_path_buf(), git_tx.clone());
 
     let (indexed_tx, mut indexed_rx) = mpsc::unbounded_channel::<Option<bool>>();
+    let mut indexed_probe_done = false;
     if config.zindeks.enabled && crate::engine_assets::zindeks_library(&config.zindeks).is_ok() {
         let runtime = state.runtime.clone();
         let cfg = config.zindeks.clone();
@@ -1486,7 +1487,11 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                 }
             }
 
-            indexed = indexed_rx.recv() => {
+            // One-shot: the probe sends once and drops its sender. A closed
+            // channel's `recv()` is always ready, so without this guard the
+            // arm would fire on every poll and spin the loop.
+            indexed = indexed_rx.recv(), if !indexed_probe_done => {
+                indexed_probe_done = true;
                 if let Some(answer) = indexed {
                     state.repo_indexed = answer;
                     state.setup_dirty = true;
