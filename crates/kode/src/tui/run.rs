@@ -1003,6 +1003,8 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
     // picker closed by a handler that `continue 'outer`s still marks the
     // setup facts dirty.
     let mut picker_was_open = state.picker.open;
+    // Redraw only when something changed; idle ticks skip the frame.
+    let mut needs_draw = true;
     'outer: loop {
         if picker_was_open && !state.picker.open {
             state.setup_dirty = true;
@@ -1013,6 +1015,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
             biased;
 
             maybe_key = next_terminal_event(&mut key_events, &mut pending_terminal_events) => {
+                needs_draw = true;
                 match maybe_key {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                         if state.running
@@ -1366,6 +1369,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
             }
 
             ev = event_rx.recv() => {
+                needs_draw = true;
                 if let Some(mut ev) = ev {
                     // Cap per iteration so key presses stay responsive under
                     // a flood; the rest is handled on the next iteration.
@@ -1475,18 +1479,21 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
             }
 
             perm = perm_rx.recv() => {
+                needs_draw = true;
                 if let Some((summary, responder)) = perm {
                     state.push_permission(PermReq { summary, responder });
                 }
             }
 
             loaded = picker_rx.recv() => {
+                needs_draw = true;
                 if let Some(loaded) = loaded {
                     apply_picker_loaded(&mut state, loaded);
                 }
             }
 
             repo = git_rx.recv() => {
+                needs_draw = true;
                 if let Some(repo) = repo {
                     apply_repo_state(&mut state, repo);
                 }
@@ -1496,6 +1503,7 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
             // channel's `recv()` is always ready, so without this guard the
             // arm would fire on every poll and spin the loop.
             indexed = indexed_rx.recv(), if !indexed_probe_done => {
+                needs_draw = true;
                 indexed_probe_done = true;
                 if let Some(answer) = indexed {
                     state.repo_indexed = answer;
@@ -1504,12 +1512,14 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
             }
 
             proposal = memory_rx.recv() => {
+                needs_draw = true;
                 if let Some(proposal) = proposal {
                     offer_memory(&mut state, proposal);
                 }
             }
 
             saved = memory_saved_rx.recv() => {
+                needs_draw = true;
                 if let Some(result) = saved {
                     let text = match &result {
                         Ok(m) if m.team => "m ● saved · team".to_string(),
@@ -1546,10 +1556,12 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
                 // its first 2 of these ~100ms ticks.
                 state.render_tick = state.render_tick.wrapping_add(1);
                 motion_tick_update(&mut state, Instant::now());
+                needs_draw |= tick_needs_draw(&state, animating);
             }
 
             _ = motion_tick.tick(), if animating => {
                 motion_tick_update(&mut state, Instant::now());
+                needs_draw |= tick_needs_draw(&state, animating);
             }
         }
 
@@ -1565,12 +1577,15 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
             }
         }
 
-        maybe_show_setup_card(&mut state, &config, cwd);
+        if needs_draw {
+            maybe_show_setup_card(&mut state, &config, cwd);
 
-        terminal.draw(|f| {
-            draw(f, &mut state, cwd);
-            theme::adapt(f.buffer_mut(), palette);
-        })?;
+            terminal.draw(|f| {
+                draw(f, &mut state, cwd);
+                theme::adapt(f.buffer_mut(), palette);
+            })?;
+            needs_draw = false;
+        }
     }
 
     if let Some(child) = current_cancel {
@@ -1579,6 +1594,12 @@ pub async fn run(cwd: &Path, cancel: CancellationToken, continue_: bool) -> anyh
     cancel.cancel();
 
     Ok(())
+}
+
+/// Whether a UI/motion tick warrants a redraw: only while something on
+/// screen is time-driven (a run, an animation, an armed exit, an index probe).
+fn tick_needs_draw(state: &AppState, animating: bool) -> bool {
+    state.running || animating || state.exit_armed_at.is_some() || state.indexing_since.is_some()
 }
 
 /// True while any Kode Benang animation can be in flight: a run is active, a
@@ -1888,6 +1909,7 @@ pub(crate) fn handle_mouse(state: &mut AppState, mouse: crossterm::event::MouseE
                 && let Some(line) = state.transcript.get_mut(idx)
             {
                 line.expanded = !line.expanded;
+                state.touch_transcript(idx);
             }
         }
     }

@@ -395,6 +395,9 @@ pub struct PickerLoaded {
 pub struct AppState {
     pub transcript: Vec<TranscriptLine>,
     pub transcript_cache: super::draw::TranscriptCache,
+    /// Lowest transcript index edited in place since the last draw
+    /// (`usize::MAX` = nothing dirty). See `touch_transcript`.
+    pub(crate) transcript_dirty_from: usize,
     pub current_stream: String,
     pub status: StatusInfo,
     pub running: bool,
@@ -603,10 +606,18 @@ pub struct TranscriptHit {
 }
 
 impl AppState {
+    /// Marks the transcript line at `index` as edited in place so the render
+    /// cache re-renders it. Every IN-PLACE edit of an existing transcript line
+    /// must call this (pushes are detected by length).
+    pub(crate) fn touch_transcript(&mut self, index: usize) {
+        self.transcript_dirty_from = self.transcript_dirty_from.min(index);
+    }
+
     pub fn new(provider: String, model: String, effort: String) -> Self {
         Self {
             transcript: Vec::new(),
             transcript_cache: Default::default(),
+            transcript_dirty_from: usize::MAX,
             current_stream: String::new(),
             status: StatusInfo::new(provider, model, effort),
             running: false,

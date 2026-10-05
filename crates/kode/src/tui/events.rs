@@ -111,6 +111,10 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             // Only Tool lines directly adjacent group; any other line
             // (prose, a note, a failure) breaks the run and starts a new
             // header on the next ToolStarted.
+            if !state.transcript.is_empty() {
+                let last_index = state.transcript.len() - 1;
+                state.touch_transcript(last_index);
+            }
             match state.transcript.last_mut() {
                 Some(last) if last.gutter == Gutter::Tool => {
                     if last.tool_children.is_empty() {
@@ -153,12 +157,13 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
                 .take()
                 .map(|started| started.elapsed().as_millis())
                 .unwrap_or(0);
-            if let Some(receipt) = state
+            if let Some(idx) = state
                 .transcript
-                .iter_mut()
-                .rev()
-                .find(|line| line.gutter == Gutter::Tool && line.tool_ok.is_none())
+                .iter()
+                .rposition(|line| line.gutter == Gutter::Tool && line.tool_ok.is_none())
             {
+                state.touch_transcript(idx);
+                let receipt = &mut state.transcript[idx];
                 receipt.tool_duration_ms = Some(
                     receipt
                         .tool_duration_ms
@@ -190,11 +195,13 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
             ));
         }
         KodeEvent::SubagentActivity { id, text } => {
-            if let Some(receipt) = state.transcript.iter_mut().rev().find(|line| {
+            if let Some(idx) = state.transcript.iter().rposition(|line| {
                 line.gutter == Gutter::Tool
                     && line.tool_ok.is_none()
                     && line.text.starts_with(&format!("subagent {id} ·"))
             }) {
+                state.touch_transcript(idx);
+                let receipt = &mut state.transcript[idx];
                 receipt.tool_children.push(text);
                 receipt.text = format!(
                     "subagent {id} · {} tool{}",
@@ -209,11 +216,13 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
         }
         KodeEvent::SubagentFinished { id, ok, summary } => {
             let status = if ok { "done" } else { "failed" };
-            if let Some(receipt) = state.transcript.iter_mut().rev().find(|line| {
+            if let Some(idx) = state.transcript.iter().rposition(|line| {
                 line.gutter == Gutter::Tool
                     && line.tool_ok.is_none()
                     && line.text.starts_with(&format!("subagent {id} ·"))
             }) {
+                state.touch_transcript(idx);
+                let receipt = &mut state.transcript[idx];
                 let count = receipt.tool_children.len();
                 receipt.text = if count == 0 {
                     format!("subagent {id} · {status} · {summary}")
@@ -437,6 +446,9 @@ pub fn apply_event(state: &mut AppState, ev: KodeEvent) {
                 ),
                 (None, None) => format!("✓ indexed · {}s", elapsed_ms / 1000),
             };
+            if let Some(row) = state.index_line {
+                state.touch_transcript(row);
+            }
             match state
                 .index_line
                 .and_then(|row| state.transcript.get_mut(row))

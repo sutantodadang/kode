@@ -111,11 +111,18 @@ fn transcript_cache_tracks_edits_expansion_stream_resize_and_clear() {
     app.transcript.push(tool);
     for step in 0..6 {
         match step {
-            1 => app.transcript[0].text = "other".to_string(),
-            2 => app.transcript[1].expanded = true,
+            1 => {
+                app.transcript[0].text = "other".to_string();
+                app.touch_transcript(0);
+            }
+            2 => {
+                app.transcript[1].expanded = true;
+                app.touch_transcript(1);
+            }
             3 => {
                 app.current_stream = "streaming now".to_string();
                 app.transcript[1].tool_ok = Some(false);
+                app.touch_transcript(1);
             }
             5 => app.transcript.clear(),
             _ => {}
@@ -4402,9 +4409,14 @@ fn transcript_cache_settles_after_animation_window() {
     };
     let mut cache = TranscriptCache::default();
     let render = |cache: &TranscriptCache| line_text(cache.probe(0).unwrap().0);
-    cache.update(&transcript, 100, ctx(now));
+    cache.update(&transcript, 100, ctx(now), usize::MAX);
     assert!(!render(&cache).contains("index refreshed"));
-    cache.update(&transcript, 100, ctx(now + Duration::from_secs(1)));
+    cache.update(
+        &transcript,
+        100,
+        ctx(now + Duration::from_secs(1)),
+        usize::MAX,
+    );
     assert!(render(&cache).contains("index refreshed"));
     assert!(cache.probe(0).unwrap().1);
 }
@@ -4992,4 +5004,65 @@ fn completed_turn_carries_the_recorded_ledger() {
             .iter()
             .any(|e| matches!(e, crate::ledger::LedgerEntry::Usage { .. }))
     );
+}
+
+fn plain_ctx() -> MotionCtx {
+    MotionCtx {
+        now: Instant::now(),
+        reduced_motion: false,
+        epoch: 0,
+        trace_from: None,
+    }
+}
+
+#[test]
+fn transcript_cache_appending_renders_only_the_new_line() {
+    let mut transcript = vec![
+        TranscriptLine::new(Gutter::Note, "one"),
+        TranscriptLine::new(Gutter::Note, "two"),
+    ];
+    let mut cache = TranscriptCache::default();
+    cache.update(&transcript, 80, plain_ctx(), usize::MAX);
+    assert_eq!(cache.render_count, 2);
+    transcript.push(TranscriptLine::new(Gutter::Note, "three"));
+    cache.update(&transcript, 80, plain_ctx(), usize::MAX);
+    assert_eq!(cache.render_count, 3);
+    assert!(line_text(cache.probe(2).unwrap().0).contains("three"));
+    assert_eq!(cache.probe_source(0).unwrap().text, "one");
+}
+
+#[test]
+fn transcript_cache_touched_edit_updates_render() {
+    let mut transcript = vec![
+        TranscriptLine::new(Gutter::Note, "one"),
+        TranscriptLine::new(Gutter::Note, "two"),
+    ];
+    let mut cache = TranscriptCache::default();
+    cache.update(&transcript, 80, plain_ctx(), usize::MAX);
+    transcript[1].text = "changed".to_string();
+    cache.update(&transcript, 80, plain_ctx(), 1);
+    assert_eq!(cache.render_count, 3);
+    assert!(line_text(cache.probe(1).unwrap().0).contains("changed"));
+}
+
+#[test]
+fn transcript_cache_width_change_rebuilds_everything() {
+    let transcript = vec![
+        TranscriptLine::new(Gutter::Note, "one"),
+        TranscriptLine::new(Gutter::Note, "two"),
+    ];
+    let mut cache = TranscriptCache::default();
+    cache.update(&transcript, 80, plain_ctx(), usize::MAX);
+    cache.update(&transcript, 40, plain_ctx(), usize::MAX);
+    assert_eq!(cache.render_count, 4);
+}
+
+#[test]
+#[should_panic(expected = "without touch_transcript")]
+fn transcript_cache_panics_on_untouched_in_place_edit() {
+    let mut transcript = vec![TranscriptLine::new(Gutter::Note, "one")];
+    let mut cache = TranscriptCache::default();
+    cache.update(&transcript, 80, plain_ctx(), usize::MAX);
+    transcript[0].text = "sneaky".to_string();
+    cache.update(&transcript, 80, plain_ctx(), usize::MAX);
 }
